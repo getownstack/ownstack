@@ -1,0 +1,27 @@
+# Ownstack stack definition. Reconciled on the node by `ownstackctl apply`.
+# Secret values never live here: secrets are env:NAME or file:/path references,
+# or omitted to use each provider's conventional environment variable.
+apiVersion: ownstack.io/v1
+kind: Stack
+metadata:
+  name: acme-platform
+spec:
+  domain: example.com
+  compute:
+    provider: own-vps
+    settings:
+      host: 203.0.113.10
+  dns:
+    provider: cloudflare        # reads CLOUDFLARE_API_TOKEN
+  ingress:
+    provider: traefik
+    settings:
+      acmeEmail: ops@example.com
+  vcs:
+    provider: github            # reads GITHUB_TOKEN
+    settings:
+      owner: acme
+  images:
+    provider: harbor            # HARBOR_ADMIN_PASSWORD is generated when unset
+  cicd:
+    provider: jenkins           # JENKINS_ADMIN_PASSWORD is generated when unset

@@ -1,0 +1,14 @@
+expose:
+  tls:
+    certSource: secret
+  ingress:
+    annotations:
+{{- range $key, $value := .Annotations }}
+      {{ $key }}: {{ printf "%q" $value }}
+{{- end }}
+    hosts:
+      core: {{ .Host }}
+externalURL: https://{{ .Host }}
+harborAdminPassword: {{ printf "%q" .Password }}
+trivy:
+  enabled: false

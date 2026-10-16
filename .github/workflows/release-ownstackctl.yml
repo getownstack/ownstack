@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Test
+        run: go test ./...
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -31,7 +33,7 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/ownstackctl-${GOOS}-${GOARCH}" ./cmd/ownstackctl
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/ownstackctl-${GOOS}-${GOARCH}" ./cmd/ownstackctl
       - name: Checksums
         run: |
           cd dist

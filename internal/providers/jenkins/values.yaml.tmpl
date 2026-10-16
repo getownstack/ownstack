@@ -1,0 +1,71 @@
+controller:
+  ingress:
+    enabled: true
+    hostName: {{ .Host }}
+    annotations:
+{{- range $key, $value := .Annotations }}
+      {{ $key }}: {{ printf "%q" $value }}
+{{- end }}
+  admin:
+    username: admin
+    password: {{ printf "%q" .Password }}
+    createSecret: true
+  jenkinsUrl: https://{{ .Host }}
+  installPlugins:
+    - configuration-as-code
+    - workflow-aggregator
+    - kubernetes
+    - git
+    - docker-workflow
+    - credentials
+    - github
+    - kubernetes-credentials-provider
+    - blueocean
+    - ws-cleanup
+    - timestamper
+    - github-branch-source
+    - pipeline-utility-steps
+    - slack
+  overridePlugins: true
+  JCasC:
+    enabled: true
+    configScripts:
+      main: |-
+        jenkins:
+          globalNodeProperties:
+          - envVars:
+              env:
+{{- range .GlobalEnv }}
+              - key: {{ .Key }}
+                value: {{ printf "%q" .Value }}
+{{- end }}
+          clouds:
+          - kubernetes:
+              containerCap: 10
+              name: "kubernetes-cluster"
+              webSocket: true
+        unclassified:
+          globalLibraries:
+            libraries:
+              - defaultVersion: "main"
+                implicit: true
+                name: "jenkins_pipeline_library"
+                retriever:
+                  modernSCM:
+                    libraryPath: "jenkins_pipeline_library/"
+                    scm:
+                      git:
+                        credentialsId: "{{ .VCSCredentialID }}"
+                        remote: {{ printf "%q" .ClusterRepoURL }}
+                        traits:
+                          - "gitBranchDiscovery"
+{{- if .Slack }}
+          slackNotifier:
+            botUser: true
+            teamDomain: ""
+            tokenCredentialId: "{{ .AlertsCredentialID }}"
+            room: {{ printf "%q" .Slack.Channel }}
+{{- end }}
+        security:
+          gitHostKeyVerificationConfiguration:
+            sshHostKeyVerificationStrategy: acceptFirstConnectionStrategy
