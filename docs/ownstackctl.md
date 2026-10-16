@@ -109,6 +109,12 @@ Values that came from the environment, a prompt, or generation are saved to `/et
 
 Flags for `apply` and `up`: `--only aspect,...`, `--prune` (remove providers no longer in the manifest, including their data), `--allow-low-memory`, `--no-verify`, `--report URL` (stream progress to an Ownstack run; token in `OWNSTACK_REPORT_TOKEN`).
 
+## Live health in Ownstack
+
+When `up` or `apply` runs with `--report` (the Ownstack CLI-agent command does this) or `--health-url`, ownstackctl installs `ownstack-health.timer`. Every 5 minutes it runs `ownstackctl status` and sends the result to Ownstack with that run's token, so the Ownstack map shows live health for every component and deployed app. It sends check names, states, and details, never secret values. Turn it off with `systemctl disable --now ownstack-health.timer`, or skip it with `--no-health-reports`.
+
+Own VPS also creates a 2 GiB swapfile (`swapGiB`) when the server has no swap, so build spikes slow things down instead of killing services.
+
 ## Events
 
 Machine-readable progress lines are printed alongside normal output:

@@ -63,6 +63,7 @@ Internet ── HTTPS (*.admin.<domain>, app hosts) ──> Traefik on k3s
 - `internal/providers/<id>/`: implementations: `ownvps` (compute), `cloudflare` and `manualdns` (dns), `traefik` (ingress), `github` (vcs), `zot`, `harbor`, and `registry` (images), `slack` (alerts), `ghactions` and `jenkins` (cicd). Helm values are embedded `values.yaml.tmpl` files. `ghactions/ownstack.yml` is the app-repo workflow (`ownstackctl workflow`).
 - `internal/githubapi/`: GitHub REST client shared by the VCS and CI providers, including sealed-box Actions secrets.
 - `internal/report/`: optional progress reporting to an Ownstack run (`--report`).
+- `internal/health/`: live health reporting: `status --health-url` and the `ownstack-health.timer` systemd unit installed after a reported run.
 - `examples/{starter,standard,byo-registry}.yaml`: one manifest per preset (kept valid by tests).
 - `install.sh`: installs a pinned, checksum-verified `ownstackctl` release.
 - `setup_system.sh`: stable entrypoint for runners that clone the repo; installs ownstackctl and runs `apply`.
@@ -119,6 +120,8 @@ Deliberate single-tenant defaults (document any change to them):
 - `ownstackctl apply` runs as root.
 - With GitHub Actions, the k3s API (port 6443) is reached from GitHub's runners with a service-account token that can only manage workloads in the environment namespaces (`ownstack-system/ownstack-deployer`). The token is an Actions secret in each app repo that carries the Ownstack workflow.
 - The Ownstack Helm library for GitHub Actions deploys comes from the public template at `libraryRef`, not from the private cluster repo.
+- The Jenkins registry credential stores `$` escaped (`robot\$name`): the Kubernetes plugin's `container()` steps run commands through a shell. Do not remove the escaping.
+- Health reports (opt-in via `--report`/`--health-url`) send `status --json` to Ownstack every 5 minutes with the run's token; they contain no secret values.
 
 ## Pipeline Conventions
 
