@@ -78,3 +78,9 @@ func TestOrgFolderXML(t *testing.T) {
 		t.Errorf("unexpected XML:\n%s", out)
 	}
 }
+
+func TestRegistryCredentialEscapesDollar(t *testing.T) {
+	if got := shellEscapeDollar("robot$ownstack-ci"); got != `robot\$ownstack-ci` {
+		t.Errorf("escaped = %q", got)
+	}
+}

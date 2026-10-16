@@ -217,7 +217,7 @@ func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
 		labels map[string]string
 	}{
 		{vcsCredentialID, map[string]string{"username": rt.Out.VCS.Username, "password": rt.Out.VCS.Token}, userPass},
-		{registryCredentialID, map[string]string{"username": images.PushUsername, "password": images.PushPassword}, userPass},
+		{registryCredentialID, map[string]string{"username": shellEscapeDollar(images.PushUsername), "password": shellEscapeDollar(images.PushPassword)}, userPass},
 	}
 	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
 		creds = append(creds, struct {
@@ -234,6 +234,11 @@ func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
 	rt.Logf("Jenkins credentials ready: %s", credentialSummary(rt))
 	return nil
 }
+
+// shellEscapeDollar escapes $ for credentials used inside the Kubernetes
+// plugin's container() steps, which run commands through a shell: Harbor's
+// robot$name username would otherwise reach docker login as "robot".
+func shellEscapeDollar(s string) string { return strings.ReplaceAll(s, "$", `\$`) }
 
 func credentialSummary(rt *stack.Runtime) string {
 	ids := []string{vcsCredentialID, registryCredentialID}
