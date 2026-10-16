@@ -89,6 +89,9 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	if missing := missingTools(rt); len(missing) > 0 {
 		steps = append(steps, stack.Step{Action: "install", Target: "base packages", Detail: strings.Join(missing, ", ")})
 	}
+	if gib := rt.SettingInt("swapGiB"); gib > 0 && swapTotalKiB() == 0 {
+		steps = append(steps, stack.Step{Action: "create", Target: "swapfile", Detail: fmt.Sprintf("%d GiB, swappiness 10 (the server has no swap)", gib)})
+	}
 	if version, ok := k3sVersion(ctx, rt); ok {
 		steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed"})
 	} else {
@@ -115,6 +118,10 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	if err := ensureSwap(ctx, rt); err != nil {
+		return err
 	}
 
 	configChanged, err := ensureK3sConfig(rt.Setting("host"))
@@ -220,6 +227,42 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		}
 	}
 	return checks
+}
+
+// ensureSwap creates a swapfile when the server has no swap at all. Memory
+// spikes (image builds, Jenkins starting) then slow down instead of getting
+// services killed. Existing swap, of any size, is left alone.
+func ensureSwap(ctx context.Context, rt *stack.Runtime) error {
+	gib := rt.SettingInt("swapGiB")
+	if gib <= 0 || swapTotalKiB() > 0 {
+		return nil
+	}
+	rt.Logf("Creating a %d GiB swapfile (the server has no swap)", gib)
+	script := fmt.Sprintf(`set -e
+fallocate -l %dG /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=%d status=none
+chmod 600 /swapfile
+mkswap -q /swapfile
+swapon /swapfile
+grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+sysctl -q -w vm.swappiness=10
+echo 'vm.swappiness=10' > /etc/sysctl.d/90-ownstack-swap.conf
+`, gib, gib*1024)
+	return rt.Exec.Shell(ctx, script)
+}
+
+func swapTotalKiB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "SwapTotal:" {
+			v, _ := strconv.Atoi(fields[1])
+			return v
+		}
+	}
+	return 0
 }
 
 func missingTools(rt *stack.Runtime) []string {

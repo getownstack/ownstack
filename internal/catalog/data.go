@@ -109,6 +109,8 @@ func Default() *Catalog {
 				Params: []Param{
 					{Key: "host", Label: "Public IP", Kind: KindIP, Required: true, Placeholder: "203.0.113.10",
 						Help: "Public IPv4 address of the server. DNS records point here."},
+					{Key: "swapGiB", Label: "Swap (GiB)", Kind: KindInt, Default: "2", Advanced: true,
+						Help: "Swapfile created when the server has no swap, so a build spike does not take services down. 0 disables."},
 					{Key: "k3sChannel", Label: "k3s channel", Kind: KindString, Default: "stable", Advanced: true},
 					{Key: "k3sVersion", Label: "k3s version", Kind: KindString, Advanced: true,
 						Help: "Pin an exact k3s release, for example v1.33.4+k3s1. Overrides the channel."},
