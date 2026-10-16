@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fetch the Ownstack Helm library
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: getownstack/ownstack-cluster-template
           ref: ${{ vars.OWNSTACK_LIBRARY_REF || 'main' }}
@@ -43,7 +43,8 @@ jobs:
             echo "::error::OWNSTACK_KUBECONFIG is not set. Run 'ownstackctl apply' on your server so it can configure this repo."
             exit 1
           fi
-          tag="$(echo "$GITHUB_REF_NAME" | tr -c 'a-zA-Z0-9_.-\n' '-')-${GITHUB_SHA::7}"
+          ref="${GITHUB_REF_NAME//[^a-zA-Z0-9_.-]/-}"
+          tag="$ref-${GITHUB_SHA::7}"
           echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
           mkdir -p ~/.kube
           printf '%s' "$KUBECONFIG_DATA" > ~/.kube/config

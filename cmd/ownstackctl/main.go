@@ -446,20 +446,38 @@ func cmdDoctor(ctx context.Context, args []string) error {
 // printSummary tells the user where their stack is and how to sign in.
 func printSummary(s *session) {
 	out := s.engine.RT.Out
+	m, cat := s.engine.Manifest, s.engine.Catalog
+	name := func(aspect string) string {
+		if c, ok := m.Component(aspect); ok {
+			if p, ok := cat.Provider(aspect, c.Provider); ok {
+				return p.Name
+			}
+		}
+		return aspect
+	}
 	c := s.console
 	c.Printf("")
 	c.Printf("Your stack is ready.")
 	if out.Ingress != nil {
-		c.Printf("  Traefik dashboard  https://%s", s.engine.Manifest.Settings(s.engine.Catalog, "ingress")["dashboardHost"])
+		c.Printf("  %-18s https://%s", name("ingress")+" dashboard", m.Settings(cat, "ingress")["dashboardHost"])
 	}
 	if out.Images != nil {
-		c.Printf("  Harbor             https://%s  (user admin, password HARBOR_ADMIN_PASSWORD)", out.Images.Host)
+		line := fmt.Sprintf("  %-18s %s/%s  (user %s)", name("images"), out.Images.Host, out.Images.Project, out.Images.PushUsername)
+		if c, ok := m.Component("images"); ok && c.Provider == "harbor" {
+			line = fmt.Sprintf("  %-18s https://%s  (user admin, password HARBOR_ADMIN_PASSWORD)", name("images"), out.Images.Host)
+		}
+		c.Printf("%s", line)
 	}
 	if out.CICD != nil {
-		c.Printf("  Jenkins            %s  (user admin, password JENKINS_ADMIN_PASSWORD)", out.CICD.URL)
+		line := fmt.Sprintf("  %-18s %s", name("cicd"), out.CICD.URL)
+		if c, ok := m.Component("cicd"); ok && c.Provider == "jenkins" {
+			line += "  (user admin, password JENKINS_ADMIN_PASSWORD)"
+		}
+		c.Printf("%s", line)
 	}
-	c.Printf("  Secrets            %s on this server", s.store.Path)
-	c.Printf("  Health             ownstackctl status")
+	c.Printf("  %-18s https://<app>.%s (each infrastructure/<app>/ in your repos)", "Apps", m.Spec.Domain)
+	c.Printf("  %-18s %s on this server", "Secrets", s.store.Path)
+	c.Printf("  %-18s ownstackctl status", "Health")
 }
 
 func applyFlags(fs *flag.FlagSet, opts *engine.ApplyOptions) {
