@@ -30,7 +30,7 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 		Host:           host,
 		Project:        rt.Setting("project"),
 		PushUsername:   rt.Setting("username"),
-		PullSecretName: PullSecretName,
+		PullSecretName: rt.Setting("pullSecretName"),
 	}
 	if isDockerHub(host) {
 		out.PullServer = "https://index.docker.io/v1/"

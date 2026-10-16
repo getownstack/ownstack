@@ -58,7 +58,7 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: err.Error()})
 	}
 	for _, r := range repos {
-		steps = append(steps, stack.Step{Action: "configure", Target: rt.Out.VCS.Owner + "/" + r, Detail: "OWNSTACK_* secrets and variables"})
+		steps = append(steps, stack.Step{Action: "configure", Target: r.String(), Detail: "OWNSTACK_* secrets and variables"})
 	}
 	if rt.Manifest.Settings(rt.Catalog, "vcs")["demoApp"] == "true" {
 		steps = append(steps, stack.Step{Action: "ensure", Target: rt.Out.VCS.Owner + "/" + demoRepo, Detail: "commit " + workflowPath + " (first build deploys the demo)"})
@@ -85,14 +85,15 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		return err
 	}
 	demo := rt.Manifest.Settings(rt.Catalog, "vcs")["demoApp"] == "true"
-	if demo && !contains(repos, demoRepo) {
-		repos = append(repos, demoRepo)
+	demoTarget := target{rt.Out.VCS.Owner, demoRepo}
+	if demo && !containsTarget(repos, demoTarget) {
+		repos = append(repos, demoTarget)
 	}
-	for _, repo := range repos {
-		if err := p.configureRepo(ctx, rt, gh, repo, kubeconfig); err != nil {
-			return fmt.Errorf("%s/%s: %w", rt.Out.VCS.Owner, repo, err)
+	for _, t := range repos {
+		if err := p.configureRepo(ctx, rt, gh, t, kubeconfig); err != nil {
+			return fmt.Errorf("%s: %w", t, err)
 		}
-		rt.Logf("GitHub Actions configured for %s/%s", rt.Out.VCS.Owner, repo)
+		rt.Logf("GitHub Actions configured for %s", t)
 	}
 	if demo {
 		info, err := gh.Repo(ctx, rt.Out.VCS.Owner, demoRepo)
@@ -129,9 +130,9 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	if err != nil {
 		return append(checks, stack.Check{Name: "pipelines", State: stack.Unknown, Detail: err.Error()})
 	}
-	for _, repo := range repos {
-		run, err := gh.LatestRun(ctx, rt.Out.VCS.Owner, repo, workflowFile)
-		name := "pipeline " + repo
+	for _, t := range repos {
+		run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile)
+		name := "pipeline " + t.String()
 		switch {
 		case err != nil:
 			checks = append(checks, stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()})
@@ -148,6 +149,22 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	return checks
 }
 
+// target is one app repo the pipeline is configured for.
+type target struct{ owner, name string }
+
+func (t target) String() string { return t.owner + "/" + t.name }
+
+// owners are the VCS owner plus any additional owners whose repos deploy here.
+func owners(rt *stack.Runtime) []string {
+	out := []string{rt.Out.VCS.Owner}
+	for _, o := range strings.Split(rt.Setting("additionalOwners"), ",") {
+		if o = strings.TrimSpace(o); o != "" && !strings.EqualFold(o, rt.Out.VCS.Owner) {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
 	base := p.APIURL
 	if base == "" {
@@ -156,37 +173,39 @@ func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
 	return &githubapi.Client{Base: base, Token: rt.Out.VCS.Token, HTTP: rt.HTTP}
 }
 
-// targetRepos are the owner's repos matching the filter that carry the
+// targetRepos are the owners' repos matching the filter that carry the
 // Ownstack workflow.
-func (p Provider) targetRepos(ctx context.Context, rt *stack.Runtime) ([]string, error) {
+func (p Provider) targetRepos(ctx context.Context, rt *stack.Runtime) ([]target, error) {
 	gh := p.client(rt)
 	login := rt.Out.VCS.Username
 	if l, err := gh.Login(ctx); err == nil {
 		login = l
 	}
-	all, err := gh.Repos(ctx, rt.Out.VCS.Owner, login)
-	if err != nil {
-		return nil, err
-	}
 	filter := rt.Setting("repoFilter")
 	clusterRepo := rt.Manifest.Settings(rt.Catalog, "vcs")["clusterRepo"]
-	var out []string
-	for _, name := range all {
-		if name == clusterRepo {
-			continue
+	var out []target
+	for _, owner := range owners(rt) {
+		all, err := gh.Repos(ctx, owner, login)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", owner, err)
 		}
-		if ok, _ := path.Match(filter, name); !ok {
-			continue
-		}
-		if has, err := gh.FileExists(ctx, rt.Out.VCS.Owner, name, workflowPath); err == nil && has {
-			out = append(out, name)
+		for _, name := range all {
+			if owner == rt.Out.VCS.Owner && name == clusterRepo {
+				continue
+			}
+			if ok, _ := path.Match(filter, name); !ok {
+				continue
+			}
+			if has, err := gh.FileExists(ctx, owner, name, workflowPath); err == nil && has {
+				out = append(out, target{owner, name})
+			}
 		}
 	}
 	return out, nil
 }
 
-func (p Provider) configureRepo(ctx context.Context, rt *stack.Runtime, gh *githubapi.Client, repo, kubeconfig string) error {
-	owner, images := rt.Out.VCS.Owner, rt.Out.Images
+func (p Provider) configureRepo(ctx context.Context, rt *stack.Runtime, gh *githubapi.Client, t target, kubeconfig string) error {
+	owner, repo, images := t.owner, t.name, rt.Out.Images
 	secrets := map[string]string{
 		"OWNSTACK_KUBECONFIG":        kubeconfig,
 		"OWNSTACK_REGISTRY_PASSWORD": images.PushPassword,
@@ -328,9 +347,9 @@ func (p Provider) verifyKubeconfig(ctx context.Context, rt *stack.Runtime, kubec
 	})
 }
 
-func contains(list []string, v string) bool {
+func containsTarget(list []target, v target) bool {
 	for _, item := range list {
-		if item == v {
+		if strings.EqualFold(item.owner, v.owner) && item.name == v.name {
 			return true
 		}
 	}

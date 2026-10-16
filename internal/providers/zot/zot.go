@@ -36,7 +36,7 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 		Host:           rt.Setting("host"),
 		Project:        rt.Setting("project"),
 		PushUsername:   rt.Setting("username"),
-		PullSecretName: PullSecretName,
+		PullSecretName: rt.Setting("pullSecretName"),
 	}
 	rt.Out.Images = out
 	password, err := rt.Secret("password")
