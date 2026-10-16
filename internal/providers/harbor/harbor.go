@@ -95,6 +95,10 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		return err
 	}
 	rt.Logf("Harbor is healthy")
+	// Docker on the node and in CI refuses untrusted registry certificates.
+	if err := stack.WaitForCertificate(ctx, rt, host, "/api/v2.0/ping", 5*time.Minute); err != nil {
+		return err
+	}
 
 	project := rt.Setting("project")
 	if err := api.ensureProject(ctx, project); err != nil {

@@ -85,6 +85,10 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}); err != nil {
 		return err
 	}
+	// CI pushes from outside the server; that needs a trusted certificate.
+	if err := stack.WaitForCertificate(ctx, rt, out.Host, "/v2/", 5*time.Minute); err != nil {
+		return err
+	}
 	rt.Logf("Zot ready; push as %s to %s/%s", out.PushUsername, out.Host, out.Project)
 	return nil
 }

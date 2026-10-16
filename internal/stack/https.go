@@ -106,3 +106,26 @@ func (rt *Runtime) ServiceClient() *http.Client {
 		},
 	}
 }
+
+// WaitForCertificate waits until host serves a publicly trusted certificate.
+// Services other machines connect to (registries pushed to from CI) are not
+// usable before that, so their stages wait instead of finishing early.
+func WaitForCertificate(ctx context.Context, rt *Runtime, host, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		check := CheckHTTPS(ctx, host, rt.Out.Compute.PublicIP, path, false)
+		if check.State == OK {
+			rt.Logf("%s: %s", host, check.Detail)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s has no trusted certificate after %s (%s); check DNS and the ACME email, then rerun apply", host, timeout, check.Detail)
+		}
+		rt.Logf("  waiting: certificate for %s (%s)", host, check.Detail)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
