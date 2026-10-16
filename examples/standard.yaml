@@ -1,6 +1,5 @@
-# Ownstack stack definition. Reconciled on the node by `ownstackctl apply`.
-# Secret values never live here: secrets are env:NAME or file:/path references,
-# or omitted to use each provider's conventional environment variable.
+# Standard: everything self-hosted on a 4 GB+ server: Harbor and Jenkins.
+# Secrets: GITHUB_TOKEN and CLOUDFLARE_API_TOKEN; admin passwords are generated.
 apiVersion: ownstack.io/v1
 kind: Stack
 metadata:

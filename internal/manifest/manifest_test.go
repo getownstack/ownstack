@@ -72,14 +72,16 @@ func TestValidManifest(t *testing.T) {
 	}
 }
 
-func TestExampleManifestIsValid(t *testing.T) {
-	data, err := os.ReadFile("../../examples/ownstack.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := parse(t, string(data))
-	if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
-		t.Fatalf("examples/ownstack.yaml: %v", issues)
+func TestExampleManifestsAreValid(t *testing.T) {
+	for _, name := range []string{"starter", "standard", "byo-registry"} {
+		data, err := os.ReadFile("../../examples/" + name + ".yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := parse(t, string(data))
+		if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
+			t.Errorf("examples/%s.yaml: %v", name, issues)
+		}
 	}
 }
 
