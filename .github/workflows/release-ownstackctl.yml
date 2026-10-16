@@ -41,3 +41,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # Tags like ownstackctl-v0.2.0-rc.1 publish as prereleases and
+          # never become the latest release.
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          make_latest: ${{ !contains(github.ref_name, '-rc') }}
