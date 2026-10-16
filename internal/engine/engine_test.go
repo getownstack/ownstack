@@ -61,9 +61,26 @@ spec:
 }
 
 func TestApplyRejectsInvalidManifest(t *testing.T) {
-	e := newEngine(t, strings.Replace(providertest.Manifest, "provider: harbor", "provider: zot", 1))
+	e := newEngine(t, strings.Replace(providertest.Manifest, "provider: jenkins", "provider: woodpecker", 1))
 	err := e.Apply(context.Background(), ApplyOptions{})
-	if err == nil || !strings.Contains(err.Error(), "spec.images.provider") {
+	if err == nil || !strings.Contains(err.Error(), "spec.cicd.provider") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMemoryPreflight(t *testing.T) {
+	e := newEngine(t, providertest.Manifest) // harbor + jenkins + the rest, about 4 GB
+	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 1642}); err == nil || !strings.Contains(err.Error(), "Harbor") {
+		t.Fatalf("1.6 GB server should be refused with the heavy parts named, got %v", err)
+	}
+	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 1642, AllowLowMemory: true}); err != nil {
+		t.Fatalf("override ignored: %v", err)
+	}
+	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 8192}); err != nil {
+		t.Fatalf("8 GB server refused: %v", err)
+	}
+	starter := strings.NewReplacer("provider: harbor", "provider: zot", "provider: jenkins", "provider: gh-actions").Replace(providertest.Manifest)
+	if err := newEngine(t, starter).memoryPreflight(ApplyOptions{MemTotalMiB: 1642}); err != nil {
+		t.Fatalf("Starter stack should fit 1.6 GB: %v", err)
 	}
 }

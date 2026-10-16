@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -88,6 +89,15 @@ func (e *Engine) resolve(ctx context.Context) map[string]error {
 type ApplyOptions struct {
 	// Only limits apply to these aspects (and the environments stage).
 	Only []string
+	// AllowLowMemory skips the memory preflight.
+	AllowLowMemory bool
+	// Prune removes providers that are installed but no longer in the
+	// manifest, including their data.
+	Prune bool
+	// SkipVerify skips the final health check.
+	SkipVerify bool
+	// MemTotalMiB overrides the detected server memory (tests).
+	MemTotalMiB int
 }
 
 func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
@@ -117,6 +127,9 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 		}
 	}()
 
+	if err := e.memoryPreflight(opts); err != nil {
+		return err
+	}
 	if errs := e.resolve(ctx); len(errs) > 0 {
 		return resolveError(errs)
 	}
@@ -126,6 +139,19 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 		return fmt.Errorf("save secrets: %w", err)
 	}
 
+	if orphans := e.orphans(ctx); len(orphans) > 0 {
+		if opts.Prune {
+			if err := e.prune(ctx, orphans); err != nil {
+				return err
+			}
+		} else {
+			for _, o := range orphans {
+				console.Printf("warning: %s is installed but no longer in ownstack.yaml; rerun with --prune to remove it and its data", o.title())
+			}
+		}
+	}
+
+	var applied []stage
 	for _, stage := range e.stages() {
 		if !selected(opts.Only, stage.id) {
 			continue
@@ -137,6 +163,137 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 			return fmt.Errorf("%s: %w", stage.title, err)
 		}
 		console.Event("stage_completed", map[string]string{"id": stage.id, "duration": time.Since(stageStart).Round(time.Second).String()})
+		applied = append(applied, stage)
+	}
+	if opts.SkipVerify {
+		return nil
+	}
+	return e.verify(ctx, applied)
+}
+
+// VerifyTimeout bounds the final health check.
+var VerifyTimeout = 5 * time.Minute
+
+// verify waits until every applied stage reports no failing checks. A stack
+// whose services fall over once everything runs together (for example on a
+// server that is too small) fails here instead of being reported as ready.
+func (e *Engine) verify(ctx context.Context, applied []stage) error {
+	console := e.RT.Console
+	console.Event("stage_started", map[string]string{"id": "verify", "title": "Health check", "provider": "ownstack"})
+	start := time.Now()
+	deadline := start.Add(VerifyTimeout)
+	for {
+		var failing []string
+		for _, s := range applied {
+			for _, c := range s.status(ctx) {
+				if c.State == stack.Fail {
+					failing = append(failing, fmt.Sprintf("%s: %s %s", s.title, c.Name, c.Detail))
+				}
+			}
+		}
+		if len(failing) == 0 {
+			console.Printf("All %d stages report healthy", len(applied))
+			console.Event("stage_completed", map[string]string{"id": "verify", "duration": time.Since(start).Round(time.Second).String()})
+			return nil
+		}
+		if time.Now().After(deadline) {
+			msg := "applied, but not healthy after " + VerifyTimeout.String() + ":\n  " + strings.Join(failing, "\n  ")
+			console.Event("stage_failed", map[string]string{"id": "verify", "error": strings.Join(failing, "; ")})
+			return errors.New(msg)
+		}
+		console.Printf("  waiting: %d check(s) failing, first: %s", len(failing), failing[0])
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
+// memoryPreflight refuses stacks that clearly do not fit the server. The
+// estimate comes from the catalog's per-provider resources.
+func (e *Engine) memoryPreflight(opts ApplyOptions) error {
+	if opts.AllowLowMemory {
+		return nil
+	}
+	total := opts.MemTotalMiB
+	if total == 0 {
+		total = memTotalMiB()
+	}
+	if total == 0 {
+		return nil
+	}
+	need := 0
+	var heavy []string
+	for _, u := range e.units() {
+		need += u.spec.Resources.MemoryMiB
+		if u.spec.Resources.MemoryMiB >= 1000 {
+			heavy = append(heavy, fmt.Sprintf("%s (~%.1f GB)", u.spec.Name, float64(u.spec.Resources.MemoryMiB)/1024))
+		}
+	}
+	if float64(total) >= float64(need)*0.8 {
+		return nil
+	}
+	msg := fmt.Sprintf("this stack needs about %.1f GB of memory but the server has %.1f GB", float64(need)/1024, float64(total)/1024)
+	if len(heavy) > 0 {
+		msg += "; the heavy parts are " + strings.Join(heavy, ", ")
+	}
+	return errors.New(msg + ". Use lighter providers (the Starter preset: Zot and GitHub Actions fit 2 GB), a bigger server, or --allow-low-memory to try anyway")
+}
+
+func memTotalMiB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	var kib int
+	fmt.Sscanf(strings.SplitN(string(data), "\n", 2)[0], "MemTotal: %d kB", &kib)
+	return kib / 1024
+}
+
+type orphan struct {
+	aspect catalog.Aspect
+	spec   catalog.Provider
+	impl   stack.Removable
+}
+
+func (o orphan) title() string { return o.aspect.Name + " · " + o.spec.Name }
+
+// orphans are installed providers that the manifest no longer selects.
+func (e *Engine) orphans(ctx context.Context) []orphan {
+	if !e.RT.Kube.Reachable(ctx) {
+		return nil
+	}
+	var out []orphan
+	for _, p := range e.Catalog.Providers {
+		if c, ok := e.Manifest.Component(p.Aspect); ok && c.Provider == p.ID {
+			continue
+		}
+		impl, ok := providers.Lookup(p.Aspect, p.ID)
+		if !ok {
+			continue
+		}
+		removable, ok := impl.(stack.Removable)
+		if !ok || !removable.Installed(ctx, e.RT.For(p.Aspect)) {
+			continue
+		}
+		aspect, _ := e.Catalog.Aspect(p.Aspect)
+		out = append(out, orphan{aspect: aspect, spec: p, impl: removable})
+	}
+	return out
+}
+
+func (e *Engine) prune(ctx context.Context, orphans []orphan) error {
+	console := e.RT.Console
+	for _, o := range orphans {
+		id := "prune-" + o.spec.ID
+		console.Event("stage_started", map[string]string{"id": id, "title": "Remove " + o.title(), "provider": o.spec.ID})
+		start := time.Now()
+		if err := o.impl.Remove(ctx, e.RT.For(o.aspect.ID)); err != nil {
+			console.Event("stage_failed", map[string]string{"id": id, "error": err.Error()})
+			return fmt.Errorf("remove %s: %w", o.title(), err)
+		}
+		console.Event("stage_completed", map[string]string{"id": id, "duration": time.Since(start).Round(time.Second).String()})
 	}
 	return nil
 }
@@ -231,7 +388,9 @@ type Plan struct {
 	Missing   []string          `json:"missingSecrets,omitempty"`
 	Generated []string          `json:"generatedSecrets,omitempty"`
 	Resources catalog.Resources `json:"resources"`
-	Stages    []StagePlan       `json:"stages"`
+	// MemTotalMiB is this server's memory, when known.
+	MemTotalMiB int         `json:"memTotalMiB,omitempty"`
+	Stages      []StagePlan `json:"stages"`
 }
 
 type StagePlan struct {
@@ -265,6 +424,11 @@ func (e *Engine) Plan(ctx context.Context) Plan {
 	for _, s := range e.stages() {
 		plan.Stages = append(plan.Stages, StagePlan{ID: s.id, Title: s.title, Provider: s.provider, Steps: s.plan(ctx)})
 	}
+	for _, o := range e.orphans(ctx) {
+		plan.Stages = append(plan.Stages, StagePlan{ID: "prune-" + o.spec.ID, Title: "Remove " + o.title(), Provider: o.spec.ID,
+			Steps: []stack.Step{{Action: "remove", Target: o.spec.Name, Detail: "no longer in ownstack.yaml; apply --prune deletes it and its data"}}})
+	}
+	plan.MemTotalMiB = memTotalMiB()
 	return plan
 }
 

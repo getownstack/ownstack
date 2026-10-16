@@ -1,0 +1,81 @@
+# Ownstack pipeline: build every infrastructure/<app>/ that has a Dockerfile
+# and a Helm chart, push it to your registry, and deploy it to your cluster.
+# ownstackctl manages the OWNSTACK_* secrets and variables this reads.
+name: ownstack
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ownstack-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the Ownstack Helm library
+        uses: actions/checkout@v4
+        with:
+          repository: getownstack/ownstack-cluster-template
+          ref: ${{ vars.OWNSTACK_LIBRARY_REF || 'main' }}
+          path: .ownstack
+          sparse-checkout: common_helm_library
+
+      - name: Build, push, and deploy
+        env:
+          KUBECONFIG_DATA: ${{ secrets.OWNSTACK_KUBECONFIG }}
+          REGISTRY: ${{ vars.OWNSTACK_REGISTRY }}
+          REGISTRY_USERNAME: ${{ vars.OWNSTACK_REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.OWNSTACK_REGISTRY_PASSWORD }}
+          PROJECT: ${{ vars.OWNSTACK_IMAGE_PROJECT }}
+          DOMAIN: ${{ vars.OWNSTACK_DOMAIN }}
+          PULL_SECRET: ${{ vars.OWNSTACK_PULL_SECRET }}
+          NAMESPACE: ${{ vars.OWNSTACK_NAMESPACE || 'prod' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBECONFIG_DATA:-}" ]; then
+            echo "::error::OWNSTACK_KUBECONFIG is not set. Run 'ownstackctl apply' on your server so it can configure this repo."
+            exit 1
+          fi
+          tag="$(echo "$GITHUB_REF_NAME" | tr -c 'a-zA-Z0-9_.-\n' '-')-${GITHUB_SHA::7}"
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
+          mkdir -p ~/.kube
+          printf '%s' "$KUBECONFIG_DATA" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          deployed=0
+          for dir in infrastructure/*/; do
+            app="$(basename "$dir")"
+            [ -f "$dir/Dockerfile" ] && [ -d "$dir/helm" ] || continue
+            image="$REGISTRY/$PROJECT/$app:$tag"
+            echo "::group::Build $app"
+            docker build -f "$dir/Dockerfile" -t "$image" .
+            docker push "$image"
+            echo "::endgroup::"
+            if [ -f "$dir/before-deployment.sh" ]; then
+              echo "::group::Before deployment $app"
+              APPLICATION_ID="$app" RELEASE_NAME="$app" NAMESPACE="$NAMESPACE" IMAGE="$image" \
+              IMAGE_REGISTRY="$REGISTRY" IMAGE_REPOSITORY_PROJECT="$PROJECT" IMAGE_TAG="$tag" \
+                bash "$dir/before-deployment.sh"
+              echo "::endgroup::"
+            fi
+            echo "::group::Deploy $app"
+            mkdir -p "$dir/helm/charts"
+            cp -r .ownstack/common_helm_library "$dir/helm/charts/"
+            helm upgrade --install "$app" "$dir/helm" --namespace "$NAMESPACE" \
+              --set image="$image" --set id="$app" --set domain="$DOMAIN" \
+              --set imagePullSecret="$PULL_SECRET" --wait --timeout 5m
+            echo "::endgroup::"
+            host="$(helm get values "$app" -n "$NAMESPACE" -a -o json | python3 -c 'import json,sys; v=json.load(sys.stdin); print(v.get("url") or "%s.%s" % (v["id"], v["domain"]))')"
+            echo "Deployed $app: https://$host" | tee -a "$GITHUB_STEP_SUMMARY"
+            deployed=$((deployed + 1))
+          done
+          if [ "$deployed" -eq 0 ]; then
+            echo "::warning::No infrastructure/<app>/ with a Dockerfile and helm chart found."
+          fi

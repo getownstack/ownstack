@@ -28,6 +28,13 @@ type Provider interface {
 	Status(ctx context.Context, rt *Runtime) []Check
 }
 
+// Removable providers can detect and remove what they installed, so a
+// provider taken out of the manifest (or replaced by another) can be pruned.
+type Removable interface {
+	Installed(ctx context.Context, rt *Runtime) bool
+	Remove(ctx context.Context, rt *Runtime) error
+}
+
 // Step is one planned action.
 type Step struct {
 	Action string `json:"action"` // install, upgrade, configure, ensure, verify
@@ -150,6 +157,10 @@ type ComputeOutput struct {
 	PublicIP     string
 	Kubeconfig   string
 	StorageClass string
+	// APIServer is the cluster API URL reachable from outside the node, for
+	// CI systems that deploy remotely; CACert is its PEM CA bundle.
+	APIServer string
+	CACert    string
 }
 
 // ACME challenge kinds.
@@ -187,6 +198,17 @@ type ImagesOutput struct {
 	PushUsername   string
 	PushPassword   string
 	PullSecretName string
+	// PullServer is the server key of the pull secret when it differs from
+	// Host (Docker Hub uses https://index.docker.io/v1/).
+	PullServer string
+}
+
+// PullSecretServer returns the server key for image pull secrets.
+func (o *ImagesOutput) PullSecretServer() string {
+	if o.PullServer != "" {
+		return o.PullServer
+	}
+	return o.Host
 }
 
 type AlertsOutput struct {
@@ -198,6 +220,9 @@ type AlertsOutput struct {
 type CICDOutput struct {
 	URL string
 }
+
+// Domain is where applications are published: <app>.<domain>.
+func (rt *Runtime) Domain() string { return rt.Manifest.Spec.Domain }
 
 // lowerFirst lowercases a leading capital unless it starts an acronym.
 func lowerFirst(s string) string {

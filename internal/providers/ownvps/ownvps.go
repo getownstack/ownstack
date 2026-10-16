@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
 
@@ -20,8 +22,66 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 		PublicIP:     rt.Setting("host"),
 		Kubeconfig:   stack.Kubeconfig,
 		StorageClass: "local-path",
+		APIServer:    "https://" + rt.Setting("host") + ":6443",
+	}
+	if ca, err := os.ReadFile(serverCA); err == nil {
+		rt.Out.Compute.CACert = string(ca)
 	}
 	return nil
+}
+
+const (
+	k3sConfig = "/etc/rancher/k3s/config.yaml"
+	serverCA  = "/var/lib/rancher/k3s/server/tls/server-ca.crt"
+)
+
+// ensureK3sConfig merges Ownstack's settings into the k3s config file: the
+// bundled Traefik is disabled (Ownstack installs its own) and the public IP is
+// a TLS SAN of the API server, so remote CI can deploy. It reports whether
+// the file changed.
+func ensureK3sConfig(host string) (bool, error) {
+	config := map[string]any{}
+	data, err := os.ReadFile(k3sConfig)
+	if err == nil {
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			return false, fmt.Errorf("%s: %w", k3sConfig, err)
+		}
+		if config == nil {
+			config = map[string]any{}
+		}
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	changed := addToList(config, "disable", "traefik")
+	changed = addToList(config, "tls-san", host) || changed
+	if !changed {
+		return false, nil
+	}
+	out, err := yaml.Marshal(config)
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll("/etc/rancher/k3s", 0o755); err != nil {
+		return false, err
+	}
+	return true, os.WriteFile(k3sConfig, append([]byte("# Managed in part by ownstackctl.\n"), out...), 0o600)
+}
+
+func addToList(config map[string]any, key, value string) bool {
+	var list []any
+	switch v := config[key].(type) {
+	case []any:
+		list = v
+	case string:
+		list = []any{v}
+	}
+	for _, item := range list {
+		if fmt.Sprint(item) == value {
+			return false
+		}
+	}
+	config[key] = append(list, value)
+	return true
 }
 
 func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
@@ -32,7 +92,7 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	if version, ok := k3sVersion(ctx, rt); ok {
 		steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed"})
 	} else {
-		steps = append(steps, stack.Step{Action: "install", Target: "k3s", Detail: k3sTarget(rt) + ", bundled Traefik disabled"})
+		steps = append(steps, stack.Step{Action: "install", Target: "k3s", Detail: k3sTarget(rt) + ", bundled Traefik disabled, API certificate valid for " + rt.Setting("host")})
 	}
 	if rt.Exec.Has("helm") {
 		steps = append(steps, stack.Step{Action: "verify", Target: "helm", Detail: "installed"})
@@ -57,11 +117,21 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		}
 	}
 
+	configChanged, err := ensureK3sConfig(rt.Setting("host"))
+	if err != nil {
+		return err
+	}
 	if version, ok := k3sVersion(ctx, rt); ok {
 		rt.Logf("k3s %s already running", version)
+		if configChanged {
+			rt.Logf("k3s configuration changed; restarting k3s")
+			if err := rt.Exec.Run(ctx, "systemctl", "restart", "k3s"); err != nil {
+				return err
+			}
+		}
 	} else {
 		rt.Logf("Installing k3s (%s)", k3sTarget(rt))
-		script := "curl -sfL https://get.k3s.io | " + k3sInstallEnv(rt) + " sh -s - --disable=traefik"
+		script := "curl -sfL https://get.k3s.io | " + k3sInstallEnv(rt) + " sh -s -"
 		if err := stack.Retry(ctx, rt.Console, "k3s install", 5, 15*time.Second, func() error {
 			return rt.Exec.Shell(ctx, script)
 		}); err != nil {
@@ -84,6 +154,11 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		}
 	}
 
+	defer func() {
+		if ca, err := os.ReadFile(serverCA); err == nil {
+			rt.Out.Compute.CACert = string(ca)
+		}
+	}()
 	return stack.Retry(ctx, rt.Console, "node ready", 40, 5*time.Second, func() error {
 		nodes, err := rt.Kube.Nodes(ctx)
 		if err != nil {

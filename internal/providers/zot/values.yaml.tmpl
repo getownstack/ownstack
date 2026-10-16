@@ -1,0 +1,35 @@
+service:
+  type: ClusterIP
+  port: 5000
+ingress:
+  enabled: true
+  className: traefik
+  pathtype: Prefix
+  annotations:
+{{- range $key, $value := .Annotations }}
+    {{ $key }}: {{ printf "%q" $value }}
+{{- end }}
+  hosts:
+    - host: {{ .Host }}
+      paths:
+        - path: /
+persistence: true
+pvc:
+  create: true
+  storage: {{ .StorageGiB }}Gi
+mountConfig: true
+configFiles:
+  config.json: |-
+    {
+      "storage": { "rootDirectory": "/var/lib/registry", "gc": true },
+      "http": {
+        "address": "0.0.0.0",
+        "port": "5000",
+        "realm": "ownstack",
+        "auth": { "htpasswd": { "path": "/secret/htpasswd" } }
+      },
+      "log": { "level": "info" }
+    }
+mountSecret: true
+secretFiles:
+  htpasswd: {{ printf "%q" .Htpasswd }}

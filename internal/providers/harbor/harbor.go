@@ -287,3 +287,16 @@ func (c *client) recreateRobot(ctx context.Context) (string, string, error) {
 	}
 	return created.Name, created.Secret, nil
 }
+
+func (Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
+	_, ok := rt.Kube.Release(ctx, release, namespace)
+	return ok
+}
+
+// Remove uninstalls the release and its namespace, including stored data.
+func (Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
+	if err := rt.Kube.HelmUninstall(ctx, release, namespace); err != nil {
+		return err
+	}
+	return rt.Kube.Delete(ctx, "namespace", namespace)
+}

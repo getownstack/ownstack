@@ -95,7 +95,7 @@ func TestValidationIssues(t *testing.T) {
 		from, to string
 		path     string
 	}{
-		"planned provider":   {"provider: harbor", "provider: zot", "spec.images.provider"},
+		"planned provider":   {"provider: jenkins", "provider: woodpecker", "spec.cicd.provider"},
 		"unknown provider":   {"provider: harbor", "provider: nope", "spec.images.provider"},
 		"bad ip":             {"host: 203.0.113.10", "host: not-an-ip", "spec.compute.settings.host"},
 		"unknown setting":    {"owner: acme", "owner: acme\n      colour: blue", "spec.vcs.settings.colour"},

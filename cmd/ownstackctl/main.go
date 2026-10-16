@@ -18,6 +18,7 @@ import (
 	"github.com/getownstack/ownstack-cluster-template/internal/engine"
 	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers"
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
 	"github.com/getownstack/ownstack-cluster-template/internal/report"
 	"github.com/getownstack/ownstack-cluster-template/internal/secrets"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
@@ -67,6 +68,9 @@ func run(ctx context.Context, args []string) error {
 		return cmdValidate(rest)
 	case "catalog":
 		return printJSON(providers.Catalog())
+	case "workflow":
+		fmt.Print(ghactions.Workflow)
+		return nil
 	case "doctor":
 		return cmdDoctor(ctx, rest)
 	case "version":
@@ -84,13 +88,16 @@ Usage:
   ownstackctl up       [-f ownstack.yaml] [--dir /root/ownstack-cluster]
                        Create or update your cluster repo with the manifest, then apply it.
                        Use this for the first run on a fresh server.
-  ownstackctl apply    [-f ownstack.yaml] [--only aspect,...]
-                       Converge this server to the manifest. Safe to rerun.
+  ownstackctl apply    [-f ownstack.yaml] [--only aspect,...] [--prune]
+                       Converge this server to the manifest, then check it is healthy.
+                       Safe to rerun. --prune removes providers no longer in the manifest.
   ownstackctl plan     [-f ownstack.yaml] [--json]    Show what apply would do.
   ownstackctl status   [-f ownstack.yaml] [--json]    Check every part of the running stack.
   ownstackctl validate [-f ownstack.yaml] [--json]    Check the manifest against the catalog.
   ownstackctl doctor   [-f ownstack.yaml]             Check this server's prerequisites.
-  ownstackctl catalog                                 Print aspects and providers as JSON.
+  ownstackctl catalog                                 Print aspects, providers, and presets as JSON.
+  ownstackctl workflow                                Print the GitHub Actions workflow for app repos
+                                                      (.github/workflows/ownstack.yml).
   ownstackctl version
 
 Secrets are never stored in ownstack.yaml. They are read from environment
@@ -102,6 +109,11 @@ Flags shared by commands that read the manifest:
   --secrets-file PATH  secrets file (default /etc/ownstack/secrets.env)
   --no-prompt          never prompt for secrets
   --report URL         also send progress to an Ownstack run (token in OWNSTACK_REPORT_TOKEN)
+
+Flags for apply and up:
+  --prune              remove installed providers that are no longer in the manifest
+  --allow-low-memory   skip the check that the stack fits this server's memory
+  --no-verify          skip the final health check
 `)
 }
 
@@ -208,7 +220,9 @@ func (s *session) finish(err error) error {
 func cmdApply(ctx context.Context, args []string) error {
 	var c common
 	var only string
+	var opts engine.ApplyOptions
 	fs := newFlags("apply", &c)
+	applyFlags(fs, &opts)
 	fs.StringVar(&only, "only", "", "comma-separated aspects to apply")
 	fs.String("legacy-script", "", "ignored; kept for setup_system.sh from earlier template versions")
 	if err := fs.Parse(args); err != nil {
@@ -218,7 +232,6 @@ func cmdApply(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := engine.ApplyOptions{}
 	if only != "" {
 		opts.Only = strings.Split(only, ",")
 	}
@@ -232,7 +245,9 @@ func cmdApply(ctx context.Context, args []string) error {
 func cmdUp(ctx context.Context, args []string) error {
 	var c common
 	var dir string
+	var opts engine.ApplyOptions
 	fs := newFlags("up", &c)
+	applyFlags(fs, &opts)
 	fs.StringVar(&dir, "dir", defaultRepoDir, "where to check out the cluster repo")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -251,7 +266,7 @@ func cmdUp(ctx context.Context, args []string) error {
 			return fmt.Errorf("read %s: %w", checkout, err)
 		}
 		s.engine = engine.New(m, s.store, s.console)
-		if err := s.engine.Apply(ctx, engine.ApplyOptions{}); err != nil {
+		if err := s.engine.Apply(ctx, opts); err != nil {
 			return err
 		}
 		printSummary(s)
@@ -285,7 +300,11 @@ func cmdPlan(ctx context.Context, args []string) error {
 	if !plan.Valid {
 		return fmt.Errorf("ownstack.yaml is not valid")
 	}
-	fmt.Printf("Needs about %.1f GiB memory and %d GiB disk.\n\n", float64(plan.Resources.MemoryMiB)/1024, plan.Resources.DiskGiB)
+	fmt.Printf("Needs about %.1f GiB memory and %d GiB disk", float64(plan.Resources.MemoryMiB)/1024, plan.Resources.DiskGiB)
+	if plan.MemTotalMiB > 0 {
+		fmt.Printf(" (this server has %.1f GiB)", float64(plan.MemTotalMiB)/1024)
+	}
+	fmt.Print(".\n\n")
 	for _, stage := range plan.Stages {
 		fmt.Printf("%s\n", stage.Title)
 		for _, step := range stage.Steps {
@@ -441,6 +460,12 @@ func printSummary(s *session) {
 	}
 	c.Printf("  Secrets            %s on this server", s.store.Path)
 	c.Printf("  Health             ownstackctl status")
+}
+
+func applyFlags(fs *flag.FlagSet, opts *engine.ApplyOptions) {
+	fs.BoolVar(&opts.Prune, "prune", false, "remove installed providers no longer in the manifest")
+	fs.BoolVar(&opts.AllowLowMemory, "allow-low-memory", false, "skip the memory preflight")
+	fs.BoolVar(&opts.SkipVerify, "no-verify", false, "skip the final health check")
 }
 
 func printJSON(v any) error {

@@ -11,7 +11,7 @@ func TestCatalogIsConsistent(t *testing.T) {
 	if err := cat.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for key := range registry {
+	for key := range implementations {
 		found := false
 		for _, p := range cat.Providers {
 			if catalog.Key(p.Aspect, p.ID) == key {

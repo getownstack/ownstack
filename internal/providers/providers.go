@@ -6,37 +6,43 @@ import (
 
 	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/cloudflare"
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/github"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/harbor"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/manualdns"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/ownvps"
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/registry"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/slack"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/traefik"
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/zot"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
 
-var registry = map[string]stack.Provider{
+var implementations = map[string]stack.Provider{
 	catalog.Key("compute", "own-vps"): ownvps.Provider{},
 	catalog.Key("dns", "cloudflare"):  cloudflare.Provider{},
 	catalog.Key("dns", "manual"):      manualdns.Provider{},
 	catalog.Key("ingress", "traefik"): traefik.Provider{},
 	catalog.Key("vcs", "github"):      github.Provider{},
 	catalog.Key("images", "harbor"):   harbor.Provider{},
+	catalog.Key("images", "zot"):      zot.Provider{},
+	catalog.Key("images", "registry"): registry.Provider{},
 	catalog.Key("alerts", "slack"):    slack.Provider{},
 	catalog.Key("cicd", "jenkins"):    jenkins.Provider{},
+	catalog.Key("cicd", "gh-actions"): ghactions.Provider{},
 }
 
 // Lookup returns the implementation of a provider.
 func Lookup(aspect, id string) (stack.Provider, bool) {
-	p, ok := registry[catalog.Key(aspect, id)]
+	p, ok := implementations[catalog.Key(aspect, id)]
 	return p, ok
 }
 
 // Catalog returns the catalog with implemented providers marked available.
 func Catalog() *catalog.Catalog {
 	implemented := map[string]bool{}
-	for key := range registry {
+	for key := range implementations {
 		implemented[key] = true
 	}
 	return catalog.Default().WithAvailability(implemented)

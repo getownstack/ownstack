@@ -256,3 +256,17 @@ func timeoutOr(d, fallback time.Duration) time.Duration {
 	}
 	return d
 }
+
+// HelmUninstall removes a release; a missing release is not an error.
+func (k *Kube) HelmUninstall(ctx context.Context, release, namespace string) error {
+	if _, ok := k.Release(ctx, release, namespace); !ok {
+		return nil
+	}
+	return k.Exec.Run(ctx, "helm", "uninstall", release, "--namespace", namespace, "--wait", "--timeout", "5m")
+}
+
+// Delete removes cluster objects by kind and name, ignoring missing ones.
+// Namespaced kinds take "-n namespace" in args.
+func (k *Kube) Delete(ctx context.Context, args ...string) error {
+	return k.Exec.Run(ctx, "kubectl", append([]string{"delete", "--ignore-not-found", "--wait=true", "--timeout=5m"}, args...)...)
+}

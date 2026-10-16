@@ -51,9 +51,12 @@ type Aspect struct {
 }
 
 type Param struct {
-	Key         string   `json:"key"`
-	Label       string   `json:"label"`
-	Help        string   `json:"help,omitempty"`
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Help  string `json:"help,omitempty"`
+	// HelpURL points at the page where the user creates this value, such as
+	// a token creation form with the right scopes preselected.
+	HelpURL     string   `json:"helpURL,omitempty"`
 	Kind        string   `json:"kind"`
 	Required    bool     `json:"required,omitempty"`
 	Default     string   `json:"default,omitempty"` // may reference {domain} and {admin}
@@ -106,10 +109,21 @@ func (p Provider) Param(key string) (Param, bool) {
 	return Param{}, false
 }
 
+// Preset is a recommended combination of providers for a kind of server.
+type Preset struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Summary     string            `json:"summary"`
+	MinMemoryGB int               `json:"minMemoryGB"`
+	Components  map[string]string `json:"components"`
+	Default     bool              `json:"default,omitempty"`
+}
+
 type Catalog struct {
 	Version   string     `json:"version"`
 	Aspects   []Aspect   `json:"aspects"`
 	Providers []Provider `json:"providers"`
+	Presets   []Preset   `json:"presets"`
 }
 
 func (c *Catalog) Aspect(id string) (Aspect, bool) {
@@ -152,7 +166,7 @@ func (c *Catalog) Order() []string {
 // WithAvailability returns a copy of the catalog where providers present in
 // implemented are marked available.
 func (c *Catalog) WithAvailability(implemented map[string]bool) *Catalog {
-	out := &Catalog{Version: c.Version, Aspects: c.Aspects}
+	out := &Catalog{Version: c.Version, Aspects: c.Aspects, Presets: c.Presets}
 	out.Providers = make([]Provider, len(c.Providers))
 	for i, p := range c.Providers {
 		p.Available = implemented[Key(p.Aspect, p.ID)]
@@ -202,6 +216,18 @@ func (c *Catalog) Validate() error {
 			params[param.Key] = true
 			if param.IsSecret() && param.Env == "" {
 				return fmt.Errorf("secret %q of provider %q needs a conventional env var", param.Key, key)
+			}
+		}
+	}
+	for _, preset := range c.Presets {
+		for aspect, id := range preset.Components {
+			if _, ok := c.Provider(aspect, id); !ok {
+				return fmt.Errorf("preset %q uses unknown provider %s/%s", preset.ID, aspect, id)
+			}
+		}
+		for _, a := range c.Aspects {
+			if _, ok := preset.Components[a.ID]; a.Required && !ok {
+				return fmt.Errorf("preset %q is missing required aspect %q", preset.ID, a.ID)
 			}
 		}
 	}

@@ -1,8 +1,16 @@
 {{/*
 Application listening on port 80 exposed via an HTTPS URL: Deployment + Service + IngressRoute
-Usage: {{ include "publicly-url-application" . }}
+Usage: {{ include "public-url-application" . }}
+
+Values: id and image (set by the pipeline); url, or domain (set by the
+pipeline) to publish at <id>.<domain>; optional replicaCount, pathPrefix,
+and imagePullSecret (set by the pipeline from the registry contract).
 */}}
 {{- define "public-url-application" -}}
+{{- $url := .Values.url -}}
+{{- if not $url -}}
+{{- $url = printf "%s.%s" .Values.id (required "url or domain is required" .Values.domain) -}}
+{{- end -}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -20,7 +28,7 @@ spec:
         app: {{ .Values.id }}
     spec:
       imagePullSecrets:
-        - name: harbor-robot
+        - name: {{ .Values.imagePullSecret | default "harbor-robot" }}
       containers:
         - name: {{ .Values.id }}
           image: {{ .Values.image }}
@@ -48,7 +56,7 @@ spec:
     - websecure
   routes:
     - kind: Rule
-      match: Host(`{{ .Values.url }}`){{- if .Values.pathPrefix }} && ( Path(`{{ .Values.pathPrefix }}`) || PathPrefix(`{{ .Values.pathPrefix }}/`) ){{- end }}
+      match: Host(`{{ $url }}`){{- if .Values.pathPrefix }} && ( Path(`{{ .Values.pathPrefix }}`) || PathPrefix(`{{ .Values.pathPrefix }}/`) ){{- end }}
       services:
         - name: {{ .Values.id }}
           port: 80

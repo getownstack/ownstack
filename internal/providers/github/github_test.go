@@ -42,11 +42,11 @@ func TestUpsertFileSkipsIdenticalContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := p.client(rt)
-	changed, err := c.upsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("apiVersion: ownstack.io/v1\n"), "msg")
+	changed, err := c.UpsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("apiVersion: ownstack.io/v1\n"), "msg")
 	if err != nil || changed || puts != 0 {
 		t.Fatalf("identical content: changed=%v puts=%d err=%v", changed, puts, err)
 	}
-	changed, err = c.upsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("changed\n"), "msg")
+	changed, err = c.UpsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("changed\n"), "msg")
 	if err != nil || !changed || puts != 1 || string(stored) != "changed\n" {
 		t.Fatalf("changed content: changed=%v puts=%d err=%v stored=%q", changed, puts, err, stored)
 	}

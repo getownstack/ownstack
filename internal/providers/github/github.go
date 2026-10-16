@@ -3,19 +3,14 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/getownstack/ownstack-cluster-template/internal/githubapi"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
 
@@ -65,6 +60,10 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	return nil
 }
 
+func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
+	return &githubapi.Client{Base: p.api(), Token: rt.Out.VCS.Token, HTTP: rt.HTTP}
+}
+
 func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	c := p.client(rt)
 	var steps []stack.Step
@@ -74,7 +73,7 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 			steps = append(steps, stack.Step{Action: "ensure", Target: target, Detail: "from template " + r.template})
 			continue
 		}
-		if _, err := c.repo(ctx, rt.Out.VCS.Owner, r.name); err == nil {
+		if _, err := c.Repo(ctx, rt.Out.VCS.Owner, r.name); err == nil {
 			steps = append(steps, stack.Step{Action: "verify", Target: target, Detail: "exists"})
 		} else {
 			steps = append(steps, stack.Step{Action: "create", Target: target, Detail: "private, from template " + r.template})
@@ -85,14 +84,14 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	c := p.client(rt)
-	login, err := c.login(ctx)
+	login, err := c.Login(ctx)
 	if err != nil {
 		return fmt.Errorf("GitHub token: %w", err)
 	}
 	rt.Out.VCS.Username = login
 	rt.Logf("GitHub: authenticated as %s", login)
 	for _, r := range p.repos(rt) {
-		if err := c.ensureRepo(ctx, rt, rt.Out.VCS.Owner, r.name, r.template, r.description); err != nil {
+		if err := c.EnsureRepo(ctx, rt, rt.Out.VCS.Owner, r.name, r.template, r.description); err != nil {
 			return err
 		}
 	}
@@ -104,13 +103,13 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		return []stack.Check{{Name: "token", State: stack.Unknown, Detail: "token not available on this node"}}
 	}
 	c := p.client(rt)
-	login, err := c.login(ctx)
+	login, err := c.Login(ctx)
 	if err != nil {
 		return []stack.Check{{Name: "token", State: stack.Fail, Detail: err.Error()}}
 	}
 	checks := []stack.Check{{Name: "token", State: stack.OK, Detail: "authenticated as " + login}}
 	repo := rt.Setting("clusterRepo")
-	if info, err := c.repo(ctx, rt.Out.VCS.Owner, repo); err != nil {
+	if info, err := c.Repo(ctx, rt.Out.VCS.Owner, repo); err != nil {
 		checks = append(checks, stack.Check{Name: "cluster repo", State: stack.Fail, Detail: err.Error()})
 	} else {
 		checks = append(checks, stack.Check{Name: "cluster repo", State: stack.OK, Detail: info.FullName + visibility(info.Private)})
@@ -126,11 +125,11 @@ func (p Provider) Bootstrap(ctx context.Context, rt *stack.Runtime, manifestYAML
 	}
 	c := p.client(rt)
 	owner, repo := rt.Out.VCS.Owner, rt.Setting("clusterRepo")
-	info, err := c.repo(ctx, owner, repo)
+	info, err := c.Repo(ctx, owner, repo)
 	if err != nil {
 		return err
 	}
-	changed, err := c.upsertFile(ctx, rt, owner, repo, info.DefaultBranch, "ownstack.yaml", manifestYAML, "Update ownstack.yaml")
+	changed, err := c.UpsertFile(ctx, rt, owner, repo, info.DefaultBranch, "ownstack.yaml", manifestYAML, "Update ownstack.yaml")
 	if err != nil {
 		return err
 	}
@@ -179,133 +178,4 @@ func visibility(private bool) string {
 		return " (private)"
 	}
 	return " (public)"
-}
-
-// ── API client ───────────────────────────────────────────────────────────────
-
-type client struct {
-	base  string
-	token string
-	http  *http.Client
-}
-
-func (p Provider) client(rt *stack.Runtime) *client {
-	return &client{base: p.api(), token: rt.Out.VCS.Token, http: rt.HTTP}
-}
-
-var errNotFound = errors.New("not found")
-
-func (c *client) do(ctx context.Context, method, path string, body, out any) error {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	res, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
-	if res.StatusCode == http.StatusNotFound {
-		return errNotFound
-	}
-	if res.StatusCode >= 300 {
-		var e struct{ Message string }
-		_ = json.Unmarshal(data, &e)
-		return fmt.Errorf("GitHub %s %s: HTTP %d: %s", method, path, res.StatusCode, e.Message)
-	}
-	if out != nil {
-		return json.Unmarshal(data, out)
-	}
-	return nil
-}
-
-type repoInfo struct {
-	FullName      string `json:"full_name"`
-	Private       bool   `json:"private"`
-	DefaultBranch string `json:"default_branch"`
-}
-
-func (c *client) login(ctx context.Context) (string, error) {
-	var user struct{ Login string }
-	if err := c.do(ctx, http.MethodGet, "/user", nil, &user); err != nil {
-		return "", err
-	}
-	return user.Login, nil
-}
-
-func (c *client) repo(ctx context.Context, owner, name string) (repoInfo, error) {
-	var info repoInfo
-	err := c.do(ctx, http.MethodGet, "/repos/"+owner+"/"+name, nil, &info)
-	if errors.Is(err, errNotFound) {
-		return info, fmt.Errorf("%s/%s not found or not accessible", owner, name)
-	}
-	if info.DefaultBranch == "" {
-		info.DefaultBranch = "main"
-	}
-	return info, err
-}
-
-func (c *client) ensureRepo(ctx context.Context, rt *stack.Runtime, owner, name, template, description string) error {
-	if _, err := c.repo(ctx, owner, name); err == nil {
-		rt.Logf("GitHub: %s/%s exists", owner, name)
-		return nil
-	}
-	rt.Logf("GitHub: creating private %s/%s from %s", owner, name, template)
-	err := c.do(ctx, http.MethodPost, "/repos/"+template+"/generate", map[string]any{
-		"owner": owner, "name": name, "private": true,
-		"description": description, "include_all_branches": false,
-	}, nil)
-	if err != nil {
-		return err
-	}
-	// Generation is asynchronous; wait until the default branch has content.
-	return stack.Retry(ctx, rt.Console, owner+"/"+name+" contents", 20, 3*time.Second, func() error {
-		info, err := c.repo(ctx, owner, name)
-		if err != nil {
-			return err
-		}
-		return c.do(ctx, http.MethodGet, "/repos/"+owner+"/"+name+"/branches/"+info.DefaultBranch, nil, nil)
-	})
-}
-
-// upsertFile commits content to path unless it is already identical.
-func (c *client) upsertFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, message string) (bool, error) {
-	endpoint := "/repos/" + owner + "/" + repo + "/contents/" + path
-	var existing struct {
-		SHA     string `json:"sha"`
-		Content string `json:"content"`
-	}
-	err := c.do(ctx, http.MethodGet, endpoint+"?ref="+branch, nil, &existing)
-	if err != nil && !errors.Is(err, errNotFound) {
-		return false, err
-	}
-	if existing.SHA != "" {
-		current, _ := base64.StdEncoding.DecodeString(strings.ReplaceAll(existing.Content, "\n", ""))
-		if bytes.Equal(current, content) {
-			return false, nil
-		}
-	}
-	body := map[string]any{
-		"message": message,
-		"content": base64.StdEncoding.EncodeToString(content),
-		"branch":  branch,
-	}
-	if existing.SHA != "" {
-		body["sha"] = existing.SHA
-	}
-	return true, stack.Retry(ctx, rt.Console, "commit "+path, 5, 3*time.Second, func() error {
-		return c.do(ctx, http.MethodPut, endpoint, body, nil)
-	})
 }

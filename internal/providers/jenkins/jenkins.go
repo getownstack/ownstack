@@ -184,6 +184,7 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 		{"IMAGE_REPOSITORY_PROJECT", images.Project},
 		{"IMAGE_PULL_SECRET", images.PullSecretName},
 		{"COMMON_HELM_LIBRARY_GITHUB_REPO", vcs.ClusterRepoURL},
+		{"OWNSTACK_DOMAIN", rt.Domain()},
 	}
 	var slack *stack.AlertsOutput
 	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
@@ -373,4 +374,20 @@ func firstLine(s string) string {
 		s = s[:200]
 	}
 	return s
+}
+
+func (Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
+	_, ok := rt.Kube.Release(ctx, release, namespace)
+	return ok
+}
+
+// Remove uninstalls the release and its namespace, including stored data.
+func (Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
+	if err := rt.Kube.HelmUninstall(ctx, release, namespace); err != nil {
+		return err
+	}
+	if err := rt.Kube.Delete(ctx, "clusterrolebinding", "jenkins-cluster-admin"); err != nil {
+		return err
+	}
+	return rt.Kube.Delete(ctx, "namespace", namespace)
 }

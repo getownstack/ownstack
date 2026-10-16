@@ -31,7 +31,7 @@ func (e environments) apply(ctx context.Context) error {
 			return err
 		}
 		if images != nil && images.PushUsername != "" {
-			if err := e.rt.Kube.ApplyPullSecret(ctx, env, images.PullSecretName, images.Host, images.PushUsername, images.PushPassword); err != nil {
+			if err := e.rt.Kube.ApplyPullSecret(ctx, env, images.PullSecretName, images.PullSecretServer(), images.PushUsername, images.PushPassword); err != nil {
 				return err
 			}
 		}
