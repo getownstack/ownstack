@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/getownstack/ownstack-cluster-template/internal/engine"
+	"github.com/getownstack/ownstack-cluster-template/internal/health"
 	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
@@ -221,8 +222,10 @@ func cmdApply(ctx context.Context, args []string) error {
 	var c common
 	var only string
 	var opts engine.ApplyOptions
+	var hf healthFlags
 	fs := newFlags("apply", &c)
 	applyFlags(fs, &opts)
+	hf.register(fs)
 	fs.StringVar(&only, "only", "", "comma-separated aspects to apply")
 	fs.String("legacy-script", "", "ignored; kept for setup_system.sh from earlier template versions")
 	if err := fs.Parse(args); err != nil {
@@ -238,6 +241,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	err = s.engine.Apply(ctx, opts)
 	if err == nil {
 		printSummary(s)
+		setupHealth(ctx, s, hf, c.reportURL, c.file)
 	}
 	return s.finish(err)
 }
@@ -246,8 +250,10 @@ func cmdUp(ctx context.Context, args []string) error {
 	var c common
 	var dir string
 	var opts engine.ApplyOptions
+	var hf healthFlags
 	fs := newFlags("up", &c)
 	applyFlags(fs, &opts)
+	hf.register(fs)
 	fs.StringVar(&dir, "dir", defaultRepoDir, "where to check out the cluster repo")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -270,6 +276,7 @@ func cmdUp(ctx context.Context, args []string) error {
 			return err
 		}
 		printSummary(s)
+		setupHealth(ctx, s, hf, c.reportURL, checkout)
 		s.console.Printf("The stack definition lives in %s (and your cluster repo). Rerun `ownstackctl apply` there after changing it.", checkout)
 		return nil
 	}()
@@ -332,8 +339,10 @@ func cmdPlan(ctx context.Context, args []string) error {
 
 func cmdStatus(ctx context.Context, args []string) error {
 	var c common
+	var healthURL string
 	fs := newFlags("status", &c)
 	fs.BoolVar(&c.jsonOut, "json", false, "print JSON")
+	fs.StringVar(&healthURL, "health-url", "", "also send the status to Ownstack (token in OWNSTACK_REPORT_TOKEN)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -344,6 +353,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	}
 	s.store.Generate, s.store.Save = false, false
 	st := s.engine.Status(ctx)
+	if healthURL != "" {
+		if err := health.Send(ctx, healthURL, os.Getenv("OWNSTACK_REPORT_TOKEN"), st); err != nil {
+			fmt.Fprintf(os.Stderr, "note: could not send health to Ownstack: %v\n", err)
+		}
+	}
 	if c.jsonOut {
 		return printJSON(st)
 	}
@@ -478,6 +492,42 @@ func printSummary(s *session) {
 	c.Printf("  %-18s https://<app>.%s (each infrastructure/<app>/ in your repos)", "Apps", m.Spec.Domain)
 	c.Printf("  %-18s %s on this server", "Secrets", s.store.Path)
 	c.Printf("  %-18s ownstackctl status", "Health")
+}
+
+// healthFlags configure the health timer installed after a successful run.
+type healthFlags struct {
+	url      string
+	disabled bool
+}
+
+func (h *healthFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&h.url, "health-url", "", "Ownstack health endpoint (default: derived from --report)")
+	fs.BoolVar(&h.disabled, "no-health-reports", false, "do not install the health report timer")
+}
+
+// setupHealth installs the health timer and sends a first report. Failures
+// are reported but never fail the run.
+func setupHealth(ctx context.Context, s *session, h healthFlags, reportURL, manifestPath string) {
+	url := h.url
+	if url == "" {
+		url = health.URLFromReport(reportURL)
+	}
+	token := os.Getenv("OWNSTACK_REPORT_TOKEN")
+	if h.disabled || url == "" || token == "" || os.Geteuid() != 0 {
+		return
+	}
+	abs, err := filepath.Abs(manifestPath)
+	if err == nil {
+		err = health.Install(ctx, s.engine.RT.Exec, url, token, abs)
+	}
+	if err == nil {
+		err = health.Send(ctx, url, token, s.engine.Status(ctx))
+	}
+	if err != nil {
+		s.console.Printf("note: health reports to Ownstack are not set up: %v", err)
+		return
+	}
+	s.console.Printf("Health is reported to Ownstack every %s (stop: systemctl disable --now ownstack-health.timer)", health.Interval)
 }
 
 func applyFlags(fs *flag.FlagSet, opts *engine.ApplyOptions) {
