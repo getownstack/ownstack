@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
+	"regexp"
 
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
@@ -55,6 +57,45 @@ func (e environments) status(ctx context.Context) []stack.Check {
 			}
 		}
 		checks = append(checks, stack.Check{Name: env, State: stack.OK, Detail: "ready"})
+		checks = append(checks, e.appChecks(ctx, env)...)
+	}
+	return checks
+}
+
+var hostRule = regexp.MustCompile("Host\\(`([^`]+)`\\)")
+
+// appChecks reports every application published in an environment: one
+// check per IngressRoute host, with its HTTPS and certificate state.
+func (e environments) appChecks(ctx context.Context, env string) []stack.Check {
+	out, err := e.rt.Exec.Output(ctx, "kubectl", "get", "ingressroutes.traefik.io", "-n", env, "-o", "json")
+	if err != nil {
+		return nil
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct{ Name string } `json:"metadata"`
+			Spec     struct {
+				Routes []struct{ Match string } `json:"routes"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if json.Unmarshal([]byte(out), &list) != nil {
+		return nil
+	}
+	var checks []stack.Check
+	for _, item := range list.Items {
+		for _, route := range item.Spec.Routes {
+			for _, m := range hostRule.FindAllStringSubmatch(route.Match, -1) {
+				c := stack.CheckHTTPS(ctx, m[1], e.rt.Out.Compute.PublicIP, "/", false)
+				c.Name = "app " + env + "/" + item.Metadata.Name
+				c.Detail = "https://" + m[1] + " " + c.Detail
+				if c.State == stack.Fail {
+					// An app being down is reported, but is not a platform failure.
+					c.State = stack.Warn
+				}
+				checks = append(checks, c)
+			}
+		}
 	}
 	return checks
 }
