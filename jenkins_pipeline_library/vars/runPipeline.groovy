@@ -21,17 +21,15 @@ def call(Object applicationIds) {
             stage('Build') {
                 steps {
                     script {
-                        slackSend(
-                                channel: '#general',
-                                color: 'warning',
-                                message: """
+                        notify(
+                                'warning',
+                                """
                                     :rocket: Pipeline Started!
                                     Job: ${env.JOB_NAME}
                                     Build: ${env.BUILD_NUMBER}
                                     Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
                                     Branch: ${env.GIT_BRANCH ?: 'N/A'}
                                     Application IDs: ${ids.join(', ')}
-                                    env: ${env}
                                     Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
                                 """.stripIndent()
                         )
@@ -79,10 +77,9 @@ def call(Object applicationIds) {
         post {
             always { cleanWs() }
             success {
-                slackSend(
-                        channel: '#general',
-                        color: 'good',
-                        message: """
+                notify(
+                        'good',
+                        """
                                 :white_check_mark: Pipeline Succeeded!
                                 Job: ${env.JOB_NAME}
                                 Build: ${env.BUILD_NUMBER}
@@ -94,10 +91,9 @@ def call(Object applicationIds) {
                 )
             }
             failure {
-                slackSend(
-                        channel: '#general',
-                        color: 'danger',
-                        message: """
+                notify(
+                        'danger',
+                        """
                                 :x: Pipeline Failed!
                                 Job: ${env.JOB_NAME}
                                 Build: ${env.BUILD_NUMBER}

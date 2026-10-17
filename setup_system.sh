@@ -1,61 +1,39 @@
 #!/usr/bin/env bash
+# Stable entrypoint for Ownstack runners that clone the cluster repo and run
+# this script on the server. It installs the pinned ownstackctl and applies
+# ownstack.yaml from this repo (or, for older runners, the legacy lowercase
+# environment variables).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-legacy_script="$repo_root/scripts/setup_system_legacy.sh"
-local_binary="$repo_root/bin/ownstackctl"
+cd "$repo_root"
 
-download_and_run() {
-  local url="$1"
-  local checksum_url="${2:-}"
-  local tmp_dir asset_name tmp_binary
-
-  tmp_dir="$(mktemp -d)"
-  asset_name="${url##*/}"
-  tmp_binary="$tmp_dir/$asset_name"
-  cleanup() { rm -rf "$tmp_dir"; }
-  trap cleanup EXIT
-
-  echo "Downloading ownstackctl..."
-  curl -fsSL "$url" -o "$tmp_binary"
-  chmod +x "$tmp_binary"
-
-  if [ -n "$checksum_url" ]; then
-    echo "Verifying ownstackctl checksum..."
-    curl -fsSL "$checksum_url" -o "$tmp_dir/checksums.txt"
-    (cd "$tmp_dir" && sha256sum -c checksums.txt --ignore-missing)
-  fi
-
-  exec "$tmp_binary" apply --legacy-script "$legacy_script"
-}
-
-if [ -x "$local_binary" ]; then
-  exec "$local_binary" apply --legacy-script "$legacy_script"
+if [ -x ./bin/ownstackctl ]; then
+  exec ./bin/ownstackctl apply "$@"
 fi
 
 if [ -n "${OWNSTACKCTL_URL:-}" ]; then
-  download_and_run "$OWNSTACKCTL_URL" "${OWNSTACKCTL_CHECKSUM_URL:-}"
+  mkdir -p ./bin
+  echo "Downloading ownstackctl from OWNSTACKCTL_URL"
+  curl -fsSL "$OWNSTACKCTL_URL" -o ./bin/ownstackctl
+  chmod +x ./bin/ownstackctl
+  exec ./bin/ownstackctl apply "$@"
 fi
 
-OWNSTACKCTL_VERSION="${OWNSTACKCTL_VERSION:-ownstackctl-v0.1.0}"
-
-if [ -n "$OWNSTACKCTL_VERSION" ]; then
-  case "$(uname -m)" in
-    x86_64|amd64) ownstack_arch="amd64" ;;
-    aarch64|arm64) ownstack_arch="arm64" ;;
-    *) echo "Unsupported architecture for ownstackctl release: $(uname -m)" >&2; exit 1 ;;
-  esac
-
-  ownstack_repo="${OWNSTACKCTL_REPO:-getownstack/ownstack-cluster-template}"
-  release_base="https://github.com/$ownstack_repo/releases/download/$OWNSTACKCTL_VERSION"
-  download_and_run \
-    "$release_base/ownstackctl-linux-$ownstack_arch" \
-    "$release_base/checksums-linux-$ownstack_arch.txt"
+if OWNSTACKCTL_INSTALL_DIR="$repo_root/bin" bash ./install.sh; then
+  exec ./bin/ownstackctl apply "$@"
 fi
 
 if command -v go >/dev/null 2>&1; then
-  exec go run "$repo_root/cmd/ownstackctl" apply --legacy-script "$legacy_script"
+  exec go run ./cmd/ownstackctl apply "$@"
 fi
 
-echo "ownstackctl binary not found and Go is not installed; falling back to legacy shell installer."
-exec bash "$legacy_script"
+# Deprecated: the pre-ownstackctl shell installer only understands the legacy
+# environment contract. Remove once ownstackctl v0.2 is verified in the field.
+if [ -n "${vps:-}" ]; then
+  echo "ownstackctl is unavailable; falling back to the legacy shell installer." >&2
+  exec bash ./scripts/setup_system_legacy.sh
+fi
+
+echo "ownstackctl could not be installed; see the errors above." >&2
+exit 1

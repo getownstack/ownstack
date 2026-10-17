@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Test
+        run: go test ./...
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -31,7 +33,7 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/ownstackctl-${GOOS}-${GOARCH}" ./cmd/ownstackctl
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/ownstackctl-${GOOS}-${GOARCH}" ./cmd/ownstackctl
       - name: Checksums
         run: |
           cd dist
@@ -39,3 +41,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # Tags like ownstackctl-v0.2.0-rc.1 publish as prereleases and
+          # never become the latest release.
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          make_latest: ${{ !contains(github.ref_name, '-rc') }}

@@ -25,10 +25,15 @@ def call(String applicationId) {
 
         echo "Deploying helm chart"
 
+        // domain and imagePullSecret come from the stack (ownstackctl sets them
+        // as Jenkins global env); charts that set url keep their own host.
+        def extra = ''
+        if (env.OWNSTACK_DOMAIN) { extra += " --set domain=${env.OWNSTACK_DOMAIN}" }
+        if (env.IMAGE_PULL_SECRET) { extra += " --set imagePullSecret=${env.IMAGE_PULL_SECRET}" }
         sh """
             helm upgrade ${applicationId} ./infrastructure/${applicationId}/helm --install --namespace prod \
             --set image=\"${env.IMAGE_REGISTRY}/${image_name_with_tag}\" \
-            --set id=${applicationId}
+            --set id=${applicationId}${extra}
         """
     }
 }
