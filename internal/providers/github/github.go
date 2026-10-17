@@ -3,6 +3,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -138,10 +139,10 @@ func (p Provider) Bootstrap(ctx context.Context, rt *stack.Runtime, manifestYAML
 	} else {
 		rt.Logf("GitHub: ownstack.yaml in %s/%s is up to date", owner, repo)
 	}
-	return p.checkout(ctx, rt, info.DefaultBranch, dir)
+	return p.checkout(ctx, rt, info.DefaultBranch, dir, manifestYAML)
 }
 
-func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir string) error {
+func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir string, manifestYAML []byte) error {
 	auth := base64.StdEncoding.EncodeToString([]byte(rt.Out.VCS.Username + ":" + rt.Out.VCS.Token))
 	git := &stack.Exec{Console: rt.Console, Env: []string{
 		"GIT_TERMINAL_PROMPT=0",
@@ -151,6 +152,12 @@ func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir s
 	}}
 	rt.Console.Redact(auth)
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		// `up -f` on the checkout's own ownstack.yaml has just committed that
+		// edit; the identical local copy would otherwise block the pull.
+		local := filepath.Join(dir, "ownstack.yaml")
+		if data, err := os.ReadFile(local); err == nil && bytes.Equal(data, manifestYAML) {
+			_ = git.Run(ctx, "git", "-C", dir, "checkout", "--", "ownstack.yaml")
+		}
 		rt.Logf("Updating %s", dir)
 		return stack.Retry(ctx, rt.Console, "git pull", 3, 10*time.Second, func() error {
 			return git.Run(ctx, "git", "-C", dir, "pull", "--ff-only", "origin", branch)
