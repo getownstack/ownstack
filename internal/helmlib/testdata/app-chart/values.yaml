@@ -1,0 +1,2 @@
+# Like an application chart: the pipeline sets id, image, domain, and
+# imagePullSecret. Tests write their own values.yaml where they need one.

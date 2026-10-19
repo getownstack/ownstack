@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cluster repos are generated from this template and inherit its workflows.
+# Every job checks the repository so CI never runs (or bills) in them.
+jobs:
+  go:
+    name: Go vet and test
+    if: github.repository == 'getownstack/ownstack-cluster-template'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The common_helm_library render tests need helm; in CI they fail without it.
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.22.1
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  shell:
+    name: Shell scripts
+    if: github.repository == 'getownstack/ownstack-cluster-template'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: for f in install.sh setup_system.sh; do bash -n "$f"; done
+      - name: ShellCheck
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck install.sh setup_system.sh

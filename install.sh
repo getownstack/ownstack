@@ -25,8 +25,8 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $asset ($version)"
-curl -fsSL "$base/$asset" -o "$tmp/$asset"
-curl -fsSL "$base/checksums-linux-$arch.txt" -o "$tmp/checksums.txt"
+curl -fsSL --proto '=https' --retry 3 --retry-connrefused "$base/$asset" -o "$tmp/$asset"
+curl -fsSL --proto '=https' --retry 3 --retry-connrefused "$base/checksums-linux-$arch.txt" -o "$tmp/checksums.txt"
 (cd "$tmp" && sha256sum -c checksums.txt --ignore-missing --quiet)
 
 mkdir -p "$install_dir"

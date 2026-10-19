@@ -6,12 +6,32 @@ on:
       - "ownstackctl-v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The common_helm_library render tests need helm; in CI they fail without it.
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.22.1
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
   build:
     name: Build release binaries
+    needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
@@ -24,8 +44,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test
-        run: go test ./...
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
