@@ -8,30 +8,51 @@ package helmlib
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
 )
 
 const (
 	libraryDir = "../../common_helm_library"
-	image      = "registry.example.com/product/app:main-abc1234"
+	// baselineDir is a frozen copy of the library from before environments.
+	// Production deploys must render byte-identically to it: ownstack.io and
+	// every existing app chart take the live library from template main.
+	baselineDir = "testdata/baseline-library"
+	image       = "registry.example.com/product/app:main-abc1234"
 )
 
 // githubActionsFlags mirrors the helm upgrade in ghactions/ownstack.yml, which
 // always passes domain and imagePullSecret (empty when the variable is unset).
+// ownstack-workflow 3 adds environment and productionEnvironment
+// (withEnvironment); older workflows do not.
 func githubActionsFlags(domain, pullSecret string) []string {
 	return []string{"--set", "image=" + image, "--set", "id=app", "--set", "domain=" + domain, "--set", "imagePullSecret=" + pullSecret}
 }
 
-// jenkinsFlags mirrors helmDeploy.groovy, which passes domain and
-// imagePullSecret only when Jenkins has them in its global env.
+// withEnvironment adds the environment being deployed to and the production
+// environment, as ownstack-workflow 3 always does and the Jenkins library
+// does when it knows them.
+func withEnvironment(flags []string, environment, production string) []string {
+	return append(slices.Clone(flags), "--set-string", "environment="+environment, "--set-string", "productionEnvironment="+production)
+}
+
+// jenkinsFlags mirrors a production deploy by helmDeploy.groovy, which passes
+// domain and imagePullSecret only when Jenkins has them in its global env, and
+// always passes the environment (here prod, the production environment).
 func jenkinsFlags(domain, pullSecret string) []string {
 	flags := []string{"--set", "image=" + image, "--set", "id=app"}
 	if domain != "" {
@@ -40,7 +61,7 @@ func jenkinsFlags(domain, pullSecret string) []string {
 	if pullSecret != "" {
 		flags = append(flags, "--set", "imagePullSecret="+pullSecret)
 	}
-	return flags
+	return withEnvironment(flags, "prod", "prod")
 }
 
 type deployment struct {
@@ -118,17 +139,24 @@ func helmPath(t *testing.T) string {
 	return path
 }
 
-// render builds an app chart from testdata with the given values.yaml, copies
-// the library into charts/common_helm_library as both pipelines do, and runs
-// helm template for release "app" in namespace prod.
-func render(t *testing.T, values string, flags ...string) (rendered, error) {
+// renderChart builds an app chart from testdata with the given values.yaml
+// and extra templates (name -> content), copies library into
+// charts/common_helm_library as both pipelines do, and runs helm template for
+// release "app" in namespace prod (flags may name another namespace). It
+// returns helm's output exactly.
+func renderChart(t *testing.T, library, values string, extra map[string]string, flags ...string) (string, error) {
 	t.Helper()
 	helm := helmPath(t)
 	chart := filepath.Join(t.TempDir(), "app")
 	copyDir(t, "testdata/app-chart", chart)
-	copyDir(t, libraryDir, filepath.Join(chart, "charts", "common_helm_library"))
+	copyDir(t, library, filepath.Join(chart, "charts", "common_helm_library"))
 	if values != "" {
 		if err := os.WriteFile(filepath.Join(chart, "values.yaml"), []byte(values), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, content := range extra {
+		if err := os.WriteFile(filepath.Join(chart, "templates", name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -143,17 +171,31 @@ func render(t *testing.T, values string, flags ...string) (rendered, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, errors.New(strings.TrimSpace(stderr.String()))
+		return "", errors.New(strings.TrimSpace(stderr.String()))
 	}
+	return stdout.String(), nil
+}
 
+// render renders the live library with the given values.yaml and flags.
+func render(t *testing.T, values string, flags ...string) (rendered, error) {
+	t.Helper()
+	return renderWith(t, values, nil, flags...)
+}
+
+func renderWith(t *testing.T, values string, extra map[string]string, flags ...string) (rendered, error) {
+	t.Helper()
+	text, err := renderChart(t, libraryDir, values, extra, flags...)
+	if err != nil {
+		return nil, err
+	}
 	out := rendered{}
-	dec := yaml.NewDecoder(&stdout)
+	dec := yaml.NewDecoder(strings.NewReader(text))
 	for {
 		var node yaml.Node
 		if err := dec.Decode(&node); errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
-			t.Fatalf("invalid YAML from helm template: %v\n%s", err, stdout.String())
+			t.Fatalf("invalid YAML from helm template: %v\n%s", err, text)
 		}
 		var head struct {
 			APIVersion string `yaml:"apiVersion"`
@@ -323,6 +365,231 @@ func TestDomainOrURLRequired(t *testing.T) {
 			_, err := render(t, "", flags...)
 			if err == nil || !strings.Contains(err.Error(), "url or domain is required") {
 				t.Errorf("err = %v, want 'url or domain is required'", err)
+			}
+		})
+	}
+}
+
+// Production deploys, and deploys by pipelines that name no environment (older
+// workflows and Jenkins libraries), render byte-identically to the library
+// before environments existed, for every value combination charts and
+// pipelines used. ownstack.io and every existing app chart take the live
+// library, so this must never be relaxed.
+func TestProductionOutputUnchanged(t *testing.T) {
+	values := map[string]string{
+		"defaults":                      "",
+		"url":                           "url: shop.example.org\nreplicaCount: 3\n",
+		"path prefix":                   "pathPrefix: /docs\n",
+		"url, path prefix, pull secret": "url: shop.example.org\npathPrefix: /api\nimagePullSecret: custom\n",
+		"environment urls":              "environmentUrls:\n  dev: dev.shop.example.org\n",
+		"chart's own environment map":   "environment:\n  region: eu\n",
+		"chart's own environment":       "environment: staging\n",
+	}
+	pipelines := map[string][]string{
+		"github actions":                  githubActionsFlags("example.com", "registry-credentials"),
+		"github actions, unset variables": githubActionsFlags("", ""),
+		"jenkins":                         jenkinsFlags("example.com", "registry-credentials"),
+		"jenkins, no domain":              jenkinsFlags("", ""),
+	}
+	environments := map[string][]string{
+		"no environment":        nil,
+		"prod":                  {"--set", "environment=prod", "--set", "productionEnvironment=prod"},
+		"production named live": {"--set", "environment=live", "--set", "productionEnvironment=live"},
+		"no production known":   {"--set", "environment=dev"},
+		"empty environment":     {"--set", "environment=", "--set", "productionEnvironment=prod"},
+	}
+	helmPath(t)
+	var mu sync.Mutex
+	renders, errs := 0, 0
+	t.Cleanup(func() {
+		// Both outcomes must be covered: renders, and the missing-domain error.
+		if !t.Failed() && (renders == 0 || errs == 0) {
+			t.Errorf("%d renders and %d errors compared; want both", renders, errs)
+		}
+	})
+	for vName, v := range values {
+		for pName, p := range pipelines {
+			for eName, e := range environments {
+				flags := append(slices.Clone(p), e...)
+				t.Run(vName+"/"+pName+"/"+eName, func(t *testing.T) {
+					t.Parallel()
+					want, wantErr := renderChart(t, baselineDir, v, nil, flags...)
+					got, gotErr := renderChart(t, libraryDir, v, nil, flags...)
+					if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) {
+						t.Fatalf("error = %v, want %v", gotErr, wantErr)
+					}
+					if got != want {
+						t.Errorf("output changed:\n%s\nwant:\n%s", got, want)
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if wantErr != nil {
+						errs++
+					} else {
+						renders++
+					}
+				})
+			}
+		}
+	}
+}
+
+// Any other environment publishes at environmentUrls.<environment>, else
+// <id>-<environment>.<domain>; url names the production host and is ignored.
+// Nothing but the host differs from a production render.
+func TestEnvironmentHost(t *testing.T) {
+	gh := githubActionsFlags("example.com", "registry-credentials")
+	urls := "environmentUrls:\n  dev: dev.shop.example.org\n"
+	for name, tc := range map[string]struct {
+		values string
+		flags  []string
+		want   string
+	}{
+		"dev":                        {"", withEnvironment(gh, "dev", "prod"), "app-dev.example.com"},
+		"url is the production host": {"url: shop.example.org\n", withEnvironment(gh, "qa", "prod"), "app-qa.example.com"},
+		"environment url":            {urls, withEnvironment(gh, "dev", "prod"), "dev.shop.example.org"},
+		"another environment's url":  {urls, withEnvironment(gh, "qa", "prod"), "app-qa.example.com"},
+		"environment url, no domain": {urls, withEnvironment(jenkinsFlags("", ""), "dev", "prod"), "dev.shop.example.org"},
+		"production named live":      {"url: shop.example.org\n", withEnvironment(gh, "prod", "live"), "app-prod.example.com"},
+		"jenkins":                    {"", withEnvironment(jenkinsFlags("example.com", ""), "staging", "prod"), "app-staging.example.com"},
+		"numeric environment":        {"", withEnvironment(gh, "2", "prod"), "app-2.example.com"},
+		"environment named true":     {"", withEnvironment(gh, "true", "prod"), "app-true.example.com"},
+		"environment named null":     {"", withEnvironment(gh, "null", "prod"), "app-null.example.com"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := mustRender(t, tc.values, append(tc.flags, "--namespace", "dev")...)
+			var ir ingressRoute
+			r.decode(t, "traefik.io/v1alpha1 IngressRoute", &ir)
+			if len(ir.Spec.Routes) != 1 || ir.Spec.Routes[0].Match != "Host(`"+tc.want+"`)" {
+				t.Errorf("routes = %+v, want host %s", ir.Spec.Routes, tc.want)
+			}
+			if ir.Metadata.Namespace != "dev" {
+				t.Errorf("namespace = %q", ir.Metadata.Namespace)
+			}
+		})
+	}
+
+	t.Run("path prefix", func(t *testing.T) {
+		r := mustRender(t, "pathPrefix: /docs\n", withEnvironment(jenkinsFlags("example.com", "harbor-robot"), "dev", "prod")...)
+		var ir ingressRoute
+		r.decode(t, "traefik.io/v1alpha1 IngressRoute", &ir)
+		want := "Host(`app-dev.example.com`) && ( Path(`/docs`) || PathPrefix(`/docs/`) )"
+		if len(ir.Spec.Routes) != 1 || ir.Spec.Routes[0].Match != want {
+			t.Errorf("routes = %+v, want match %s", ir.Spec.Routes, want)
+		}
+	})
+
+	t.Run("only the host differs", func(t *testing.T) {
+		values := "replicaCount: 2\npathPrefix: /api\n"
+		flags := append(withEnvironment(gh, "dev", "prod"), "--namespace", "dev")
+		got, err := renderChart(t, libraryDir, values, nil, flags...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		production, err := renderChart(t, baselineDir, values, nil, flags...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := strings.Replace(production, "Host(`app.example.com`)", "Host(`app-dev.example.com`)", 1)
+		if got != want || want == production {
+			t.Errorf("render:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("domain or environment url required", func(t *testing.T) {
+		_, err := render(t, "url: shop.example.org\n", withEnvironment(jenkinsFlags("", ""), "dev", "prod")...)
+		if err == nil || !strings.Contains(err.Error(), "environmentUrls.dev or domain is required") {
+			t.Errorf("err = %v", err)
+		}
+	})
+}
+
+// valuesDump is an extra app-chart template exposing the computed values, as
+// helm get values -a returns them after a deploy.
+const valuesDump = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: values
+data:
+  values.json: {{ .Values | toJson | quote }}
+`
+
+// workflowHostRule is the Python the GitHub Actions workflow prints the
+// deployed host with.
+func workflowHostRule(t *testing.T) string {
+	t.Helper()
+	var wf struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(ghactions.Workflow), &wf); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range wf.Jobs["deploy"].Steps {
+		if m := regexp.MustCompile(`(?s)\nhost_rule='\n(.*?)\n'\n`).FindStringSubmatch(step.Run); m != nil {
+			return m[1]
+		}
+	}
+	t.Fatal("the workflow has no host_rule")
+	return ""
+}
+
+// The workflow's deploy summary reads the host back from the release's values
+// with the library's rule; both must agree for every case.
+func TestWorkflowHostRuleMatchesLibrary(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	rule := workflowHostRule(t)
+	gh := githubActionsFlags("example.com", "registry-credentials")
+	urls := "environmentUrls:\n  dev: dev.shop.example.org\n"
+	cases := map[string]struct {
+		values string
+		flags  []string
+	}{
+		"older workflow":           {"", gh},
+		"older workflow, url":      {"url: shop.example.org\n", gh},
+		"production":               {"url: shop.example.org\n", withEnvironment(gh, "prod", "prod")},
+		"production, no url":       {urls, withEnvironment(gh, "prod", "prod")},
+		"dev":                      {"url: shop.example.org\n", withEnvironment(gh, "dev", "prod")},
+		"dev url":                  {urls, withEnvironment(gh, "dev", "prod")},
+		"qa, dev url":              {urls, withEnvironment(gh, "qa", "prod")},
+		"no production known":      {"", append(slices.Clone(gh), "--set", "environment=dev")},
+		"empty environment":        {"url: shop.example.org\n", withEnvironment(gh, "", "prod")},
+		"chart's environment map":  {"environment:\n  region: eu\n", append(slices.Clone(gh), "--set", "productionEnvironment=prod")},
+		"chart's environment":      {"environment: staging\n", gh},
+		"numeric environment":      {"", withEnvironment(gh, "2", "prod")},
+		"jenkins, environment url": {urls, withEnvironment(jenkinsFlags("", ""), "dev", "prod")},
+	}
+	names := make([]string, 0, len(cases))
+	for name := range cases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	host := regexp.MustCompile("^Host\\(`([^`]+)`\\)")
+	for _, name := range names {
+		tc := cases[name]
+		t.Run(name, func(t *testing.T) {
+			r, err := renderWith(t, tc.values, map[string]string{"values.yaml": valuesDump}, tc.flags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ir ingressRoute
+			r.decode(t, "traefik.io/v1alpha1 IngressRoute", &ir)
+			m := host.FindStringSubmatch(ir.Spec.Routes[0].Match)
+			if m == nil {
+				t.Fatalf("match = %q", ir.Spec.Routes[0].Match)
+			}
+			var dump struct{ Data map[string]string }
+			r.decode(t, "v1 ConfigMap", &dump)
+			cmd := exec.Command("python3", "-c", rule)
+			cmd.Stdin = strings.NewReader(dump.Data["values.json"])
+			out, err := cmd.CombinedOutput()
+			if got := strings.TrimSpace(string(out)); err != nil || got != m[1] {
+				t.Errorf("workflow host = %q (%v), library host = %q", got, err, m[1])
 			}
 		})
 	}

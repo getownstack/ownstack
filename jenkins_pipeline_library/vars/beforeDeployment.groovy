@@ -4,6 +4,8 @@ def call(String applicationId) {
     def imageNameWithTag = "${values.imageRepositoryProject}/${applicationId}:${tag}"
     def image = "${env.IMAGE_REGISTRY}/${imageNameWithTag}"
     def scriptPath = "infrastructure/${applicationId}/before-deployment.sh"
+    // The namespace helmDeploy deploys into.
+    def environment = deployEnvironment() ?: values.namespace
 
     container('helm') {
         if (!fileExists(scriptPath)) {
@@ -11,12 +13,13 @@ def call(String applicationId) {
             return
         }
 
-        echo "Running ${scriptPath}"
+        echo "Running ${scriptPath} for ${environment}"
         sh """
             chmod +x '${scriptPath}'
             APPLICATION_ID='${applicationId}' \
             RELEASE_NAME='${applicationId}' \
-            NAMESPACE='${values.namespace}' \
+            NAMESPACE='${environment}' \
+            OWNSTACK_ENVIRONMENT='${environment}' \
             IMAGE='${image}' \
             IMAGE_REGISTRY='${env.IMAGE_REGISTRY}' \
             IMAGE_REPOSITORY_PROJECT='${values.imageRepositoryProject}' \

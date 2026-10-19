@@ -19,12 +19,13 @@ def call(Object applicationIds) {
         return
     }
 
-    // Only the deploy branch pushes and deploys. Other branches and pull
-    // requests are build-only checks, so a manual build never replaces the
-    // release from unreviewed code.
-    def deployBranch = values().deployBranch
-    boolean deployable = !env.CHANGE_ID && env.BRANCH_NAME == deployBranch
+    // Only mapped branches push and deploy, each into its environment
+    // (deployEnvironment). Pull requests and other branches are build-only
+    // checks, so a manual build never replaces a release from unreviewed code.
+    def environment = deployEnvironment()
+    boolean deployable = environment != ''
     def mode = deployable ? '' : ' (build only)'
+    def target = deployable ? environment : 'none (build only)'
 
     pipeline {
         agent {
@@ -49,6 +50,7 @@ def call(Object applicationIds) {
                                     Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
                                     Branch: ${env.GIT_BRANCH ?: 'N/A'}
                                     Application IDs: ${ids.join(', ')}
+                                    Environment: ${target}
                                     Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
                                 """.stripIndent()
                         )
@@ -108,6 +110,7 @@ def call(Object applicationIds) {
                                 Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
                                 Branch: ${env.GIT_BRANCH ?: 'N/A'}
                                 Application IDs: ${ids.join(', ')}
+                                Environment: ${target}
                                 Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
                             """.stripIndent()
                 )
@@ -122,6 +125,7 @@ def call(Object applicationIds) {
                                 Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
                                 Branch: ${env.GIT_BRANCH ?: 'N/A'}
                                 Application IDs: ${ids.join(', ')}
+                                Environment: ${target}
                                 Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
                             """.stripIndent()
                 )

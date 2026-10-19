@@ -34,7 +34,7 @@ ownstackctl up -f ownstack.yaml       # build it
 | vcs | `github` | Cluster repo and app repos; optionally a demo app repo. |
 | images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified (push access too, where the registry's token lists it), nothing is installed. Zot keeps every tag unless `keepTags` is set: then it keeps that many most recently pushed tags per repository, plus tags pulled in the last 30 days, and deletes the rest. Set it well above the number of tags you might roll back to. |
 | alerts | `slack` | Pipeline notifications (Jenkins). |
-| cicd | `gh-actions`, `jenkins` | See "Deploying apps". |
+| cicd | `gh-actions`, `jenkins` | See "Deploying apps". `environment` (default `prod`) is the production environment, where the default branch deploys (`main`, or Jenkins' `deployBranch`); `branches` sends other branches to other environments, such as `develop=dev release/*=qa`. See "Environments and promotion". |
 
 `ownstackctl catalog` prints every aspect, contract, provider, setting, and preset as JSON.
 
@@ -73,6 +73,7 @@ Each aspect is a contract with typed outputs. Providers only read other aspects'
 - Environments are lowercase DNS labels, each listed once. `default`, `kube-*`, `ownstack-*`, `traefik`, `zot`, `harbor`, and `jenkins` are reserved: CI deploy credentials can manage every environment namespace.
 - Each setting must match its kind (hostname, IPv4 address, email, whole number, true/false) and, where the catalog gives one, its format: image projects are lowercase registry paths, pull secret names are Kubernetes names, `k3sVersion` is a k3s release such as `v1.33.4+k3s1`.
 - The CI `environment` setting (default `prod`) must be one of the environments.
+- The CI `branches` setting is space-separated `<branch>=<environment>` pairs. A branch is a name or a glob whose `*` matches any characters, `/` included; it is listed once and is never the default branch (`main`, or Jenkins' `deployBranch`), which always deploys to `environment`. Each environment must be one of the environments.
 
 ## Deploying apps
 
@@ -84,20 +85,56 @@ infrastructure/<app>/helm/            # chart using {{ include "public-url-appli
 infrastructure/<app>/before-deployment.sh   # optional, runs after push, before deploy
 ```
 
-Apps are published at `https://<app>.<domain>` unless the chart sets `url`.
+In the production environment, apps are published at `https://<app>.<domain>` unless the chart sets `url`; other environments are described in "Environments and promotion".
 
-`before-deployment.sh` runs after the image is pushed, before the Helm deploy, with `APPLICATION_ID`, `RELEASE_NAME`, `NAMESPACE`, `IMAGE`, `IMAGE_REGISTRY`, `IMAGE_REPOSITORY_PROJECT`, `IMAGE_TAG`, `IMAGE_PULL_SECRET`, and `OWNSTACK_DOMAIN` set.
+`before-deployment.sh` runs after the image is pushed, before the Helm deploy, with `APPLICATION_ID`, `RELEASE_NAME`, `NAMESPACE`, `IMAGE`, `IMAGE_REGISTRY`, `IMAGE_REPOSITORY_PROJECT`, `IMAGE_TAG`, `IMAGE_PULL_SECRET`, `OWNSTACK_DOMAIN`, and `OWNSTACK_ENVIRONMENT` (the environment being deployed to, also its namespace) set. Workflows older than `# ownstack-workflow: 3` and older Jenkins libraries do not set `OWNSTACK_ENVIRONMENT`.
 
 The `repoFilter` setting of both CI providers takes space-separated wildcards, such as `app-* api-*`.
 
 - **GitHub Actions**: add `.github/workflows/ownstack.yml` (print it with `ownstackctl workflow`) and rerun `ownstackctl apply`. ownstackctl gives every repo that has the workflow a deploy credential limited to the environment namespaces, plus the registry credential, as Actions secrets and variables. Builds run on GitHub's runners; the server only runs apps.
+  - The workflow runs on pushes to every branch. A small `resolve` job picks the environment from `OWNSTACK_BRANCHES`; branches that map to none stop there, without building. Deploys to one environment run one at a time.
   - Images are built for the server's architecture (`OWNSTACK_PLATFORM`). On an ARM server, GitHub's default runners build under emulation, which is slower; set the repo or organization variable `OWNSTACK_RUNNER` to an ARM runner (for example `ubuntu-24.04-arm`) to build natively.
   - The Helm library comes from this repository at the tag of the ownstackctl release that last applied the stack, so it changes only when you apply with a newer release. Set `libraryRef` to pin another branch or tag.
   - `status` checks the repos the last apply configured, and warns when a repo's workflow is older than the one `ownstackctl workflow` prints. After adding the workflow to a new repo, rerun `apply`.
   - A repo that could not be checked for the workflow (for example, 403 from an organization's SSO) fails the apply after the other repos are configured.
   - Removing GitHub Actions with `--prune` also deletes the `OWNSTACK_*` secrets and variables from the repos it configured, when the GitHub token is available.
 - **Pods** in the environment namespaces must meet the Kubernetes Pod Security `baseline` level: no privileged containers, host network/PID/IPC, or hostPath volumes. Run anything that needs those in a namespace of its own. Pods that name no `imagePullSecrets` (hooks, CronJobs, third-party charts) pull with the environment's pull secret through the `default` service account; `public-url-application` names it explicitly.
-- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically and builds the `deployBranch` (default `main`) automatically. Only that branch pushes and deploys, into the `environment` setting (default `prod`); other branches and pull requests build only. When the owner, `repoFilter`, `jenkinsfilePath`, or `deployBranch` changes, apply rewrites the organization folder's configuration (`plan` shows it), replacing manual edits to the folder; Jenkins then deletes the jobs of repos that no longer match.
+- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically and builds the `deployBranch` (default `main`) and every branch `branches` maps automatically. The `deployBranch` pushes and deploys into the `environment` setting (default `prod`), mapped branches into theirs; other branches and pull requests build only. When the owner, `repoFilter`, `jenkinsfilePath`, `deployBranch`, or `branches` changes, apply rewrites the organization folder's configuration (`plan` shows it), replacing manual edits to the folder; Jenkins then deletes the jobs of repos that no longer match.
+
+## Environments and promotion
+
+Each of `spec.environments` (default `dev`, `qa`, `prod`) is a namespace the CI credentials can deploy to. The cicd settings decide which branch deploys where:
+
+```yaml
+  cicd:
+    provider: gh-actions
+    settings:
+      environment: prod                   # the production environment: main deploys here
+      branches: develop=dev release/*=qa  # first match wins; * matches any characters, / included
+```
+
+The default branch (`main` with GitHub Actions, `deployBranch` with Jenkins) always deploys to `environment`. Branches that match no pair do not deploy.
+
+Hosts: in the production environment an app is published at its chart's `url`, else `<app>.<domain>`, exactly as before environments existed. In any other environment it is published at `environmentUrls.<environment>` when the chart sets it, else `<app>-<environment>.<domain>`, which the stack's wildcard DNS record and certificate already cover. `url` is not used there, because it names the production host.
+
+```yaml
+# infrastructure/shop/helm/values.yaml
+url: shop.example.com
+environmentUrls:
+  qa: qa.shop.example.com   # dev uses shop-dev.<domain>
+```
+
+Both pipelines pass the Helm values `environment` and `productionEnvironment`, so a chart that uses a value named `environment` for something else sees it replaced.
+
+Promotion with GitHub Actions: images are tagged `<branch>-<commit>` (for example `release-1.2-0123456`). To deploy an image already in the registry to another environment, run the `ownstack` workflow by hand (Actions, Run workflow) on the branch whose charts and hooks should deploy it, with `environment` (for example `prod`) and `tag` set. It checks that every app's image exists, then deploys it without building. With only `environment`, it builds the branch and deploys it there. The environment must be one of `spec.environments`. With Jenkins, merge into the branch mapped to the target environment; that build deploys it.
+
+ownstackctl sets `OWNSTACK_BRANCHES` (the mapping, default branch first, such as `main=prod develop=dev release/*=qa`) and `OWNSTACK_PRODUCTION_ENVIRONMENT` for both providers: GitHub Actions repo variables (plus `OWNSTACK_ENVIRONMENTS`) and Jenkins global environment.
+
+Existing stacks:
+
+- GitHub Actions app repos with a workflow older than `# ownstack-workflow: 3` keep deploying only `main`, into `environment`; replace the file with the output of `ownstackctl workflow` (`status` warns about older copies). The new workflow deploys only `main` until the stack is applied with a release that sets `OWNSTACK_BRANCHES`.
+- A deploy outside the production environment refuses a Helm library from before environments, which would publish it at the production host: with GitHub Actions an old `libraryRef`, with Jenkins the cluster repo's older `common_helm_library`.
+- Jenkins cluster repos keep the pipeline library they were generated with, which deploys only the `deployBranch`, until a newer `jenkins_pipeline_library` is copied in.
 
 ## Secrets
 

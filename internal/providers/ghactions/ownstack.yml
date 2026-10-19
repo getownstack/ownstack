@@ -1,20 +1,101 @@
 # Ownstack pipeline: build every infrastructure/<app>/ that has a Dockerfile
 # and a Helm chart, push it to your registry, and deploy it to your cluster.
+# Branches deploy to the environments OWNSTACK_BRANCHES maps them to (main to
+# production); other branches do not build. Run it by hand to deploy a branch
+# to another environment, or with an image tag to promote an existing build.
 # ownstackctl manages the OWNSTACK_* secrets and variables this reads.
-# ownstack-workflow: 2
+# ownstack-workflow: 3
 name: ownstack
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
-
-concurrency:
-  group: ownstack-${{ github.ref }}
-  cancel-in-progress: false
+    inputs:
+      environment:
+        description: Environment to deploy to. Empty deploys to the environment the branch maps to.
+        required: false
+        default: ''
+      tag:
+        description: Image tag to promote, such as main-0123456. Empty builds the branch.
+        required: false
+        default: ''
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      production: ${{ steps.resolve.outputs.production }}
+    steps:
+      - name: Resolve the environment
+        id: resolve
+        env:
+          BRANCHES: ${{ vars.OWNSTACK_BRANCHES }}
+          ENVIRONMENTS: ${{ vars.OWNSTACK_ENVIRONMENTS }}
+          PRODUCTION: ${{ vars.OWNSTACK_PRODUCTION_ENVIRONMENT }}
+          NAMESPACE: ${{ vars.OWNSTACK_NAMESPACE }}
+          REQUESTED: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          # Stacks not applied since environments existed have no
+          # OWNSTACK_BRANCHES: main deploys to OWNSTACK_NAMESPACE, as before.
+          production="${PRODUCTION:-${NAMESPACE:-prod}}"
+          branches="${BRANCHES:-main=${NAMESPACE:-prod}}"
+          environments="${ENVIRONMENTS:-$production}"
+          label='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+          environment=""
+          if [ -n "${REQUESTED:-}" ]; then
+            read -ra known <<< "$environments"
+            for name in "${known[@]}"; do
+              if [ "$name" = "$REQUESTED" ]; then
+                environment="$name"
+              fi
+            done
+            if [ -z "$environment" ]; then
+              echo "::error::The environment input must be one of: $environments. Rerun 'ownstackctl apply' on your server if the stack has more."
+              exit 1
+            fi
+          else
+            read -ra pairs <<< "$branches"
+            for pair in "${pairs[@]}"; do
+              [[ "$pair" == *=* ]] || continue
+              pattern="${pair%%=*}"
+              # The pattern is a glob on purpose: * matches any characters, / too.
+              # shellcheck disable=SC2254
+              case "$GITHUB_REF_NAME" in
+                $pattern) environment="${pair#*=}"; break ;;
+              esac
+            done
+          fi
+          if [ -n "$environment" ] && ! [[ "$environment" =~ $label ]]; then
+            echo "::error::OWNSTACK_BRANCHES maps $GITHUB_REF_NAME to an invalid environment. Rerun 'ownstackctl apply' on your server."
+            exit 1
+          fi
+          if ! [[ "$production" =~ $label ]]; then
+            echo "::error::OWNSTACK_PRODUCTION_ENVIRONMENT is not a valid environment. Rerun 'ownstackctl apply' on your server."
+            exit 1
+          fi
+          if [ -z "$environment" ]; then
+            if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
+              echo "::error::$GITHUB_REF_NAME does not deploy to an environment ($branches). Choose one with the environment input."
+              exit 1
+            fi
+            echo "$GITHUB_REF_NAME does not deploy to an environment ($branches); nothing to build."
+          else
+            echo "$GITHUB_REF_NAME deploys to $environment (production: $production)."
+          fi
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
+          echo "production=$production" >> "$GITHUB_OUTPUT"
+
   deploy:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.environment != '' }}
+    # One deploy per environment at a time, whichever branch it comes from.
+    concurrency:
+      group: ownstack-deploy-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
     # Set the OWNSTACK_RUNNER variable (for example ubuntu-24.04-arm) to build
     # on a runner with the server's architecture instead of under emulation.
     runs-on: ${{ vars.OWNSTACK_RUNNER || 'ubuntu-latest' }}
@@ -32,8 +113,9 @@ jobs:
 
       # Images are built for the server's platform (OWNSTACK_PLATFORM); a
       # runner with another architecture builds them under QEMU emulation.
+      # Promotions deploy an image that is already built.
       - name: Set up emulation for the server's platform
-        if: ${{ (vars.OWNSTACK_PLATFORM || 'linux/amd64') != (runner.arch == 'ARM64' && 'linux/arm64' || 'linux/amd64') }}
+        if: ${{ !inputs.tag && (vars.OWNSTACK_PLATFORM || 'linux/amd64') != (runner.arch == 'ARM64' && 'linux/arm64' || 'linux/amd64') }}
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           image: docker.io/tonistiigi/binfmt:qemu-v10.2.3
@@ -47,7 +129,9 @@ jobs:
           PROJECT: ${{ vars.OWNSTACK_IMAGE_PROJECT }}
           DOMAIN: ${{ vars.OWNSTACK_DOMAIN }}
           PULL_SECRET: ${{ vars.OWNSTACK_PULL_SECRET }}
-          NAMESPACE: ${{ vars.OWNSTACK_NAMESPACE || 'prod' }}
+          NAMESPACE: ${{ needs.resolve.outputs.environment }}
+          PRODUCTION_ENVIRONMENT: ${{ needs.resolve.outputs.production }}
+          PROMOTE_TAG: ${{ inputs.tag }}
           PLATFORM: ${{ vars.OWNSTACK_PLATFORM }}
         run: |
           set -euo pipefail
@@ -57,25 +141,71 @@ jobs:
           fi
           ref="${GITHUB_REF_NAME//[^a-zA-Z0-9_.-]/-}"
           tag="$ref-${GITHUB_SHA::7}"
+          if [ -n "${PROMOTE_TAG:-}" ]; then
+            if ! [[ "$PROMOTE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::The tag input is not an image tag, such as main-0123456."
+              exit 1
+            fi
+            tag="$PROMOTE_TAG"
+          fi
+          # The host the Helm library publishes an app at, from the release's
+          # values (common_helm_library's rule).
+          host_rule='
+          import json, sys
+          v = json.load(sys.stdin) or {}
+          env, prod = str(v.get("environment") or ""), str(v.get("productionEnvironment") or "")
+          if isinstance(v.get("environment"), (dict, list, bool)):
+              env = ""
+          if isinstance(v.get("productionEnvironment"), (dict, list, bool)):
+              prod = ""
+          if not env or not prod or env == prod:
+              host = v.get("url") or "%s.%s" % (v.get("id"), v.get("domain"))
+          else:
+              urls = v.get("environmentUrls")
+              host = (urls.get(env) if isinstance(urls, dict) else None) or "%s-%s.%s" % (v.get("id"), env, v.get("domain"))
+          print(host)
+          '
+          # A library from before environments would publish every
+          # environment at the production host.
+          if [ "$NAMESPACE" != "$PRODUCTION_ENVIRONMENT" ] && ! grep -q productionEnvironment .ownstack/common_helm_library/templates/*.tpl; then
+            echo "::error::The Helm library at OWNSTACK_LIBRARY_REF predates environments and would publish $NAMESPACE at the production host. Set the gh-actions libraryRef to a newer release and rerun 'ownstackctl apply'."
+            exit 1
+          fi
           echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
           mkdir -p ~/.kube
           printf '%s' "$KUBECONFIG_DATA" > ~/.kube/config
           chmod 600 ~/.kube/config
+
+          # A promotion checks every app's image exists before deploying any.
+          if [ -n "${PROMOTE_TAG:-}" ]; then
+            missing=0
+            for dir in infrastructure/*/; do
+              app="$(basename "$dir")"
+              [ -f "$dir/Dockerfile" ] && [ -d "$dir/helm" ] || continue
+              if ! docker manifest inspect "$REGISTRY/$PROJECT/$app:$tag" > /dev/null 2>&1; then
+                echo "::error::$REGISTRY/$PROJECT/$app:$tag is not in the registry. Promote a tag a build pushed, such as main-0123456."
+                missing=1
+              fi
+            done
+            [ "$missing" -eq 0 ] || exit 1
+          fi
 
           deployed=0
           for dir in infrastructure/*/; do
             app="$(basename "$dir")"
             [ -f "$dir/Dockerfile" ] && [ -d "$dir/helm" ] || continue
             image="$REGISTRY/$PROJECT/$app:$tag"
-            echo "::group::Build $app"
-            docker build --platform "${PLATFORM:-linux/amd64}" -f "$dir/Dockerfile" -t "$image" .
-            docker push "$image"
-            echo "::endgroup::"
+            if [ -z "${PROMOTE_TAG:-}" ]; then
+              echo "::group::Build $app"
+              docker build --platform "${PLATFORM:-linux/amd64}" -f "$dir/Dockerfile" -t "$image" .
+              docker push "$image"
+              echo "::endgroup::"
+            fi
             if [ -f "$dir/before-deployment.sh" ]; then
               echo "::group::Before deployment $app"
               APPLICATION_ID="$app" RELEASE_NAME="$app" NAMESPACE="$NAMESPACE" IMAGE="$image" \
               IMAGE_REGISTRY="$REGISTRY" IMAGE_REPOSITORY_PROJECT="$PROJECT" IMAGE_TAG="$tag" \
-              IMAGE_PULL_SECRET="$PULL_SECRET" OWNSTACK_DOMAIN="$DOMAIN" \
+              IMAGE_PULL_SECRET="$PULL_SECRET" OWNSTACK_DOMAIN="$DOMAIN" OWNSTACK_ENVIRONMENT="$NAMESPACE" \
                 bash "$dir/before-deployment.sh"
               echo "::endgroup::"
             fi
@@ -84,10 +214,12 @@ jobs:
             cp -r .ownstack/common_helm_library "$dir/helm/charts/"
             helm upgrade --install "$app" "$dir/helm" --namespace "$NAMESPACE" \
               --set image="$image" --set id="$app" --set domain="$DOMAIN" \
-              --set imagePullSecret="$PULL_SECRET" --wait --timeout 5m
+              --set imagePullSecret="$PULL_SECRET" \
+              --set-string environment="$NAMESPACE" --set-string productionEnvironment="$PRODUCTION_ENVIRONMENT" \
+              --wait --timeout 5m
             echo "::endgroup::"
-            host="$(helm get values "$app" -n "$NAMESPACE" -a -o json | python3 -c 'import json,sys; v=json.load(sys.stdin); print(v.get("url") or "%s.%s" % (v["id"], v["domain"]))')"
-            echo "Deployed $app: https://$host" | tee -a "$GITHUB_STEP_SUMMARY"
+            host="$(helm get values "$app" -n "$NAMESPACE" -a -o json | python3 -c "$host_rule")"
+            echo "Deployed $app ($tag) to $NAMESPACE: https://$host" | tee -a "$GITHUB_STEP_SUMMARY"
             deployed=$((deployed + 1))
           done
           if [ "$deployed" -eq 0 ]; then

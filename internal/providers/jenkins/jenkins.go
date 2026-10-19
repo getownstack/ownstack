@@ -75,8 +75,8 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 func folderStep(ctx context.Context, rt *stack.Runtime) stack.Step {
 	folder := rt.Setting("orgFolder")
 	step := stack.Step{Action: "ensure", Target: "organization folder " + folder,
-		Detail: fmt.Sprintf("discovers %s/%s with %s; builds %s automatically and deploys it to %s",
-			rt.Out.VCS.Owner, rt.Setting("repoFilter"), rt.Setting("jenkinsfilePath"), deployBranch(rt), deployNamespace(rt))}
+		Detail: fmt.Sprintf("discovers %s/%s with %s; %s",
+			rt.Out.VCS.Owner, rt.Setting("repoFilter"), rt.Setting("jenkinsfilePath"), deploySummary(branchMappings(rt)))}
 	password, err := rt.Secret("adminPassword")
 	if err != nil {
 		return step
@@ -242,12 +242,79 @@ func deployBranch(rt *stack.Runtime) string {
 	return defaultDeployBranch
 }
 
-// deployNamespace is the environment the deploy branch deploys into.
+// deployNamespace is the environment the deploy branch deploys into: the
+// production environment.
 func deployNamespace(rt *stack.Runtime) string {
 	if ns := rt.Setting("environment"); ns != "" {
 		return ns
 	}
 	return defaultNamespace
+}
+
+// branchMapping maps a branch, a name or a glob where '*' matches any run of
+// characters including '/', to the environment it deploys into.
+type branchMapping struct{ Branch, Environment string }
+
+// branchMappings is the effective mapping: the deploy branch to the
+// production environment, then the branches setting's <branch>=<environment>
+// pairs in order. The first match wins, so a pair whose branch is already
+// mapped is dropped; malformed pairs (which validation rejects) are skipped.
+func branchMappings(rt *stack.Runtime) []branchMapping {
+	mappings := []branchMapping{{deployBranch(rt), deployNamespace(rt)}}
+	seen := map[string]bool{mappings[0].Branch: true}
+	for _, pair := range strings.Fields(rt.Setting("branches")) {
+		branch, environment, ok := strings.Cut(pair, "=")
+		if !ok || branch == "" || environment == "" || strings.Contains(environment, "=") || seen[branch] {
+			continue
+		}
+		seen[branch] = true
+		mappings = append(mappings, branchMapping{branch, environment})
+	}
+	return mappings
+}
+
+// branchesEnv formats mappings for OWNSTACK_BRANCHES, the shared library's
+// input: space-separated <branch>=<environment> pairs, deploy branch first.
+func branchesEnv(mappings []branchMapping) string {
+	pairs := make([]string, len(mappings))
+	for i, m := range mappings {
+		pairs[i] = m.Branch + "=" + m.Environment
+	}
+	return strings.Join(pairs, " ")
+}
+
+// globRegexp turns a branch glob into a regular expression: '*' matches any
+// run of characters, everything else is literal. A name without '*' gives
+// regexp.QuoteMeta(name), which Java's regex syntax reads the same way.
+func globRegexp(glob string) string {
+	parts := strings.Split(glob, "*")
+	for i, p := range parts {
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	return strings.Join(parts, ".*")
+}
+
+// triggerBranches is the organization folder's NoTrigger regular expression:
+// every mapped branch, so each one builds and deploys on push. With only the
+// deploy branch it is the quoted deploy branch, as before branch mappings.
+func triggerBranches(mappings []branchMapping) string {
+	alternatives := make([]string, len(mappings))
+	for i, m := range mappings {
+		alternatives[i] = globRegexp(m.Branch)
+	}
+	return strings.Join(alternatives, "|")
+}
+
+// deploySummary describes which branches deploy where, for plan.
+func deploySummary(mappings []branchMapping) string {
+	if len(mappings) == 1 {
+		return fmt.Sprintf("builds %s automatically and deploys it to %s", mappings[0].Branch, mappings[0].Environment)
+	}
+	pairs := make([]string, len(mappings))
+	for i, m := range mappings {
+		pairs[i] = m.Branch + " to " + m.Environment
+	}
+	return "builds and deploys automatically " + strings.Join(pairs, ", ")
 }
 
 func orgFolderData(rt *stack.Runtime) map[string]string {
@@ -261,8 +328,9 @@ func orgFolderData(rt *stack.Runtime) map[string]string {
 		"CredentialID":    vcsCredentialID,
 		"RepoFilter":      rt.Setting("repoFilter"),
 		"JenkinsfilePath": rt.Setting("jenkinsfilePath"),
-		// NoTriggerOrganizationFolderProperty takes a regular expression.
-		"TriggerBranches": regexp.QuoteMeta(deployBranch(rt)),
+		// NoTriggerOrganizationFolderProperty takes a regular expression,
+		// which Jenkins matches against the whole branch name.
+		"TriggerBranches": triggerBranches(branchMappings(rt)),
 	}
 }
 
@@ -340,9 +408,14 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 		{"IMAGE_PULL_SECRET", images.PullSecretName},
 		{"COMMON_HELM_LIBRARY_GITHUB_REPO", vcs.ClusterRepoURL},
 		{"OWNSTACK_DOMAIN", rt.Domain()},
-		// The shared library deploys only this branch, into this namespace.
+		// Libraries without branch mappings deploy only this branch, into
+		// this namespace.
 		{"OWNSTACK_DEPLOY_BRANCH", deployBranch(rt)},
 		{"OWNSTACK_NAMESPACE", deployNamespace(rt)},
+		// Newer libraries deploy each mapped branch into its environment
+		// and tell the Helm library which environment is production.
+		{"OWNSTACK_BRANCHES", branchesEnv(branchMappings(rt))},
+		{"OWNSTACK_PRODUCTION_ENVIRONMENT", deployNamespace(rt)},
 	}
 	var slack *stack.AlertsOutput
 	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {

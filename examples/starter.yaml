@@ -25,3 +25,5 @@ spec:
     provider: zot
   cicd:
     provider: gh-actions
+    # settings:
+    #   branches: develop=dev release/*=qa   # main deploys to prod; these branches to dev and qa

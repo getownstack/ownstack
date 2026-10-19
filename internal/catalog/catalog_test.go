@@ -126,3 +126,31 @@ func TestValidateChecksParams(t *testing.T) {
 		t.Errorf("templated defaults are not pattern-checked: %v", err)
 	}
 }
+
+func TestCICDBranchSettings(t *testing.T) {
+	for _, id := range []string{"gh-actions", "jenkins"} {
+		p, ok := Default().Provider("cicd", id)
+		if !ok {
+			t.Fatalf("no cicd provider %s", id)
+		}
+		env, ok := p.Param(ParamEnvironment)
+		if !ok || env.Kind != KindEnvironment || env.Default != "prod" || !env.Required {
+			t.Errorf("%s environment = %+v", id, env)
+		}
+		branches, ok := p.Param(ParamBranches)
+		if !ok || branches.Kind != KindString || !branches.Advanced || branches.Required || branches.Default != "" || branches.Pattern != "" {
+			t.Errorf("%s branches = %+v", id, branches)
+		}
+		if !strings.Contains(branches.Help, "develop=dev release/*=qa") || !strings.Contains(branches.Help, "<branch>=<environment>") {
+			t.Errorf("%s branches help does not explain the format: %q", id, branches.Help)
+		}
+	}
+	jenkins, _ := Default().Provider("cicd", "jenkins")
+	if deploy, ok := jenkins.Param(ParamDeployBranch); !ok || deploy.Default != DefaultBranch {
+		t.Errorf("jenkins deployBranch = %+v", deploy)
+	}
+	ghActions, _ := Default().Provider("cicd", "gh-actions")
+	if _, ok := ghActions.Param(ParamDeployBranch); ok {
+		t.Error("gh-actions deploys main; the manifest reads a deployBranch param as the default branch")
+	}
+}

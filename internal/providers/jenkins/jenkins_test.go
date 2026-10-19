@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -111,7 +112,7 @@ func jenkinsRuntime(t *testing.T, settings string) *stack.Runtime {
 	return rt.For("cicd")
 }
 
-func triggerBranches(t *testing.T, xmlConfig string) string {
+func folderTriggerBranches(t *testing.T, xmlConfig string) string {
 	t.Helper()
 	m := regexp.MustCompile(`(?s)<jenkins\.branch\.NoTriggerOrganizationFolderProperty>\s*<branches>([^<]*)</branches>`).FindStringSubmatch(xmlConfig)
 	if m == nil {
@@ -140,7 +141,7 @@ func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := triggerBranches(t, out); got != string(deploy[1]) {
+	if got := folderTriggerBranches(t, out); got != string(deploy[1]) {
 		t.Errorf("org folder triggers %q but the library deploys %q", got, deploy[1])
 	}
 	namespace := regexp.MustCompile(`env\.OWNSTACK_NAMESPACE \?: '([^']*)'`).FindSubmatch(lib)
@@ -153,7 +154,7 @@ func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := triggerBranches(t, out); got != `release/1\.0` {
+	if got := folderTriggerBranches(t, out); got != `release/1\.0` {
 		t.Errorf("branches = %q", got)
 	}
 }
@@ -172,6 +173,173 @@ func TestValuesExportDeploySettings(t *testing.T) {
 			t.Errorf("settings %q: env %v", c.settings, env)
 		}
 	}
+}
+
+func globalEnv(t *testing.T, settings string) map[string]string {
+	t.Helper()
+	env := map[string]string{}
+	for _, v := range valuesData(jenkinsRuntime(t, settings), "pw")["GlobalEnv"].([]envVar) {
+		env[v.Key] = v.Value
+	}
+	return env
+}
+
+// OWNSTACK_BRANCHES is the effective mapping, deploy branch first, and
+// OWNSTACK_PRODUCTION_ENVIRONMENT the environment the deploy branch deploys
+// into. The earlier variables keep their meaning for older libraries.
+func TestValuesExportBranchMappings(t *testing.T) {
+	for _, c := range []struct{ settings, branches, production, namespace string }{
+		{"", "main=prod", "prod", "prod"},
+		{"      branches: develop=dev release/*=qa\n", "main=prod develop=dev release/*=qa", "prod", "prod"},
+		{"      deployBranch: trunk\n      environment: qa\n      branches: \"  develop=dev\n        hotfix/*=qa \"\n", "trunk=qa develop=dev hotfix/*=qa", "qa", "qa"},
+		// Validation rejects these; the first match wins regardless, so a
+		// repeated or default branch (and a malformed pair) is dropped.
+		{"      branches: main=dev develop=dev develop=qa broken =x y= a=b=c\n", "main=prod develop=dev", "prod", "prod"},
+	} {
+		env := globalEnv(t, c.settings)
+		if env["OWNSTACK_BRANCHES"] != c.branches || env["OWNSTACK_PRODUCTION_ENVIRONMENT"] != c.production || env["OWNSTACK_NAMESPACE"] != c.namespace {
+			t.Errorf("settings %q: env %v", c.settings, env)
+		}
+	}
+
+	// The values reach JCasC intact.
+	values, err := stack.Render(valuesTmpl, valuesData(jenkinsRuntime(t, "      branches: develop=dev release/*=qa\n"), "pw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Controller struct {
+			JCasC struct {
+				ConfigScripts map[string]string `yaml:"configScripts"`
+			} `yaml:"JCasC"`
+		}
+	}
+	if err := yaml.Unmarshal([]byte(values), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var casc struct {
+		Jenkins struct {
+			GlobalNodeProperties []struct {
+				EnvVars struct {
+					Env []struct{ Key, Value string }
+				} `yaml:"envVars"`
+			} `yaml:"globalNodeProperties"`
+		}
+	}
+	if err := yaml.Unmarshal([]byte(parsed.Controller.JCasC.ConfigScripts["main"]), &casc); err != nil || len(casc.Jenkins.GlobalNodeProperties) != 1 {
+		t.Fatalf("JCasC: %v", err)
+	}
+	found := map[string]string{}
+	for _, e := range casc.Jenkins.GlobalNodeProperties[0].EnvVars.Env {
+		found[e.Key] = e.Value
+	}
+	if found["OWNSTACK_BRANCHES"] != "main=prod develop=dev release/*=qa" || found["OWNSTACK_PRODUCTION_ENVIRONMENT"] != "prod" {
+		t.Errorf("JCasC env = %v", found)
+	}
+}
+
+// The org folder builds every mapped branch automatically. Java matches the
+// expression against the whole branch name, so it is checked anchored here.
+func TestOrgFolderTriggersEveryMappedBranch(t *testing.T) {
+	out, err := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "      branches: develop=dev release/*=qa v1.*-rc=qa\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := folderTriggerBranches(t, out)
+	if got != `main|develop|release/.*|v1\..*-rc` {
+		t.Fatalf("branches = %q", got)
+	}
+	re := regexp.MustCompile(`^(?:` + got + `)$`)
+	for branch, want := range map[string]bool{
+		"main": true, "develop": true, "release/1.0": true, "release/a/b": true, "release/": true, "v1.2-rc": true, "v1.2/x-rc": true,
+		"mainx": false, "xmain": false, "develop2": false, "release": false, "feature/x": false, "v1x2-rc": false, "PR-1": false,
+	} {
+		if re.MatchString(branch) != want {
+			t.Errorf("trigger expression %q matches %q: %v, want %v", got, branch, !want, want)
+		}
+	}
+	if g := globRegexp("*"); g != ".*" {
+		t.Errorf("globRegexp(*) = %q", g)
+	}
+
+	// Adding mappings to an existing folder rewrites it once.
+	changes, ok, err := folderChanges(jenkinsStored, out)
+	if err != nil || !ok || !strings.Contains(strings.Join(changes, ", "), `auto-build branches "main" → "main|develop|release/.*|v1\\..*-rc"`) {
+		t.Errorf("changes = %v %v %v", changes, ok, err)
+	}
+}
+
+// Every variable ownstackctl puts in Jenkins global env is one the shared
+// library reads.
+func TestLibraryReadsGlobalEnv(t *testing.T) {
+	files, err := filepath.Glob("../../../jenkins_pipeline_library/vars/*.groovy")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no library sources: %v", err)
+	}
+	var lib strings.Builder
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lib.Write(data)
+	}
+	rt, _ := providertest.Runtime(t)
+	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", ClusterRepoURL: "https://github.com/acme/ownstack-cluster.git"}
+	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "product", PullSecretName: "harbor-robot"}
+	if err := (slack.Provider{}).Resolve(context.Background(), rt.For("alerts")); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range valuesData(rt.For("cicd"), "pw")["GlobalEnv"].([]envVar) {
+		if !strings.Contains(lib.String(), "env."+v.Key) {
+			t.Errorf("Jenkins global env sets %s, which the library never reads", v.Key)
+		}
+	}
+	// The library's fallback production environment is the namespace default.
+	values, _ := os.ReadFile("../../../jenkins_pipeline_library/vars/values.groovy")
+	if !strings.Contains(string(values), `env.OWNSTACK_PRODUCTION_ENVIRONMENT ?: (env.OWNSTACK_NAMESPACE ?: '`+defaultNamespace+`')`) {
+		t.Error("values.groovy productionEnvironment does not fall back to OWNSTACK_NAMESPACE")
+	}
+}
+
+func TestPlanDescribesBranchMappings(t *testing.T) {
+	if got := deploySummary(branchMappings(jenkinsRuntime(t, ""))); got != "builds main automatically and deploys it to prod" {
+		t.Errorf("default summary = %q", got)
+	}
+	if got := deploySummary(branchMappings(jenkinsRuntime(t, "      branches: develop=dev release/*=qa\n"))); got != "builds and deploys automatically main to prod, develop to dev, release/* to qa" {
+		t.Errorf("summary = %q", got)
+	}
+}
+
+// helmDeploy refuses a non-production deploy when the cluster repo's Helm
+// library predates environments, by looking for a word in its templates. The
+// live library must contain that word, or every such deploy would fail.
+func TestHelmDeployRecognizesCurrentHelmLibrary(t *testing.T) {
+	deploy, err := os.ReadFile("../../../jenkins_pipeline_library/vars/helmDeploy.groovy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`grep -q (\w+) \./tmp-infrastructure/common_helm_library/templates/\*\.tpl`).FindSubmatch(deploy)
+	if m == nil {
+		t.Fatal("helmDeploy.groovy does not check the Helm library")
+	}
+	if !strings.Contains(string(deploy), "--set-string "+string(m[1])+"=") {
+		t.Errorf("helmDeploy.groovy checks for %s but does not set it", m[1])
+	}
+	templates, err := filepath.Glob("../../../common_helm_library/templates/*.tpl")
+	if err != nil || len(templates) == 0 {
+		t.Fatalf("no library templates: %v", err)
+	}
+	for _, f := range templates {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), string(m[1])) {
+			return
+		}
+	}
+	t.Errorf("common_helm_library never mentions %s, so helmDeploy would refuse every non-production deploy", m[1])
 }
 
 // jenkinsStored is how Jenkins keeps a folder ownstackctl created: XML 1.1,

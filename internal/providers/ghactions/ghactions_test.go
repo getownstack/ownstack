@@ -118,7 +118,12 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 			}
 			json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(content))})
 		case strings.HasSuffix(r.URL.Path, "/runs"):
-			json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"status": "completed", "conclusion": "success", "head_sha": "0123456789"}}})
+			// Only main's runs succeeded; status must not read other branches'.
+			conclusion := "failure"
+			if r.URL.Query().Get("branch") == "main" {
+				conclusion = "success"
+			}
+			json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"status": "completed", "conclusion": conclusion, "head_sha": "0123456789"}}})
 		case r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -173,16 +178,25 @@ func TestLibraryRef(t *testing.T) {
 
 func TestRepoVariables(t *testing.T) {
 	images := &stack.ImagesOutput{Host: "registry.admin.example.com", Project: "apps", PushUsername: "ownstack", PushPassword: "pw", PullSecretName: "registry-credentials"}
-	vars := repoVariables(images, "example.com", "prod", "ownstackctl-v0.3.0", "arm64")
+	branches, err := branchMap("prod", "develop=dev release/*=qa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploy := deployTargets{production: "prod", branches: branches, environments: []string{"dev", "qa", "prod"}}
+	vars := repoVariables(images, "example.com", deploy, "ownstackctl-v0.3.0", "arm64")
 	want := map[string]string{
 		"OWNSTACK_REGISTRY":          "registry.admin.example.com",
 		"OWNSTACK_REGISTRY_USERNAME": "ownstack",
 		"OWNSTACK_IMAGE_PROJECT":     "apps",
 		"OWNSTACK_PULL_SECRET":       "registry-credentials",
 		"OWNSTACK_DOMAIN":            "example.com",
-		"OWNSTACK_NAMESPACE":         "prod",
-		"OWNSTACK_LIBRARY_REF":       "ownstackctl-v0.3.0",
-		"OWNSTACK_PLATFORM":          "linux/arm64",
+		// Kept for workflows committed before ownstack-workflow 3.
+		"OWNSTACK_NAMESPACE":              "prod",
+		"OWNSTACK_PRODUCTION_ENVIRONMENT": "prod",
+		"OWNSTACK_BRANCHES":               "main=prod develop=dev release/*=qa",
+		"OWNSTACK_ENVIRONMENTS":           "dev qa prod",
+		"OWNSTACK_LIBRARY_REF":            "ownstackctl-v0.3.0",
+		"OWNSTACK_PLATFORM":               "linux/arm64",
 	}
 	if len(vars) != len(want) {
 		t.Errorf("variables = %v", vars)
@@ -198,7 +212,7 @@ func TestRepoVariables(t *testing.T) {
 		}
 	}
 	// Without a known architecture the workflow keeps its linux/amd64 default.
-	if _, ok := repoVariables(images, "example.com", "prod", "main", "")["OWNSTACK_PLATFORM"]; ok {
+	if _, ok := repoVariables(images, "example.com", deploy, "main", "")["OWNSTACK_PLATFORM"]; ok {
 		t.Error("OWNSTACK_PLATFORM set without an architecture")
 	}
 }
@@ -206,7 +220,7 @@ func TestRepoVariables(t *testing.T) {
 // Everything the workflow reads is managed by ownstackctl (and removed by
 // Remove), except OWNSTACK_RUNNER, which belongs to the customer.
 func TestWorkflowReadsManagedSettings(t *testing.T) {
-	set := repoVariables(&stack.ImagesOutput{}, "", "", "", "amd64")
+	set := repoVariables(&stack.ImagesOutput{}, "", deployTargets{}, "", "amd64")
 	for _, m := range regexp.MustCompile(`vars\.(OWNSTACK_[A-Z_]+)`).FindAllStringSubmatch(Workflow, -1) {
 		name := m[1]
 		if name == "OWNSTACK_RUNNER" {
@@ -228,6 +242,45 @@ func TestWorkflowReadsManagedSettings(t *testing.T) {
 		if !slices.Contains(repoSecretNames, m[1]) {
 			t.Errorf("workflow reads secret %s, which ownstackctl does not manage", m[1])
 		}
+	}
+}
+
+// The default branch deploys to the environment setting, first; the
+// branches setting adds pairs in order.
+func TestBranchMap(t *testing.T) {
+	for setting, want := range map[string]string{
+		"":                                 "main=prod",
+		"  develop=dev   release/*=qa  ":   "main=prod develop=dev release/*=qa",
+		"release/*=qa hotfix/*=prod":       "main=prod release/*=qa hotfix/*=prod",
+		"feature/*/preview=dev develop=qa": "main=prod feature/*/preview=dev develop=qa",
+	} {
+		m, err := branchMap("prod", setting)
+		if err != nil {
+			t.Errorf("%q: %v", setting, err)
+			continue
+		}
+		if got := formatBranches(m); got != want {
+			t.Errorf("%q: OWNSTACK_BRANCHES = %q, want %q", setting, got, want)
+		}
+	}
+	for _, bad := range []string{"develop", "develop=", "=dev", "develop=dev=qa", "main=dev", "develop=dev main=qa"} {
+		if _, err := branchMap("prod", bad); err == nil {
+			t.Errorf("branches %q accepted", bad)
+		}
+	}
+
+	rt, _ := ghRuntime(t, "    settings:\n      environment: qa\n      branches: \"develop=dev release/*=prod\"\n")
+	rt.Out.VCS = vcs("")
+	if got := deploysDetail(rt); got != "main to qa, develop to dev, release/* to prod" {
+		t.Errorf("deploys %q", got)
+	}
+	if err := (Provider{}).Resolve(context.Background(), rt); err != nil {
+		t.Errorf("Resolve: %v", err)
+	}
+	rt, _ = ghRuntime(t, "    settings:\n      branches: \"main=dev\"\n")
+	rt.Out.VCS = vcs("")
+	if err := (Provider{}).Resolve(context.Background(), rt); err == nil || !strings.Contains(err.Error(), "branches") {
+		t.Errorf("Resolve accepted main in branches: %v", err)
 	}
 }
 
@@ -364,7 +417,8 @@ func TestStatusScansWithoutRecord(t *testing.T) {
 }
 
 func TestWorkflowMarker(t *testing.T) {
-	if workflowVersion < 2 {
+	// 3 added environments; status must warn about repos with older copies.
+	if workflowVersion < 3 {
 		t.Fatalf("embedded workflow version = %d", workflowVersion)
 	}
 	for content, want := range map[string]int{

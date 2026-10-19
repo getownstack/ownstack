@@ -141,12 +141,17 @@ type Run struct {
 	CreatedAt  string `json:"created_at"`
 }
 
-// LatestRun returns the most recent run of a workflow file, or nil.
-func (c *Client) LatestRun(ctx context.Context, owner, repo, workflow string) (*Run, error) {
+// LatestRun returns the most recent run of a workflow file on branch (any
+// branch when empty), or nil.
+func (c *Client) LatestRun(ctx context.Context, owner, repo, workflow, branch string) (*Run, error) {
 	var body struct {
 		Runs []Run `json:"workflow_runs"`
 	}
-	err := c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+repo+"/actions/workflows/"+workflow+"/runs?per_page=1", nil, &body)
+	path := "/repos/" + owner + "/" + repo + "/actions/workflows/" + workflow + "/runs?per_page=1"
+	if branch != "" {
+		path += "&branch=" + url.QueryEscape(branch)
+	}
+	err := c.Do(ctx, http.MethodGet, path, nil, &body)
 	if errors.Is(err, ErrNotFound) || (err == nil && len(body.Runs) == 0) {
 		return nil, nil
 	}

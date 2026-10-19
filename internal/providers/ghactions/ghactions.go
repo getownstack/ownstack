@@ -24,6 +24,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
 	"github.com/getownstack/ownstack-cluster-template/internal/githubapi"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
@@ -68,8 +69,13 @@ func workflowMarker(content []byte) int {
 var (
 	repoSecretNames   = []string{"OWNSTACK_KUBECONFIG", "OWNSTACK_REGISTRY_PASSWORD"}
 	repoVariableNames = []string{"OWNSTACK_REGISTRY", "OWNSTACK_REGISTRY_USERNAME", "OWNSTACK_IMAGE_PROJECT", "OWNSTACK_PULL_SECRET",
-		"OWNSTACK_DOMAIN", "OWNSTACK_NAMESPACE", "OWNSTACK_LIBRARY_REF", "OWNSTACK_PLATFORM"}
+		"OWNSTACK_DOMAIN", "OWNSTACK_NAMESPACE", "OWNSTACK_LIBRARY_REF", "OWNSTACK_PLATFORM",
+		"OWNSTACK_BRANCHES", "OWNSTACK_ENVIRONMENTS", "OWNSTACK_PRODUCTION_ENVIRONMENT"}
 )
+
+// defaultBranch always deploys to the environment setting (the production
+// environment); the branches setting maps other branches.
+const defaultBranch = "main"
 
 type Provider struct {
 	// APIURL overrides the GitHub API in tests.
@@ -78,15 +84,18 @@ type Provider struct {
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	rt.Out.CICD = &stack.CICDOutput{URL: "https://github.com/" + rt.Out.VCS.Owner}
-	_, err := parseRepoFilter(rt.Setting("repoFilter"))
+	if _, err := parseRepoFilter(rt.Setting("repoFilter")); err != nil {
+		return err
+	}
+	_, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
 	return err
 }
 
 func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	steps := []stack.Step{
 		{Action: "ensure", Target: "deploy identity", Detail: fmt.Sprintf("service account %s/%s, may only change %s", systemNamespace, deployer, strings.Join(rt.Manifest.Environments(), ", "))},
-		{Action: "configure", Target: "app pipelines", Detail: fmt.Sprintf("Helm library %s@%s, images for %s, deploys to %s",
-			libraryRepo, libraryRef(rt.Setting("libraryRef"), stack.EngineVersion), platform(nodeArch(rt)), rt.Setting("environment"))},
+		{Action: "configure", Target: "app pipelines", Detail: fmt.Sprintf("Helm library %s@%s, images for %s, deploys %s",
+			libraryRepo, libraryRef(rt.Setting("libraryRef"), stack.EngineVersion), platform(nodeArch(rt)), deploysDetail(rt))},
 	}
 	if rt.Out.VCS.Token == "" {
 		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: "repos with " + workflowPath})
@@ -141,7 +150,15 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		"OWNSTACK_KUBECONFIG":        kubeconfig,
 		"OWNSTACK_REGISTRY_PASSWORD": rt.Out.Images.PushPassword,
 	}
-	variables := repoVariables(rt.Out.Images, rt.Domain(), rt.Setting("environment"), ref, nodeArch(rt))
+	branches, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
+	if err != nil {
+		return err
+	}
+	variables := repoVariables(rt.Out.Images, rt.Domain(), deployTargets{
+		production:   rt.Setting("environment"),
+		branches:     branches,
+		environments: rt.Manifest.Environments(),
+	}, ref, nodeArch(rt))
 	for _, t := range repos {
 		if err := configureRepo(ctx, gh, t, secrets, variables); err != nil {
 			return fmt.Errorf("%s: %w", t, err)
@@ -153,7 +170,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err := recordTargets(ctx, rt, repos, failed); err != nil {
 		return err
 	}
-	rt.Logf("App pipelines take the Helm library from %s@%s and build images for %s", libraryRepo, ref, platform(nodeArch(rt)))
+	rt.Logf("App pipelines take the Helm library from %s@%s, build images for %s, and deploy %s", libraryRepo, ref, platform(nodeArch(rt)), deploysDetail(rt))
 	if demo {
 		info, err := gh.Repo(ctx, rt.Out.VCS.Owner, demoRepo)
 		if err != nil {
@@ -216,7 +233,10 @@ func pipelineCheck(ctx context.Context, gh *githubapi.Client, t target) stack.Ch
 	if err != nil {
 		return stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()}
 	}
-	run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile)
+	// Runs on the default branch: since ownstack-workflow 3 every push runs the
+	// workflow, and pushes to unmapped branches only resolve, so they would
+	// hide a failed deploy.
+	run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile, catalog.DefaultBranch)
 	var check stack.Check
 	switch {
 	case err != nil:
@@ -384,17 +404,77 @@ func platform(arch string) string {
 	return "linux/" + arch
 }
 
+// branchMapping sends pushes to branches matching pattern (a name, or a glob
+// whose * matches any characters, / included) to an environment.
+type branchMapping struct{ pattern, environment string }
+
+// branchMap is the effective mapping, first match wins: the default branch to
+// the production environment, then the branches setting's
+// space-separated <branch>=<environment> pairs in order. The manifest
+// validator checks the pairs against spec.environments; this only rejects
+// what the workflow could not read.
+func branchMap(production, setting string) ([]branchMapping, error) {
+	out := []branchMapping{{defaultBranch, production}}
+	for _, pair := range strings.Fields(setting) {
+		pattern, env, ok := strings.Cut(pair, "=")
+		if !ok || pattern == "" || env == "" || strings.Contains(env, "=") {
+			return nil, fmt.Errorf("branches: %q is not <branch>=<environment>", pair)
+		}
+		if pattern == defaultBranch {
+			return nil, fmt.Errorf("branches: %s always deploys to the environment setting (%s); do not list it", defaultBranch, production)
+		}
+		out = append(out, branchMapping{pattern, env})
+	}
+	return out, nil
+}
+
+// formatBranches is OWNSTACK_BRANCHES: the mapping as space-separated pairs,
+// such as "main=prod develop=dev release/*=qa".
+func formatBranches(mapping []branchMapping) string {
+	pairs := make([]string, len(mapping))
+	for i, m := range mapping {
+		pairs[i] = m.pattern + "=" + m.environment
+	}
+	return strings.Join(pairs, " ")
+}
+
+// deploysDetail says where pushes deploy, for plan.
+func deploysDetail(rt *stack.Runtime) string {
+	mapping, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
+	if err != nil {
+		return "nowhere: " + err.Error()
+	}
+	parts := make([]string, len(mapping))
+	for i, m := range mapping {
+		parts[i] = m.pattern + " to " + m.environment
+	}
+	return strings.Join(parts, ", ")
+}
+
+// deployTargets are where app repos deploy: the production environment (the
+// environment setting, where the default branch goes), the branch mapping,
+// and every environment a manual run may pick.
+type deployTargets struct {
+	production   string
+	branches     []branchMapping
+	environments []string
+}
+
 // repoVariables are the Actions variables the workflow reads; the registry
 // password and the deploy kubeconfig are secrets instead.
-func repoVariables(images *stack.ImagesOutput, domain, namespace, libraryRef, arch string) map[string]string {
+func repoVariables(images *stack.ImagesOutput, domain string, deploy deployTargets, libraryRef, arch string) map[string]string {
 	variables := map[string]string{
 		"OWNSTACK_REGISTRY":          images.Host,
 		"OWNSTACK_REGISTRY_USERNAME": images.PushUsername,
 		"OWNSTACK_IMAGE_PROJECT":     images.Project,
 		"OWNSTACK_PULL_SECRET":       images.PullSecretName,
 		"OWNSTACK_DOMAIN":            domain,
-		"OWNSTACK_NAMESPACE":         namespace,
-		"OWNSTACK_LIBRARY_REF":       libraryRef,
+		// Workflows before ownstack-workflow 3 deploy main here.
+		"OWNSTACK_NAMESPACE":              deploy.production,
+		"OWNSTACK_PRODUCTION_ENVIRONMENT": deploy.production,
+		"OWNSTACK_BRANCHES":               formatBranches(deploy.branches),
+		"OWNSTACK_ENVIRONMENTS":           strings.Join(deploy.environments, " "),
+		"OWNSTACK_LIBRARY_REF":            libraryRef,
 	}
 	// Without it the workflow builds linux/amd64.
 	if arch != "" {

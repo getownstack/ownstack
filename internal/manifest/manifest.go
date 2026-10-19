@@ -302,6 +302,11 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 			if msg := checkKind(param, value, m.Environments()); msg != "" {
 				add(path, "%s", msg)
 			}
+			if param.Key == catalog.ParamBranches {
+				for _, msg := range checkBranches(value, defaultBranch(p, settings), m.Environments()) {
+					add(path, "%s", msg)
+				}
+			}
 		}
 	}
 	return issues
@@ -357,6 +362,51 @@ func checkKind(param catalog.Param, value string, environments []string) string 
 		return param.PatternHelp
 	}
 	return ""
+}
+
+// branchRe is a branch name or a glob where '*' matches any run of characters,
+// including '/'. '*' is its only special character: the workflow matches it as
+// a bash case pattern, and Jenkins turns it into '.*' and quotes the rest.
+var branchRe = regexp.MustCompile(`^[A-Za-z0-9*][A-Za-z0-9._/*-]*$`)
+
+// defaultBranch is the branch a cicd provider deploys into its environment
+// setting, the production environment: its deployBranch setting when it has
+// one, else main.
+func defaultBranch(p catalog.Provider, settings map[string]string) string {
+	if _, ok := p.Param(catalog.ParamDeployBranch); ok && settings[catalog.ParamDeployBranch] != "" {
+		return settings[catalog.ParamDeployBranch]
+	}
+	return catalog.DefaultBranch
+}
+
+// checkBranches checks a branches setting: <branch>=<environment> pairs
+// separated by spaces, tabs, or newlines (where bash splits them), each
+// branch listed once and never the default branch, which always maps to the
+// environment setting. It returns one message per problem.
+func checkBranches(value, defaultBranch string, environments []string) []string {
+	var msgs []string
+	seen := map[string]bool{}
+	pairs := strings.FieldsFunc(value, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
+	for _, pair := range pairs {
+		branch, env, ok := strings.Cut(pair, "=")
+		if !ok || strings.Contains(env, "=") {
+			msgs = append(msgs, fmt.Sprintf("%q must be one <branch>=<environment> pair, such as develop=dev", pair))
+			continue
+		}
+		switch {
+		case !branchRe.MatchString(branch):
+			msgs = append(msgs, fmt.Sprintf("branch %q must be a branch name or a glob of letters, digits, '.', '_', '-', '/' and '*'", branch))
+		case branch == defaultBranch:
+			msgs = append(msgs, fmt.Sprintf("branch %q always deploys into the production environment (the environment setting); remove it here", branch))
+		case seen[branch]:
+			msgs = append(msgs, fmt.Sprintf("branch %q is listed twice", branch))
+		}
+		seen[branch] = true
+		if !slices.Contains(environments, env) {
+			msgs = append(msgs, fmt.Sprintf("environment %q of %q must be one of spec.environments (%s)", env, pair, strings.Join(environments, ", ")))
+		}
+	}
+	return msgs
 }
 
 // ── Writing ───────────────────────────────────────────────────────────────────

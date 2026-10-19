@@ -82,6 +82,18 @@ func TestExampleManifestsAreValid(t *testing.T) {
 		if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
 			t.Errorf("examples/%s.yaml: %v", name, issues)
 		}
+		// Commented-out settings must be valid once uncommented.
+		uncommented := strings.NewReplacer("    # settings:", "    settings:", "    #   ", "      ").Replace(string(data))
+		if uncommented == string(data) {
+			continue
+		}
+		m = parse(t, uncommented)
+		if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
+			t.Errorf("examples/%s.yaml uncommented: %v", name, issues)
+		}
+		if m.Spec.Components["cicd"].Settings["branches"] != "develop=dev release/*=qa" {
+			t.Errorf("examples/%s.yaml uncommented: cicd settings = %v", name, m.Spec.Components["cicd"].Settings)
+		}
 	}
 }
 
@@ -196,6 +208,76 @@ func TestCICDEnvironmentMustBeListed(t *testing.T) {
 				t.Fatalf("issues = %v", issues)
 			}
 		})
+	}
+}
+
+func TestBranches(t *testing.T) {
+	ghActions := strings.Replace(valid, "provider: jenkins\n    settings:\n      repoFilter: \"*\"", "provider: gh-actions\n    settings:\n      SETTINGS", 1)
+	ghActions = strings.Replace(ghActions, "provider: harbor", "provider: zot", 1)
+	jenkins := strings.Replace(valid, `repoFilter: "*"`, "SETTINGS", 1)
+	custom := func(src string) string {
+		return strings.Replace(src, "domain: example.com", "domain: example.com\n  environments: [dev, staging, prod]", 1)
+	}
+	for name, tc := range map[string]struct {
+		src, settings string
+		issues        int // at spec.cicd.settings.branches; no other issues
+	}{
+		"empty":                  {ghActions, `branches: ""`, 0},
+		"gitflow":                {ghActions, `branches: develop=dev release/*=qa`, 0},
+		"glob everything":        {ghActions, `branches: "develop=dev *=qa"`, 0},
+		"tabs and newlines":      {ghActions, `branches: "develop=dev\trelease/*=qa\n hotfix/*=prod "`, 0},
+		"globs and dots":         {ghActions, `branches: "release/1.*=qa feature/**=dev Team_x-1=dev"`, 0},
+		"custom environment":     {custom(ghActions), `branches: develop=staging`, 0},
+		"jenkins gitflow":        {jenkins, `branches: develop=dev release/*=qa`, 0},
+		"jenkins main elsewhere": {jenkins, "deployBranch: release\n      branches: main=dev", 0},
+		"no equals":              {ghActions, `branches: develop`, 1},
+		"two equals":             {ghActions, `branches: develop=dev=qa`, 1},
+		"empty branch":           {ghActions, `branches: =dev`, 1},
+		"empty environment":      {ghActions, `branches: develop=`, 1},
+		"unknown environment":    {ghActions, `branches: develop=staging`, 1},
+		"not in custom":          {custom(ghActions), `branches: develop=qa`, 1},
+		"bad branch":             {ghActions, `branches: "feature;rm=dev"`, 1},
+		"leading dash":           {ghActions, `branches: -x=dev`, 1},
+		"question mark":          {ghActions, `branches: release/?=qa`, 1},
+		"carriage return":        {ghActions, `branches: "develop=dev\r"`, 1},
+		"listed twice":           {ghActions, `branches: develop=dev release/*=qa develop=qa`, 1},
+		"default branch":         {ghActions, `branches: main=dev`, 1},
+		"jenkins default":        {jenkins, `branches: develop=dev main=qa`, 1},
+		"jenkins deploy branch":  {jenkins, "deployBranch: release\n      branches: release=qa", 1},
+		"several problems":       {ghActions, `branches: main=dev develop=x develop=dev feature`, 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := strings.Replace(tc.src, "SETTINGS", tc.settings, 1)
+			issues := parse(t, src).Validate(providers.Catalog())
+			n := 0
+			for _, issue := range issues {
+				if issue.Path != "spec.cicd.settings.branches" {
+					t.Fatalf("unexpected issue %v", issue)
+				}
+				n++
+			}
+			if n != tc.issues {
+				t.Fatalf("%d issues, want %d: %v", n, tc.issues, issues)
+			}
+		})
+	}
+}
+
+// A branches value may start with '*', a YAML alias indicator: writing the
+// manifest must quote it.
+func TestBranchesRoundTrip(t *testing.T) {
+	cat := providers.Catalog()
+	m := parse(t, strings.Replace(valid, `repoFilter: "*"`, `branches: "*=qa develop=dev"`, 1))
+	out, err := m.Marshal(cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := parse(t, string(out))
+	if got := back.Spec.Components["cicd"].Settings["branches"]; got != "*=qa develop=dev" {
+		t.Fatalf("branches = %q after a round trip:\n%s", got, out)
+	}
+	if issues := back.Validate(cat); len(issues) > 0 {
+		t.Fatalf("unexpected issues: %v", issues)
 	}
 }
 

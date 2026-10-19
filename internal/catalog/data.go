@@ -15,6 +15,31 @@ const (
 	imagePathHelp    = "must be lowercase letters and digits joined by '.', '_', '-' or '/' (registries reject uppercase)"
 )
 
+// Branch settings of the cicd providers. The default branch (the deployBranch
+// setting when a provider has one, else DefaultBranch) always deploys into the
+// environment setting, the production environment. The branches setting maps
+// further branches to environments; the manifest validates and parses it.
+const (
+	ParamEnvironment  = "environment"
+	ParamDeployBranch = "deployBranch"
+	ParamBranches     = "branches"
+	DefaultBranch     = "main"
+)
+
+// branchesParam is the cicd providers' setting for extra deploy branches.
+// defaultBranch names the branch it may not list, as the help text reads it;
+// older says which pipelines ignore the setting.
+func branchesParam(defaultBranch, unmapped, older string) Param {
+	return Param{Key: ParamBranches, Label: "Branch environments", Kind: KindString, Advanced: true, Placeholder: "develop=dev release/*=qa",
+		Help: "Other branches that deploy, as space-separated <branch>=<environment> pairs, for example develop=dev release/*=qa. " +
+			"A branch is a name or a glob where * matches any characters, including /. Each environment must be one of spec.environments. " +
+			defaultBranch + " always deploys into the production environment and is not listed; the first matching pair wins. " + unmapped + " " +
+			older}
+}
+
+// environmentHelp completes the cicd providers' environment setting help.
+const environmentHelp = "Apps publish at their url, else <id>.<domain>, there; in the other environments at the chart's environmentUrls.<environment>, else <id>-<environment>.<domain>."
+
 // pullSecretParam is the images providers' pull secret name setting.
 func pullSecretParam(def string) Param {
 	return Param{Key: "pullSecretName", Label: "Pull secret name", Kind: KindString, Required: true, Default: def, Advanced: true,
@@ -307,11 +332,12 @@ func Default() *Catalog {
 					{Key: "repoFilter", Label: "Repository filter", Kind: KindString, Default: "*", Advanced: true,
 						Help: "Space-separated wildcards, such as app-* api-*. Matching repos with a Jenkinsfile get a pipeline."},
 					{Key: "jenkinsfilePath", Label: "Jenkinsfile path", Kind: KindString, Default: "infrastructure/Jenkinsfile", Advanced: true},
-					{Key: "environment", Label: "Deploy environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
-						Help: "Environment the deploy branch deploys into, exported to Jenkins as OWNSTACK_NAMESPACE. Cluster repos with an older pipeline library always deploy to prod."},
-					{Key: "deployBranch", Label: "Deploy branch", Kind: KindString, Required: true, Default: "main", Advanced: true,
-						Help:    "Branch the organization folder builds automatically and the pipeline pushes and deploys from, exported as OWNSTACK_DEPLOY_BRANCH. Other branches build only.",
+					{Key: ParamEnvironment, Label: "Production environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
+						Help: "Environment the deploy branch deploys into, exported to Jenkins as OWNSTACK_NAMESPACE. " + environmentHelp + " Cluster repos with an older pipeline library always deploy to prod."},
+					{Key: ParamDeployBranch, Label: "Deploy branch", Kind: KindString, Required: true, Default: DefaultBranch, Advanced: true,
+						Help:    "Branch the organization folder builds automatically and the pipeline pushes and deploys into the production environment, exported as OWNSTACK_DEPLOY_BRANCH. Other branches build only unless Branch environments maps them.",
 						Pattern: `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, PatternHelp: "must be a branch name of letters, digits, '.', '_', '-' and '/'"},
+					branchesParam("The deploy branch", "Branches that match no pair build only.", "Cluster repos with an older pipeline library deploy only the deploy branch."),
 					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: "5.8.79", Advanced: true},
 				},
 			},
@@ -326,8 +352,9 @@ func Default() *Catalog {
 						Help: "Space-separated wildcards, such as app-* api-*. Matching repos that contain .github/workflows/ownstack.yml get the deploy credential."},
 					{Key: "libraryRef", Label: "Ownstack library ref", Kind: KindString, Advanced: true,
 						Help: "Branch or tag of getownstack/ownstack-cluster-template the workflow takes the Helm library from. Empty: the ownstackctl release running on the server, or main for development builds."},
-					{Key: "environment", Label: "Deploy environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
-						Help: "Environment that pushes to main deploy into."},
+					{Key: ParamEnvironment, Label: "Production environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
+						Help: "Environment that pushes to main deploy into. " + environmentHelp},
+					branchesParam(DefaultBranch, "Pushes to branches that match no pair do not deploy.", "App repos with a workflow older than ownstack-workflow 3 deploy only main."),
 					{Key: "additionalOwners", Label: "Additional owners", Kind: KindString, Advanced: true,
 						Help: "Comma-separated GitHub users or organizations whose repos also deploy here. The token must be able to administer them."},
 				},
