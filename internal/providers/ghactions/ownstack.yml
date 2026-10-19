@@ -1,6 +1,7 @@
 # Ownstack pipeline: build every infrastructure/<app>/ that has a Dockerfile
 # and a Helm chart, push it to your registry, and deploy it to your cluster.
 # ownstackctl manages the OWNSTACK_* secrets and variables this reads.
+# ownstack-workflow: 2
 name: ownstack
 
 on:
@@ -14,7 +15,9 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # Set the OWNSTACK_RUNNER variable (for example ubuntu-24.04-arm) to build
+    # on a runner with the server's architecture instead of under emulation.
+    runs-on: ${{ vars.OWNSTACK_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -27,6 +30,14 @@ jobs:
           path: .ownstack
           sparse-checkout: common_helm_library
 
+      # Images are built for the server's platform (OWNSTACK_PLATFORM); a
+      # runner with another architecture builds them under QEMU emulation.
+      - name: Set up emulation for the server's platform
+        if: ${{ (vars.OWNSTACK_PLATFORM || 'linux/amd64') != (runner.arch == 'ARM64' && 'linux/arm64' || 'linux/amd64') }}
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3
+
       - name: Build, push, and deploy
         env:
           KUBECONFIG_DATA: ${{ secrets.OWNSTACK_KUBECONFIG }}
@@ -37,6 +48,7 @@ jobs:
           DOMAIN: ${{ vars.OWNSTACK_DOMAIN }}
           PULL_SECRET: ${{ vars.OWNSTACK_PULL_SECRET }}
           NAMESPACE: ${{ vars.OWNSTACK_NAMESPACE || 'prod' }}
+          PLATFORM: ${{ vars.OWNSTACK_PLATFORM }}
         run: |
           set -euo pipefail
           if [ -z "${KUBECONFIG_DATA:-}" ]; then
@@ -56,13 +68,14 @@ jobs:
             [ -f "$dir/Dockerfile" ] && [ -d "$dir/helm" ] || continue
             image="$REGISTRY/$PROJECT/$app:$tag"
             echo "::group::Build $app"
-            docker build -f "$dir/Dockerfile" -t "$image" .
+            docker build --platform "${PLATFORM:-linux/amd64}" -f "$dir/Dockerfile" -t "$image" .
             docker push "$image"
             echo "::endgroup::"
             if [ -f "$dir/before-deployment.sh" ]; then
               echo "::group::Before deployment $app"
               APPLICATION_ID="$app" RELEASE_NAME="$app" NAMESPACE="$NAMESPACE" IMAGE="$image" \
               IMAGE_REGISTRY="$REGISTRY" IMAGE_REPOSITORY_PROJECT="$PROJECT" IMAGE_TAG="$tag" \
+              IMAGE_PULL_SECRET="$PULL_SECRET" OWNSTACK_DOMAIN="$DOMAIN" \
                 bash "$dir/before-deployment.sh"
               echo "::endgroup::"
             fi

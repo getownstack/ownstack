@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"golang.org/x/crypto/nacl/box"
 )
@@ -19,7 +20,7 @@ func (c *Client) Repos(ctx context.Context, owner, login string) ([]string, erro
 	var names []string
 	for page := 1; page <= 20; page++ {
 		path := fmt.Sprintf("/orgs/%s/repos?per_page=100&page=%d", url.PathEscape(owner), page)
-		if equalFold(owner, login) {
+		if strings.EqualFold(owner, login) {
 			path = fmt.Sprintf("/user/repos?affiliation=owner&per_page=100&page=%d", page)
 		}
 		var repos []struct {
@@ -33,7 +34,7 @@ func (c *Client) Repos(ctx context.Context, owner, login string) ([]string, erro
 			return nil, err
 		}
 		for _, r := range repos {
-			if !r.Archived && equalFold(r.Owner.Login, owner) {
+			if !r.Archived && strings.EqualFold(r.Owner.Login, owner) {
 				names = append(names, r.Name)
 			}
 		}
@@ -51,6 +52,22 @@ func (c *Client) FileExists(ctx context.Context, owner, repo, path string) (bool
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// FileContent returns a file on the repo's default branch; ErrNotFound when
+// it does not exist.
+func (c *Client) FileContent(ctx context.Context, owner, repo, path string) ([]byte, error) {
+	var file struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+repo+"/contents/"+path, nil, &file); err != nil {
+		return nil, err
+	}
+	if file.Encoding != "base64" {
+		return nil, fmt.Errorf("%s/%s: %s: unexpected encoding %q", owner, repo, path, file.Encoding)
+	}
+	return base64.StdEncoding.DecodeString(strings.ReplaceAll(file.Content, "\n", ""))
 }
 
 // SetSecret creates or updates an Actions secret, sealed with the repo's
@@ -98,6 +115,23 @@ func (c *Client) SetVariable(ctx context.Context, owner, repo, name, value strin
 	return err
 }
 
+// DeleteSecret removes an Actions secret; a missing one is not an error.
+func (c *Client) DeleteSecret(ctx context.Context, owner, repo, name string) error {
+	return ignoreNotFound(c.Do(ctx, http.MethodDelete, "/repos/"+owner+"/"+repo+"/actions/secrets/"+name, nil, nil))
+}
+
+// DeleteVariable removes an Actions variable; a missing one is not an error.
+func (c *Client) DeleteVariable(ctx context.Context, owner, repo, name string) error {
+	return ignoreNotFound(c.Do(ctx, http.MethodDelete, "/repos/"+owner+"/"+repo+"/actions/variables/"+name, nil, nil))
+}
+
+func ignoreNotFound(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // Run is the latest run of a workflow.
 type Run struct {
 	Status     string `json:"status"`
@@ -125,23 +159,4 @@ func (c *Client) LatestRun(ctx context.Context, owner, repo, workflow string) (*
 // Dispatch starts a workflow_dispatch run on ref.
 func (c *Client) Dispatch(ctx context.Context, owner, repo, workflow, ref string) error {
 	return c.Do(ctx, http.MethodPost, "/repos/"+owner+"/"+repo+"/actions/workflows/"+workflow+"/dispatches", map[string]string{"ref": ref}, nil)
-}
-
-func equalFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		x, y := a[i], b[i]
-		if 'A' <= x && x <= 'Z' {
-			x += 'a' - 'A'
-		}
-		if 'A' <= y && y <= 'Z' {
-			y += 'a' - 'A'
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
 }

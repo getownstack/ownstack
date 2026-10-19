@@ -10,9 +10,15 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,14 +32,44 @@ const (
 	systemNamespace = "ownstack-system"
 	deployer        = "ownstack-deployer"
 	tokenSecret     = "ownstack-deployer-token"
-	workflowFile    = "ownstack.yml"
-	workflowPath    = ".github/workflows/" + workflowFile
+	// targetsConfigMap records the repos the last apply configured, so status
+	// and removal do not have to scan every repo of every owner.
+	targetsConfigMap = "ownstack-ci-targets"
+	workflowFile     = "ownstack.yml"
+	workflowPath     = ".github/workflows/" + workflowFile
+	// libraryRepo is where the workflow takes common_helm_library from.
+	libraryRepo = "getownstack/ownstack-cluster-template"
 )
 
 // Workflow is the pipeline committed to app repos; docs link to it too.
 //
 //go:embed ownstack.yml
 var Workflow string
+
+// workflowVersion is the embedded workflow's "# ownstack-workflow: N"
+// marker. Bump it when app repos should replace their copy: status warns
+// about repos whose marker is missing or older.
+var workflowVersion = workflowMarker([]byte(Workflow))
+
+var markerPattern = regexp.MustCompile(`(?m)^#\s*ownstack-workflow:\s*(\d+)\s*$`)
+
+// workflowMarker returns a workflow's version marker, 0 when it has none.
+func workflowMarker(content []byte) int {
+	m := markerPattern.FindSubmatch(content)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(string(m[1]))
+	return n
+}
+
+// The secrets and variables ownstackctl manages in app repos. OWNSTACK_RUNNER
+// is the customer's own and is never touched.
+var (
+	repoSecretNames   = []string{"OWNSTACK_KUBECONFIG", "OWNSTACK_REGISTRY_PASSWORD"}
+	repoVariableNames = []string{"OWNSTACK_REGISTRY", "OWNSTACK_REGISTRY_USERNAME", "OWNSTACK_IMAGE_PROJECT", "OWNSTACK_PULL_SECRET",
+		"OWNSTACK_DOMAIN", "OWNSTACK_NAMESPACE", "OWNSTACK_LIBRARY_REF", "OWNSTACK_PLATFORM"}
+)
 
 type Provider struct {
 	// APIURL overrides the GitHub API in tests.
@@ -42,22 +78,28 @@ type Provider struct {
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	rt.Out.CICD = &stack.CICDOutput{URL: "https://github.com/" + rt.Out.VCS.Owner}
-	return nil
+	_, err := parseRepoFilter(rt.Setting("repoFilter"))
+	return err
 }
 
 func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	steps := []stack.Step{
 		{Action: "ensure", Target: "deploy identity", Detail: fmt.Sprintf("service account %s/%s, may only change %s", systemNamespace, deployer, strings.Join(rt.Manifest.Environments(), ", "))},
+		{Action: "configure", Target: "app pipelines", Detail: fmt.Sprintf("Helm library %s@%s, images for %s, deploys to %s",
+			libraryRepo, libraryRef(rt.Setting("libraryRef"), stack.EngineVersion), platform(nodeArch(rt)), rt.Setting("environment"))},
 	}
 	if rt.Out.VCS.Token == "" {
 		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: "repos with " + workflowPath})
 	}
-	repos, err := p.targetRepos(ctx, rt)
+	repos, failed, err := p.targetRepos(ctx, rt)
 	if err != nil {
 		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: err.Error()})
 	}
 	for _, r := range repos {
 		steps = append(steps, stack.Step{Action: "configure", Target: r.String(), Detail: "OWNSTACK_* secrets and variables"})
+	}
+	for _, f := range failed {
+		steps = append(steps, stack.Step{Action: "verify", Target: f.String(), Detail: "cannot check for " + workflowPath + ": " + f.err.Error()})
 	}
 	if demo := rt.Out.VCS.DemoRepo; demo != "" {
 		steps = append(steps, stack.Step{Action: "ensure", Target: rt.Out.VCS.Owner + "/" + demo, Detail: "commit " + workflowPath + " (first build deploys the demo)"})
@@ -83,22 +125,35 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	rt.Logf("Deploy credential verified against %s", rt.Out.Compute.APIServer)
 
 	gh := p.client(rt)
-	repos, err := p.targetRepos(ctx, rt)
+	// Repos that could not be checked fail the apply at the end, after every
+	// reachable repo is configured.
+	repos, failed, err := p.targetRepos(ctx, rt)
 	if err != nil {
 		return err
 	}
 	demoRepo := rt.Out.VCS.DemoRepo
 	demo := demoRepo != ""
-	demoTarget := target{rt.Out.VCS.Owner, demoRepo}
-	if demo && !containsTarget(repos, demoTarget) {
-		repos = append(repos, demoTarget)
+	if demo {
+		repos, failed = withDemo(repos, failed, target{rt.Out.VCS.Owner, demoRepo})
 	}
+	ref := libraryRef(rt.Setting("libraryRef"), stack.EngineVersion)
+	secrets := map[string]string{
+		"OWNSTACK_KUBECONFIG":        kubeconfig,
+		"OWNSTACK_REGISTRY_PASSWORD": rt.Out.Images.PushPassword,
+	}
+	variables := repoVariables(rt.Out.Images, rt.Domain(), rt.Setting("environment"), ref, nodeArch(rt))
 	for _, t := range repos {
-		if err := p.configureRepo(ctx, rt, gh, t, kubeconfig); err != nil {
+		if err := configureRepo(ctx, gh, t, secrets, variables); err != nil {
 			return fmt.Errorf("%s: %w", t, err)
 		}
 		rt.Logf("GitHub Actions configured for %s", t)
 	}
+	// Recorded as soon as the repos hold the credentials, so status and
+	// removal find them even when committing the demo workflow fails.
+	if err := recordTargets(ctx, rt, repos, failed); err != nil {
+		return err
+	}
+	rt.Logf("App pipelines take the Helm library from %s@%s and build images for %s", libraryRepo, ref, platform(nodeArch(rt)))
 	if demo {
 		info, err := gh.Repo(ctx, rt.Out.VCS.Owner, demoRepo)
 		if err != nil {
@@ -116,7 +171,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if len(repos) == 0 {
 		rt.Logf("No app repos yet. Add %s to a repo (ownstackctl prints it with `ownstackctl workflow`) and rerun apply.", workflowPath)
 	}
-	return nil
+	return discoveryError(failed)
 }
 
 func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
@@ -130,27 +185,58 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		return append(checks, stack.Check{Name: "pipelines", State: stack.Unknown, Detail: "GitHub token not available on this node"})
 	}
 	gh := p.client(rt)
-	repos, err := p.targetRepos(ctx, rt)
-	if err != nil {
-		return append(checks, stack.Check{Name: "pipelines", State: stack.Unknown, Detail: err.Error()})
-	}
-	for _, t := range repos {
-		run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile)
-		name := "pipeline " + t.String()
-		switch {
-		case err != nil:
-			checks = append(checks, stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()})
-		case run == nil:
-			checks = append(checks, stack.Check{Name: name, State: stack.Warn, Detail: "no runs yet"})
-		case run.Status != "completed":
-			checks = append(checks, stack.Check{Name: name, State: stack.OK, Detail: run.Status + " " + short(run.HeadSHA)})
-		case run.Conclusion == "success":
-			checks = append(checks, stack.Check{Name: name, State: stack.OK, Detail: "last build succeeded " + short(run.HeadSHA)})
-		default:
-			checks = append(checks, stack.Check{Name: name, State: stack.Warn, Detail: "last build " + run.Conclusion + ": " + run.HTMLURL})
+	// The repos the last apply configured: two requests each, however many
+	// repos the owners have. Stacks applied by an older ownstackctl have no
+	// record until the next apply, so they are still discovered.
+	repos, recorded := recordedTargets(ctx, rt)
+	var failed []repoError
+	if !recorded {
+		var err error
+		if repos, failed, err = p.targetRepos(ctx, rt); err != nil {
+			return append(checks, stack.Check{Name: "pipelines", State: stack.Unknown, Detail: err.Error()})
 		}
 	}
+	for _, t := range repos {
+		checks = append(checks, pipelineCheck(ctx, gh, t))
+	}
+	for _, f := range failed {
+		checks = append(checks, stack.Check{Name: "pipeline " + f.String(), State: stack.Unknown, Detail: f.err.Error()})
+	}
 	return checks
+}
+
+// pipelineCheck reports a repo's latest run, and warns when its workflow is
+// older than the one this ownstackctl ships.
+func pipelineCheck(ctx context.Context, gh *githubapi.Client, t target) stack.Check {
+	name := "pipeline " + t.String()
+	content, err := gh.FileContent(ctx, t.owner, t.name, workflowPath)
+	if errors.Is(err, githubapi.ErrNotFound) {
+		return stack.Check{Name: name, State: stack.Warn, Detail: workflowPath + " not found; rerun apply if the repo no longer deploys here"}
+	}
+	if err != nil {
+		return stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()}
+	}
+	run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile)
+	var check stack.Check
+	switch {
+	case err != nil:
+		check = stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()}
+	case run == nil:
+		check = stack.Check{Name: name, State: stack.Warn, Detail: "no runs yet"}
+	case run.Status != "completed":
+		check = stack.Check{Name: name, State: stack.OK, Detail: run.Status + " " + short(run.HeadSHA)}
+	case run.Conclusion == "success":
+		check = stack.Check{Name: name, State: stack.OK, Detail: "last build succeeded " + short(run.HeadSHA)}
+	default:
+		check = stack.Check{Name: name, State: stack.Warn, Detail: "last build " + run.Conclusion + ": " + run.HTMLURL}
+	}
+	if workflowMarker(content) < workflowVersion {
+		if check.State == stack.OK {
+			check.State = stack.Warn
+		}
+		check.Detail += fmt.Sprintf("; %s is older than ownstack-workflow %d, replace it with the output of `ownstackctl workflow`", workflowFile, workflowVersion)
+	}
+	return check
 }
 
 // target is one app repo the pipeline is configured for.
@@ -177,63 +263,259 @@ func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
 	return &githubapi.Client{Base: base, Token: rt.Out.VCS.Token, HTTP: rt.HTTP}
 }
 
+// repoFilter is the repoFilter setting: space-separated wildcards, as the
+// Jenkins organization folder takes them. A repo matches when any does.
+type repoFilter []string
+
+func parseRepoFilter(s string) (repoFilter, error) {
+	patterns := strings.Fields(s)
+	if len(patterns) == 0 {
+		return nil, fmt.Errorf("repoFilter is empty; use * for every repo")
+	}
+	for _, p := range patterns {
+		if _, err := path.Match(p, ""); err != nil {
+			return nil, fmt.Errorf("repoFilter: bad pattern %q", p)
+		}
+	}
+	return patterns, nil
+}
+
+func (f repoFilter) match(name string) bool {
+	for _, p := range f {
+		if ok, _ := path.Match(p, name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// repoError is a repo whose workflow could not be checked.
+type repoError struct {
+	target
+	err error
+}
+
 // targetRepos are the owners' repos matching the filter that carry the
-// Ownstack workflow.
-func (p Provider) targetRepos(ctx context.Context, rt *stack.Runtime) ([]target, error) {
+// Ownstack workflow. Repos that could not be checked (rate limits, SSO, an
+// outage) are returned in failed, so one of them does not hide the others.
+func (p Provider) targetRepos(ctx context.Context, rt *stack.Runtime) (targets []target, failed []repoError, err error) {
+	filter, err := parseRepoFilter(rt.Setting("repoFilter"))
+	if err != nil {
+		return nil, nil, err
+	}
 	gh := p.client(rt)
 	login := rt.Out.VCS.Username
 	if l, err := gh.Login(ctx); err == nil {
 		login = l
 	}
-	filter := rt.Setting("repoFilter")
 	clusterRepo := rt.Out.VCS.ClusterRepo
-	var out []target
 	for _, owner := range owners(rt) {
 		all, err := gh.Repos(ctx, owner, login)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", owner, err)
+			return nil, nil, fmt.Errorf("%s: %w", owner, err)
 		}
 		for _, name := range all {
 			if owner == rt.Out.VCS.Owner && name == clusterRepo {
 				continue
 			}
-			if ok, _ := path.Match(filter, name); !ok {
+			if !filter.match(name) {
 				continue
 			}
-			if has, err := gh.FileExists(ctx, owner, name, workflowPath); err == nil && has {
-				out = append(out, target{owner, name})
+			switch has, err := gh.FileExists(ctx, owner, name, workflowPath); {
+			case err != nil:
+				failed = append(failed, repoError{target{owner, name}, err})
+			case has:
+				targets = append(targets, target{owner, name})
 			}
 		}
 	}
-	return out, nil
+	return targets, failed, nil
 }
 
-func (p Provider) configureRepo(ctx context.Context, rt *stack.Runtime, gh *githubapi.Client, t target, kubeconfig string) error {
-	owner, repo, images := t.owner, t.name, rt.Out.Images
-	secrets := map[string]string{
-		"OWNSTACK_KUBECONFIG":        kubeconfig,
-		"OWNSTACK_REGISTRY_PASSWORD": images.PushPassword,
+// withDemo adds the demo repo, which is configured before its workflow is
+// committed. Once configured it is no longer a repo that could not be checked.
+func withDemo(repos []target, failed []repoError, demo target) ([]target, []repoError) {
+	if !containsTarget(repos, demo) {
+		repos = append(repos, demo)
 	}
+	return repos, slices.DeleteFunc(failed, func(f repoError) bool { return containsTarget(repos, f.target) })
+}
+
+// discoveryError fails an apply that could not check some repos.
+func discoveryError(failed []repoError) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	reasons := make([]string, len(failed))
+	for i, f := range failed {
+		reasons[i] = f.String() + ": " + f.err.Error()
+	}
+	return fmt.Errorf("could not check %d repos for %s (%s); the other repos are configured", len(failed), workflowPath, strings.Join(reasons, "; "))
+}
+
+// libraryRef is the template ref app pipelines take the Helm library from:
+// the libraryRef setting, else the tag of the running ownstackctl release,
+// so a stack's library only changes when a newer release applies it.
+// Development builds use main.
+func libraryRef(setting, version string) string {
+	if setting != "" {
+		return setting
+	}
+	if tag := stack.ReleaseTag(version); tag != "" {
+		return tag
+	}
+	return "main"
+}
+
+// nodeArch is the server's architecture from the compute output, "" when
+// the compute provider does not report one.
+func nodeArch(rt *stack.Runtime) string {
+	if rt.Out.Compute == nil {
+		return ""
+	}
+	return rt.Out.Compute.Arch
+}
+
+// platform is the image platform the workflow builds for.
+func platform(arch string) string {
+	if arch == "" {
+		return "linux/amd64"
+	}
+	return "linux/" + arch
+}
+
+// repoVariables are the Actions variables the workflow reads; the registry
+// password and the deploy kubeconfig are secrets instead.
+func repoVariables(images *stack.ImagesOutput, domain, namespace, libraryRef, arch string) map[string]string {
 	variables := map[string]string{
 		"OWNSTACK_REGISTRY":          images.Host,
 		"OWNSTACK_REGISTRY_USERNAME": images.PushUsername,
 		"OWNSTACK_IMAGE_PROJECT":     images.Project,
 		"OWNSTACK_PULL_SECRET":       images.PullSecretName,
-		"OWNSTACK_DOMAIN":            rt.Domain(),
-		"OWNSTACK_NAMESPACE":         rt.Setting("environment"),
-		"OWNSTACK_LIBRARY_REF":       rt.Setting("libraryRef"),
+		"OWNSTACK_DOMAIN":            domain,
+		"OWNSTACK_NAMESPACE":         namespace,
+		"OWNSTACK_LIBRARY_REF":       libraryRef,
 	}
+	// Without it the workflow builds linux/amd64.
+	if arch != "" {
+		variables["OWNSTACK_PLATFORM"] = platform(arch)
+	}
+	return variables
+}
+
+func configureRepo(ctx context.Context, gh *githubapi.Client, t target, secrets, variables map[string]string) error {
 	for name, value := range secrets {
-		if err := gh.SetSecret(ctx, owner, repo, name, value); err != nil {
+		if err := gh.SetSecret(ctx, t.owner, t.name, name, value); err != nil {
 			return fmt.Errorf("secret %s: %w", name, err)
 		}
 	}
 	for name, value := range variables {
-		if err := gh.SetVariable(ctx, owner, repo, name, value); err != nil {
+		if err := gh.SetVariable(ctx, t.owner, t.name, name, value); err != nil {
 			return fmt.Errorf("variable %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// recordedTargets returns the repos the last apply configured; ok is false
+// when there is no record (not applied yet, applied by an older
+// ownstackctl, or the cluster is unreachable).
+func recordedTargets(ctx context.Context, rt *stack.Runtime) (targets []target, ok bool) {
+	out, err := rt.Kube.Exec.Output(ctx, "kubectl", "get", "configmap", targetsConfigMap, "-n", systemNamespace, "-o", "json")
+	if err != nil {
+		return nil, false
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if json.Unmarshal([]byte(out), &cm) != nil {
+		return nil, false
+	}
+	raw, ok := cm.Data["targets"]
+	if !ok {
+		return nil, false
+	}
+	return parseTargets(raw), true
+}
+
+func parseTargets(raw string) []target {
+	var out []target
+	for _, line := range strings.Split(raw, "\n") {
+		owner, name, ok := strings.Cut(strings.TrimSpace(line), "/")
+		if ok && owner != "" && name != "" {
+			out = append(out, target{owner, name})
+		}
+	}
+	return out
+}
+
+func targetsObject(targets []target) map[string]any {
+	lines := make([]string, len(targets))
+	for i, t := range targets {
+		lines[i] = t.String()
+	}
+	sort.Strings(lines)
+	return map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": targetsConfigMap, "namespace": systemNamespace},
+		"data":     map[string]string{"targets": strings.Join(lines, "\n")},
+	}
+}
+
+// recordTargets saves the configured repos for status and removal. Repos
+// that could not be checked this time stay recorded; repos that dropped out
+// are reported, because they still hold the deploy credential.
+func recordTargets(ctx context.Context, rt *stack.Runtime, configured []target, failed []repoError) error {
+	previous, _ := recordedTargets(ctx, rt)
+	record := append([]target(nil), configured...)
+	for _, t := range previous {
+		switch {
+		case containsTarget(configured, t):
+		case containsFailed(failed, t):
+			record = append(record, t)
+		default:
+			rt.Logf("warning: %s no longer has %s or matches the repository filter, but still holds its OWNSTACK_* secrets and variables; delete them in the repo's settings if it should not deploy here", t, workflowPath)
+		}
+	}
+	return rt.Kube.Apply(ctx, targetsObject(record))
+}
+
+func containsFailed(list []repoError, v target) bool {
+	for _, f := range list {
+		if strings.EqualFold(f.owner, v.owner) && f.name == v.name {
+			return true
+		}
+	}
+	return false
+}
+
+// deployerCoreResources are the core resources app charts and
+// before-deployment hooks manage. They are listed because a wildcard would
+// include the namespace object itself: bound in prod, the token could then
+// delete prod or relabel it (Pod Security).
+var deployerCoreResources = []string{
+	"pods", "pods/log", "pods/exec", "pods/portforward", "pods/attach",
+	"services", "endpoints", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims",
+	"events", "replicationcontrollers", "resourcequotas", "limitranges",
+}
+
+// deployerRole is what the deploy token may do in each environment namespace
+// it is bound in: manage workloads, and only read the namespace itself
+// (hooks such as ownstack.io's check it exists).
+func deployerRole() map[string]any {
+	return map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+		"metadata": map[string]any{"name": deployer},
+		"rules": []map[string]any{
+			{"apiGroups": []string{""}, "resources": deployerCoreResources, "verbs": []string{"*"}},
+			{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "verbs": []string{"get"}},
+			{
+				"apiGroups": []string{"apps", "batch", "autoscaling", "policy", "networking.k8s.io", "traefik.io", "gateway.networking.k8s.io"},
+				"resources": []string{"*"},
+				"verbs":     []string{"*"},
+			},
+		},
+	}
 }
 
 // ensureDeployer creates a service account that can manage workloads only in
@@ -251,15 +533,7 @@ func (p Provider) ensureDeployer(ctx context.Context, rt *stack.Runtime) (string
 			"metadata": map[string]any{"name": tokenSecret, "namespace": systemNamespace,
 				"annotations": map[string]string{"kubernetes.io/service-account.name": deployer}},
 		},
-		{
-			"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
-			"metadata": map[string]any{"name": deployer},
-			"rules": []map[string]any{{
-				"apiGroups": []string{"", "apps", "batch", "autoscaling", "policy", "networking.k8s.io", "traefik.io", "gateway.networking.k8s.io"},
-				"resources": []string{"*"},
-				"verbs":     []string{"*"},
-			}},
-		},
+		deployerRole(),
 	}
 	for _, env := range rt.Manifest.Environments() {
 		objects = append(objects, map[string]any{
@@ -372,9 +646,17 @@ func (p Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
 	return ok
 }
 
-// Remove deletes the deploy identity; repos keep their workflow but can no
-// longer deploy.
+// Remove deletes the deploy identity and, when the GitHub token is available,
+// the OWNSTACK_* secrets and variables of the repos the last apply
+// configured. Repos keep their workflow but can no longer deploy. GitHub
+// failures are warnings: they never stop the cluster cleanup.
 func (p Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
+	// The record lives in ownstack-system, so read it before deleting that.
+	if repos, ok := recordedTargets(ctx, rt); ok {
+		p.removeRepoSettings(ctx, rt, repos)
+	} else {
+		rt.Logf("warning: no record of the configured app repos; they keep their OWNSTACK_* secrets and variables until you delete them in each repo's settings")
+	}
 	for _, env := range rt.Manifest.Environments() {
 		if err := rt.Kube.Delete(ctx, "rolebinding", deployer, "-n", env); err != nil {
 			return err
@@ -384,4 +666,41 @@ func (p Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
 		return err
 	}
 	return rt.Kube.Delete(ctx, "namespace", systemNamespace)
+}
+
+// removeRepoSettings deletes the secrets and variables ownstackctl set in
+// app repos, so a removed pipeline leaves no working registry credential
+// behind.
+func (p Provider) removeRepoSettings(ctx context.Context, rt *stack.Runtime, repos []target) {
+	if len(repos) == 0 {
+		return
+	}
+	if rt.Out.VCS == nil || rt.Out.VCS.Kind != "github" || rt.Out.VCS.Token == "" {
+		names := make([]string, len(repos))
+		for i, t := range repos {
+			names[i] = t.String()
+		}
+		rt.Logf("warning: no GitHub token available, so %s keep their OWNSTACK_* secrets and variables; delete them in each repo's settings", strings.Join(names, ", "))
+		return
+	}
+	gh := p.client(rt)
+	for _, t := range repos {
+		var failed []string
+		var lastErr error
+		for _, name := range repoSecretNames {
+			if err := gh.DeleteSecret(ctx, t.owner, t.name, name); err != nil {
+				failed, lastErr = append(failed, name), err
+			}
+		}
+		for _, name := range repoVariableNames {
+			if err := gh.DeleteVariable(ctx, t.owner, t.name, name); err != nil {
+				failed, lastErr = append(failed, name), err
+			}
+		}
+		if lastErr != nil {
+			rt.Logf("warning: %s: could not delete %s (%v); delete them in the repo's settings", t, strings.Join(failed, ", "), lastErr)
+			continue
+		}
+		rt.Logf("Removed the OWNSTACK_* secrets and variables from %s", t)
+	}
 }

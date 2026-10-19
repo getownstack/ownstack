@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -29,6 +30,12 @@ const (
 	vcsCredentialID      = "github-pat"
 	registryCredentialID = "harbor-robot"
 	alertsCredentialID   = "slack-token"
+
+	// The shared library's defaults when Jenkins global env does not set
+	// OWNSTACK_DEPLOY_BRANCH or OWNSTACK_NAMESPACE.
+	defaultDeployBranch = "main"
+	defaultNamespace    = "prod"
+	defaultGitHubAPI    = "https://api.github.com"
 )
 
 //go:embed values.yaml.tmpl
@@ -58,10 +65,40 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	steps = append(steps,
 		stack.Step{Action: "ensure", Target: "credentials", Detail: credentialSummary(rt)},
 		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
-		stack.Step{Action: "ensure", Target: "organization folder " + rt.Setting("orgFolder"),
-			Detail: fmt.Sprintf("discovers %s/%s with %s", rt.Out.VCS.Owner, rt.Setting("repoFilter"), rt.Setting("jenkinsfilePath"))},
+		folderStep(ctx, rt),
 	)
 	return steps
+}
+
+// folderStep plans the organization folder, and says what changes when an
+// existing folder's managed fields differ from the manifest.
+func folderStep(ctx context.Context, rt *stack.Runtime) stack.Step {
+	folder := rt.Setting("orgFolder")
+	step := stack.Step{Action: "ensure", Target: "organization folder " + folder,
+		Detail: fmt.Sprintf("discovers %s/%s with %s; builds %s automatically and deploys it to %s",
+			rt.Out.VCS.Owner, rt.Setting("repoFilter"), rt.Setting("jenkinsfilePath"), deployBranch(rt), deployNamespace(rt))}
+	password, err := rt.Secret("adminPassword")
+	if err != nil {
+		return step
+	}
+	desired, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
+	if err != nil {
+		return step
+	}
+	api, err := newClient(rt, password)
+	if err != nil {
+		return step
+	}
+	current, exists, err := api.get(ctx, "/job/"+url.PathEscape(folder)+"/config.xml")
+	if err != nil || !exists {
+		return step
+	}
+	changes, ok, err := folderChanges(current, desired)
+	if err != nil || !ok || len(changes) == 0 {
+		return step
+	}
+	return stack.Step{Action: "update", Target: "organization folder " + folder,
+		Detail: strings.Join(changes, ", ") + "; Jenkins then deletes the jobs and build history of repos that no longer match"}
 }
 
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -121,22 +158,19 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}
 
 	folder := rt.Setting("orgFolder")
-	exists, err := api.exists(ctx, folder)
+	xmlConfig, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
+	if err != nil {
+		return err
+	}
+	current, exists, err := api.get(ctx, "/job/"+url.PathEscape(folder)+"/config.xml")
 	if err != nil {
 		return err
 	}
 	if exists {
-		rt.Logf("Jenkins organization folder %s exists", folder)
-	} else {
-		xmlConfig, err := stack.Render(orgFolderTmpl, map[string]string{
-			"Owner":           rt.Out.VCS.Owner,
-			"CredentialID":    vcsCredentialID,
-			"RepoFilter":      rt.Setting("repoFilter"),
-			"JenkinsfilePath": rt.Setting("jenkinsfilePath"),
-		})
-		if err != nil {
+		if err := convergeFolder(ctx, rt, api, folder, current, xmlConfig); err != nil {
 			return err
 		}
+	} else {
 		if err := stack.Retry(ctx, rt.Console, "create organization folder", 5, 15*time.Second, func() error {
 			return api.post(ctx, "/createItem?name="+url.QueryEscape(folder), "application/xml", xmlConfig)
 		}); err != nil {
@@ -175,6 +209,127 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	return append(checks, stack.Check{Name: "organization folder", State: stack.Fail, Detail: detail})
 }
 
+// convergeFolder replaces an existing organization folder's config.xml when
+// a field ownstackctl manages differs from the manifest. Admin edits to the
+// folder survive only while the managed fields match.
+func convergeFolder(ctx context.Context, rt *stack.Runtime, api *client, folder, current, desired string) error {
+	changes, ok, err := folderChanges(current, desired)
+	switch {
+	case err != nil:
+		rt.Logf("warning: cannot read Jenkins folder %s (%v); leaving it unchanged", folder, err)
+		return nil
+	case !ok:
+		rt.Logf("warning: Jenkins item %s is not an organization folder; leaving it unchanged", folder)
+		return nil
+	case len(changes) == 0:
+		rt.Logf("Jenkins organization folder %s is up to date", folder)
+		return nil
+	}
+	if err := stack.Retry(ctx, rt.Console, "update organization folder", 5, 15*time.Second, func() error {
+		return api.post(ctx, "/job/"+url.PathEscape(folder)+"/config.xml", "application/xml", desired)
+	}); err != nil {
+		return err
+	}
+	rt.Logf("Jenkins organization folder %s updated: %s", folder, strings.Join(changes, ", "))
+	return nil
+}
+
+// deployBranch is the branch Jenkins builds automatically and deploys from.
+func deployBranch(rt *stack.Runtime) string {
+	if b := rt.Setting("deployBranch"); b != "" {
+		return b
+	}
+	return defaultDeployBranch
+}
+
+// deployNamespace is the environment the deploy branch deploys into.
+func deployNamespace(rt *stack.Runtime) string {
+	if ns := rt.Setting("environment"); ns != "" {
+		return ns
+	}
+	return defaultNamespace
+}
+
+func orgFolderData(rt *stack.Runtime) map[string]string {
+	api := rt.Out.VCS.APIURL
+	if api == "" {
+		api = defaultGitHubAPI
+	}
+	return map[string]string{
+		"Owner":           rt.Out.VCS.Owner,
+		"APIURL":          api,
+		"CredentialID":    vcsCredentialID,
+		"RepoFilter":      rt.Setting("repoFilter"),
+		"JenkinsfilePath": rt.Setting("jenkinsfilePath"),
+		// NoTriggerOrganizationFolderProperty takes a regular expression.
+		"TriggerBranches": regexp.QuoteMeta(deployBranch(rt)),
+	}
+}
+
+// folderConfig is what ownstackctl manages in an organization folder's
+// config.xml.
+type folderConfig struct {
+	XMLName         xml.Name
+	Owner           string `xml:"navigators>org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator>repoOwner"`
+	APIURL          string `xml:"navigators>org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator>apiUri"`
+	CredentialID    string `xml:"navigators>org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator>credentialsId"`
+	Includes        string `xml:"navigators>org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator>traits>jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait>includes"`
+	ScriptPath      string `xml:"projectFactories>org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProjectFactory>scriptPath"`
+	TriggerBranches string `xml:"properties>jenkins.branch.NoTriggerOrganizationFolderProperty>branches"`
+}
+
+func parseFolderConfig(raw string) (folderConfig, error) {
+	// Jenkins writes XML 1.1, which encoding/xml refuses; the body is
+	// 1.0-compatible.
+	if strings.HasPrefix(strings.TrimSpace(raw), "<?xml") {
+		if i := strings.Index(raw, "?>"); i >= 0 {
+			raw = raw[i+2:]
+		}
+	}
+	var c folderConfig
+	if err := xml.Unmarshal([]byte(raw), &c); err != nil {
+		return c, err
+	}
+	// Jenkins may normalize whitespace; an unset API URL means github.com.
+	c.Owner, c.CredentialID = strings.TrimSpace(c.Owner), strings.TrimSpace(c.CredentialID)
+	c.ScriptPath, c.TriggerBranches = strings.TrimSpace(c.ScriptPath), strings.TrimSpace(c.TriggerBranches)
+	c.Includes = strings.Join(strings.Fields(c.Includes), " ")
+	if c.APIURL = strings.TrimSpace(c.APIURL); c.APIURL == "" {
+		c.APIURL = defaultGitHubAPI
+	}
+	return c, nil
+}
+
+// folderChanges lists the managed fields of an existing folder that differ
+// from the desired config, as "field old → new". ok is false when the
+// existing item is not an organization folder.
+func folderChanges(current, desired string) (changes []string, ok bool, err error) {
+	have, err := parseFolderConfig(current)
+	if err != nil {
+		return nil, false, err
+	}
+	want, err := parseFolderConfig(desired)
+	if err != nil {
+		return nil, false, err
+	}
+	if have.XMLName.Local != want.XMLName.Local {
+		return nil, false, nil
+	}
+	for _, f := range []struct{ name, have, want string }{
+		{"owner", have.Owner, want.Owner},
+		{"API", have.APIURL, want.APIURL},
+		{"credential", have.CredentialID, want.CredentialID},
+		{"repository filter", have.Includes, want.Includes},
+		{"Jenkinsfile path", have.ScriptPath, want.ScriptPath},
+		{"auto-build branches", have.TriggerBranches, want.TriggerBranches},
+	} {
+		if f.have != f.want {
+			changes = append(changes, fmt.Sprintf("%s %q → %q", f.name, f.have, f.want))
+		}
+	}
+	return changes, true, nil
+}
+
 type envVar struct{ Key, Value string }
 
 func valuesData(rt *stack.Runtime, password string) map[string]any {
@@ -185,6 +340,9 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 		{"IMAGE_PULL_SECRET", images.PullSecretName},
 		{"COMMON_HELM_LIBRARY_GITHUB_REPO", vcs.ClusterRepoURL},
 		{"OWNSTACK_DOMAIN", rt.Domain()},
+		// The shared library deploys only this branch, into this namespace.
+		{"OWNSTACK_DEPLOY_BRANCH", deployBranch(rt)},
+		{"OWNSTACK_NAMESPACE", deployNamespace(rt)},
 	}
 	var slack *stack.AlertsOutput
 	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
@@ -332,6 +490,21 @@ func (c *client) ready(ctx context.Context) error {
 		return fmt.Errorf("HTTP %d", code)
 	}
 	return nil
+}
+
+// get returns a page; exists is false on 404.
+func (c *client) get(ctx context.Context, path string) (body string, exists bool, err error) {
+	code, data, err := c.request(ctx, http.MethodGet, path, "", "", nil)
+	if err != nil {
+		return "", false, err
+	}
+	switch code {
+	case http.StatusOK:
+		return string(data), true, nil
+	case http.StatusNotFound:
+		return "", false, nil
+	}
+	return "", false, fmt.Errorf("GET %s: HTTP %d", path, code)
 }
 
 func (c *client) exists(ctx context.Context, job string) (bool, error) {

@@ -42,6 +42,7 @@ func redactError(err error) string {
 }
 
 func main() {
+	stack.EngineVersion = version
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:]); err != nil {

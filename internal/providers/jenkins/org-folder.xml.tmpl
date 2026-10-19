@@ -25,7 +25,7 @@
       </templates>
     </jenkins.branch.OrganizationChildTriggersProperty>
     <jenkins.branch.NoTriggerOrganizationFolderProperty>
-      <branches>main</branches>
+      <branches>{{ xml .TriggerBranches }}</branches>
       <strategy>NONE</strategy>
     </jenkins.branch.NoTriggerOrganizationFolderProperty>
   </properties>
@@ -52,7 +52,7 @@
   <navigators>
     <org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator plugin="github-branch-source">
       <repoOwner>{{ xml .Owner }}</repoOwner>
-      <apiUri>https://api.github.com</apiUri>
+      <apiUri>{{ xml .APIURL }}</apiUri>
       <credentialsId>{{ xml .CredentialID }}</credentialsId>
       <enableAvatar>false</enableAvatar>
       <traits>

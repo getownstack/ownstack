@@ -37,7 +37,7 @@ type Removable interface {
 
 // Step is one planned action.
 type Step struct {
-	Action string `json:"action"` // install, upgrade, configure, ensure, verify
+	Action string `json:"action"` // install, upgrade, configure, ensure, create, replace, remove, verify
 	Target string `json:"target"`
 	Detail string `json:"detail,omitempty"`
 }

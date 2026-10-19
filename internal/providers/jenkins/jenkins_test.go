@@ -2,14 +2,21 @@ package jenkins
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/xml"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
 	"github.com/getownstack/ownstack-cluster-template/internal/providers/slack"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
@@ -60,7 +67,8 @@ func TestValuesRenderWithAlerts(t *testing.T) {
 
 func TestOrgFolderXML(t *testing.T) {
 	out, err := stack.Render(orgFolderTmpl, map[string]string{
-		"Owner": "acme", "CredentialID": "github-pat", "RepoFilter": "app-* <&>", "JenkinsfilePath": "infrastructure/Jenkinsfile",
+		"Owner": "acme", "APIURL": "https://api.github.com", "CredentialID": "github-pat", "RepoFilter": "app-* <&>",
+		"JenkinsfilePath": "infrastructure/Jenkinsfile", "TriggerBranches": "main",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,13 +94,36 @@ func TestOrgFolderXML(t *testing.T) {
 	}
 }
 
-// The org folder builds only the deploy branch automatically, and the shared
-// library deploys only from it. Both default to the same branch.
-func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
-	triggered := regexp.MustCompile(`(?s)<jenkins\.branch\.NoTriggerOrganizationFolderProperty>\s*<branches>([^<]*)</branches>`).FindStringSubmatch(orgFolderTemplate)
-	if triggered == nil {
+// jenkinsRuntime is the test stack (Jenkins CI) with extra cicd settings,
+// given as indented YAML.
+func jenkinsRuntime(t *testing.T, settings string) *stack.Runtime {
+	t.Helper()
+	rt, _ := providertest.Runtime(t)
+	if settings != "" {
+		m, err := manifest.Parse([]byte(strings.Replace(providertest.Manifest, "    provider: jenkins\n", "    provider: jenkins\n    settings:\n"+settings, 1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt.Manifest = m
+	}
+	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", APIURL: "https://api.github.com", ClusterRepoURL: "https://github.com/acme/ownstack-cluster.git"}
+	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "product", PullSecretName: "harbor-robot"}
+	return rt.For("cicd")
+}
+
+func triggerBranches(t *testing.T, xmlConfig string) string {
+	t.Helper()
+	m := regexp.MustCompile(`(?s)<jenkins\.branch\.NoTriggerOrganizationFolderProperty>\s*<branches>([^<]*)</branches>`).FindStringSubmatch(xmlConfig)
+	if m == nil {
 		t.Fatal("org folder has no NoTriggerOrganizationFolderProperty branches")
 	}
+	return m[1]
+}
+
+// The org folder builds only the deploy branch automatically, and the shared
+// library deploys only from it. Both default to the same branch, and the
+// folder follows the deployBranch setting.
+func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
 	lib, err := os.ReadFile("../../../jenkins_pipeline_library/vars/values.groovy")
 	if err != nil {
 		t.Fatal(err)
@@ -101,8 +132,194 @@ func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
 	if deploy == nil {
 		t.Fatal("values.groovy has no OWNSTACK_DEPLOY_BRANCH default")
 	}
-	if triggered[1] != string(deploy[1]) {
-		t.Errorf("org folder triggers %q but the library deploys %q", triggered[1], deploy[1])
+	rt := jenkinsRuntime(t, "")
+	if got := deployBranch(rt); got != string(deploy[1]) || defaultDeployBranch != got {
+		t.Errorf("default deploy branch %q (fallback %q), but the library deploys %q", got, defaultDeployBranch, deploy[1])
+	}
+	out, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := triggerBranches(t, out); got != string(deploy[1]) {
+		t.Errorf("org folder triggers %q but the library deploys %q", got, deploy[1])
+	}
+	namespace := regexp.MustCompile(`env\.OWNSTACK_NAMESPACE \?: '([^']*)'`).FindSubmatch(lib)
+	if namespace == nil || deployNamespace(rt) != string(namespace[1]) || defaultNamespace != string(namespace[1]) {
+		t.Errorf("default namespace %q, library %q", deployNamespace(rt), namespace)
+	}
+
+	// NoTrigger takes a regular expression: release/1.0 must not also match release/1x0.
+	out, err = stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "      deployBranch: release/1.0\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := triggerBranches(t, out); got != `release/1\.0` {
+		t.Errorf("branches = %q", got)
+	}
+}
+
+// Jenkins global env carries the deploy branch and namespace the library reads.
+func TestValuesExportDeploySettings(t *testing.T) {
+	for _, c := range []struct{ settings, branch, namespace string }{
+		{"", "main", "prod"},
+		{"      deployBranch: trunk\n      environment: qa\n", "trunk", "qa"},
+	} {
+		env := map[string]string{}
+		for _, v := range valuesData(jenkinsRuntime(t, c.settings), "pw")["GlobalEnv"].([]envVar) {
+			env[v.Key] = v.Value
+		}
+		if env["OWNSTACK_DEPLOY_BRANCH"] != c.branch || env["OWNSTACK_NAMESPACE"] != c.namespace {
+			t.Errorf("settings %q: env %v", c.settings, env)
+		}
+	}
+}
+
+// jenkinsStored is how Jenkins keeps a folder ownstackctl created: XML 1.1,
+// plugin versions, normalized whitespace, an admin's extra trait, and no
+// apiUri (older folders).
+const jenkinsStored = `<?xml version='1.1' encoding='UTF-8'?>
+<jenkins.branch.OrganizationFolder plugin="branch-api@2.1217">
+  <properties>
+    <jenkins.branch.NoTriggerOrganizationFolderProperty>
+      <branches>main</branches>
+      <strategy>NONE</strategy>
+    </jenkins.branch.NoTriggerOrganizationFolderProperty>
+  </properties>
+  <navigators>
+    <org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator plugin="github-branch-source@1810.v913311241fa_9">
+      <repoOwner>acme</repoOwner>
+      <credentialsId>github-pat</credentialsId>
+      <traits>
+        <jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait plugin="scm-api@704.v3ce5c542825a_">
+          <includes>app-*   api-*
+          </includes>
+          <excludes></excludes>
+        </jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait>
+        <org.jenkinsci.plugins.github__branch__source.ForkPullRequestDiscoveryTrait>
+          <strategyId>2</strategyId>
+        </org.jenkinsci.plugins.github__branch__source.ForkPullRequestDiscoveryTrait>
+      </traits>
+    </org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator>
+  </navigators>
+  <projectFactories>
+    <org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProjectFactory plugin="workflow-multibranch@795.ve0cb_1f45ca_9a_">
+      <scriptPath>infrastructure/Jenkinsfile</scriptPath>
+    </org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProjectFactory>
+  </projectFactories>
+</jenkins.branch.OrganizationFolder>`
+
+func TestFolderChanges(t *testing.T) {
+	desired := func(settings string) string {
+		out, err := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, settings)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	same := desired("      repoFilter: app-* api-*\n")
+	if changes, ok, err := folderChanges(same, same); err != nil || !ok || len(changes) != 0 {
+		t.Errorf("rendered folder against itself: %v %v %v", changes, ok, err)
+	}
+	if changes, ok, err := folderChanges(jenkinsStored, same); err != nil || !ok || len(changes) != 0 {
+		t.Errorf("stored folder with the same managed fields: %v %v %v", changes, ok, err)
+	}
+	changes, ok, err := folderChanges(jenkinsStored, desired("      repoFilter: \"*\"\n      deployBranch: trunk\n"))
+	if err != nil || !ok || strings.Join(changes, ", ") != `repository filter "app-* api-*" → "*", auto-build branches "main" → "trunk"` {
+		t.Errorf("changes = %v %v %v", changes, ok, err)
+	}
+	if _, ok, err := folderChanges(`<?xml version='1.1' encoding='UTF-8'?><com.cloudbees.hudson.plugins.folder.Folder/>`, same); ok || err != nil {
+		t.Errorf("a plain folder is not ownstackctl's to update: %v %v", ok, err)
+	}
+	if _, _, err := folderChanges("<not xml", same); err == nil {
+		t.Error("unreadable config accepted")
+	}
+}
+
+// fakeJenkins answers the crumb issuer and one folder's config.xml, and
+// records posts.
+type fakeJenkins struct {
+	mu     sync.Mutex
+	config string
+	posts  []string
+}
+
+func (f *fakeJenkins) handler(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case r.URL.Path == "/crumbIssuer/api/json":
+		w.Write([]byte(`{"crumb":"c","crumbRequestField":"Jenkins-Crumb"}`))
+	case r.URL.Path == "/job/Repositories/config.xml" && r.Method == http.MethodGet:
+		if f.config == "" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(f.config))
+	case r.Method == http.MethodPost:
+		if r.Header.Get("Jenkins-Crumb") != "c" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		f.posts = append(f.posts, r.URL.Path+" "+string(body))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestConvergeFolderPostsOnlyOnDrift(t *testing.T) {
+	jenkins := &fakeJenkins{config: jenkinsStored}
+	srv := httptest.NewServer(http.HandlerFunc(jenkins.handler))
+	defer srv.Close()
+	api := &client{base: srv.URL, password: "pw", http: srv.Client()}
+	rt, out := providertest.Runtime(t)
+	ctx := context.Background()
+
+	unchanged, _ := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "      repoFilter: app-* api-*\n")))
+	if err := convergeFolder(ctx, rt, api, "Repositories", jenkins.config, unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if len(jenkins.posts) != 0 {
+		t.Errorf("posted without drift: %v", jenkins.posts)
+	}
+
+	changed, _ := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "")))
+	if err := convergeFolder(ctx, rt, api, "Repositories", jenkins.config, changed); err != nil {
+		t.Fatal(err)
+	}
+	if len(jenkins.posts) != 1 || !strings.HasPrefix(jenkins.posts[0], "/job/Repositories/config.xml <?xml") || !strings.Contains(jenkins.posts[0], "<includes>*</includes>") {
+		t.Errorf("posts = %v", jenkins.posts)
+	}
+	if !strings.Contains(out.String(), `Repositories updated: repository filter "app-* api-*" → "*"`) {
+		t.Errorf("log:\n%s", out.String())
+	}
+}
+
+// Plan says when apply will rewrite an existing folder, and what that costs.
+func TestPlanReportsFolderUpdate(t *testing.T) {
+	jenkins := &fakeJenkins{config: jenkinsStored}
+	srv := httptest.NewTLSServer(http.HandlerFunc(jenkins.handler))
+	defer srv.Close()
+	folder := func(settings string) stack.Step {
+		rt := jenkinsRuntime(t, settings)
+		rt.ServiceHTTP = &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+			},
+		}}
+		return folderStep(context.Background(), rt)
+	}
+	if step := folder("      repoFilter: app-* api-*\n"); step.Action != "ensure" || !strings.Contains(step.Detail, "builds main automatically and deploys it to prod") {
+		t.Errorf("unchanged folder: %+v", step)
+	}
+	step := folder("      jenkinsfilePath: ci/Jenkinsfile\n      repoFilter: app-* api-*\n")
+	if step.Action != "update" || !strings.Contains(step.Detail, `Jenkinsfile path "infrastructure/Jenkinsfile" → "ci/Jenkinsfile"`) ||
+		!strings.Contains(step.Detail, "deletes the jobs") {
+		t.Errorf("drifted folder: %+v", step)
+	}
+	if len(jenkins.posts) != 0 {
+		t.Errorf("plan changed Jenkins: %v", jenkins.posts)
 	}
 }
 

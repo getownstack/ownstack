@@ -28,11 +28,11 @@ ownstackctl up -f ownstack.yaml       # build it
 
 | Aspect | Providers | Notes |
 | --- | --- | --- |
-| compute | `own-vps` | k3s on the server ownstackctl runs on. The public IP is added to the API certificate. |
-| dns | `cloudflare`, `manual` | Cloudflare manages A records and DNS-01 certificates. Manual: you create `A domain` and `A *.domain`; certificates use TLS-ALPN. |
+| compute | `own-vps` | k3s on the server ownstackctl runs on. The public IP is added to the API certificate. `k3sVersion` pins a release; setting it to a newer one upgrades k3s on the next apply (one minor version at a time, never down; the API server restarts briefly). |
+| dns | `cloudflare`, `manual` | Cloudflare manages A records and DNS-01 certificates. It only changes records it created (comment `managed by ownstack`) or A records already pointing at the server; see "Troubleshooting". Manual: you create `A domain` and `A *.domain`; certificates use TLS-ALPN. |
 | ingress | `traefik` | Let's Encrypt certificates; `acmeStaging: true` for test runs (health checks then accept the staging certificate, but CI pushing from outside the server will not trust it). |
 | vcs | `github` | Cluster repo and app repos; optionally a demo app repo. |
-| images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified, nothing is installed. |
+| images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified (push access too, where the registry's token lists it), nothing is installed. Zot keeps every tag unless `keepTags` is set: then it keeps that many most recently pushed tags per repository, plus tags pulled in the last 30 days, and deletes the rest. Set it well above the number of tags you might roll back to. |
 | alerts | `slack` | Pipeline notifications (Jenkins). |
 | cicd | `gh-actions`, `jenkins` | See "Deploying apps". |
 
@@ -48,7 +48,7 @@ metadata:
 spec:
   domain: example.com
   # adminSubdomain: admin          # platform services at <svc>.admin.example.com (default)
-  # environments: [dev, qa, prod]  # namespaces that get the registry pull secret
+  # environments: [dev, qa, prod]  # namespaces with the registry pull secret and Pod Security baseline
   compute:
     provider: own-vps
     settings: {host: 203.0.113.10}
@@ -68,6 +68,12 @@ spec:
 
 Each aspect is a contract with typed outputs. Providers only read other aspects' outputs, never their settings, so any provider that satisfies a contract can replace another. Every component also accepts `values:`, extra Helm values merged over the provider's defaults.
 
+`validate`, `apply`, and `up` check the manifest against the catalog:
+
+- Environments are lowercase DNS labels, each listed once. `default`, `kube-*`, `ownstack-*`, `traefik`, `zot`, `harbor`, and `jenkins` are reserved: CI deploy credentials can manage every environment namespace.
+- Each setting must match its kind (hostname, IPv4 address, email, whole number, true/false) and, where the catalog gives one, its format: image projects are lowercase registry paths, pull secret names are Kubernetes names, `k3sVersion` is a k3s release such as `v1.33.4+k3s1`.
+- The CI `environment` setting (default `prod`) must be one of the environments.
+
 ## Deploying apps
 
 The app convention is the same for both CI providers:
@@ -80,8 +86,18 @@ infrastructure/<app>/before-deployment.sh   # optional, runs after push, before 
 
 Apps are published at `https://<app>.<domain>` unless the chart sets `url`.
 
+`before-deployment.sh` runs after the image is pushed, before the Helm deploy, with `APPLICATION_ID`, `RELEASE_NAME`, `NAMESPACE`, `IMAGE`, `IMAGE_REGISTRY`, `IMAGE_REPOSITORY_PROJECT`, `IMAGE_TAG`, `IMAGE_PULL_SECRET`, and `OWNSTACK_DOMAIN` set.
+
+The `repoFilter` setting of both CI providers takes space-separated wildcards, such as `app-* api-*`.
+
 - **GitHub Actions**: add `.github/workflows/ownstack.yml` (print it with `ownstackctl workflow`) and rerun `ownstackctl apply`. ownstackctl gives every repo that has the workflow a deploy credential limited to the environment namespaces, plus the registry credential, as Actions secrets and variables. Builds run on GitHub's runners; the server only runs apps.
-- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically.
+  - Images are built for the server's architecture (`OWNSTACK_PLATFORM`). On an ARM server, GitHub's default runners build under emulation, which is slower; set the repo or organization variable `OWNSTACK_RUNNER` to an ARM runner (for example `ubuntu-24.04-arm`) to build natively.
+  - The Helm library comes from this repository at the tag of the ownstackctl release that last applied the stack, so it changes only when you apply with a newer release. Set `libraryRef` to pin another branch or tag.
+  - `status` checks the repos the last apply configured, and warns when a repo's workflow is older than the one `ownstackctl workflow` prints. After adding the workflow to a new repo, rerun `apply`.
+  - A repo that could not be checked for the workflow (for example, 403 from an organization's SSO) fails the apply after the other repos are configured.
+  - Removing GitHub Actions with `--prune` also deletes the `OWNSTACK_*` secrets and variables from the repos it configured, when the GitHub token is available.
+- **Pods** in the environment namespaces must meet the Kubernetes Pod Security `baseline` level: no privileged containers, host network/PID/IPC, or hostPath volumes. Run anything that needs those in a namespace of its own. Pods that name no `imagePullSecrets` (hooks, CronJobs, third-party charts) pull with the environment's pull secret through the `default` service account; `public-url-application` names it explicitly.
+- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically and builds the `deployBranch` (default `main`) automatically. Only that branch pushes and deploys, into the `environment` setting (default `prod`); other branches and pull requests build only. When the owner, `repoFilter`, `jenkinsfilePath`, or `deployBranch` changes, apply rewrites the organization folder's configuration (`plan` shows it), replacing manual edits to the folder; Jenkins then deletes the jobs of repos that no longer match.
 
 ## Secrets
 
@@ -136,7 +152,9 @@ Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune
 ## Troubleshooting
 
 - **"needs about X GB of memory"**: pick a lighter preset (Starter fits 2 GB) or a bigger server.
-- **Waiting for a certificate**: DNS must point at the server and port 443 must be reachable. With Cloudflare the records must be DNS-only (grey cloud).
+- **Waiting for a certificate**: DNS must point at the server and port 443 must be reachable. With Cloudflare the records must be DNS-only (grey cloud). AAAA records for the names must point at this server or be removed; Let's Encrypt uses them.
+- **"DNS records that ownstackctl did not create already exist"**: the domain or its wildcard has A, AAAA, or CNAME records that point elsewhere, such as an existing website. Nothing was changed. Remove them, point them at the server, or set `replaceRecords: true` under `spec.dns.settings` to let ownstackctl replace them, then remove the setting again. Moving to a new server needs the setting only for records written by ownstackctl versions that did not mark them.
+- **"violates PodSecurity" when deploying**: the pod needs privileges the environments do not allow (see "Deploying apps"). Apply lists existing pods that would be rejected the first time it enforces Pod Security on a namespace.
 - **GitHub Actions cannot deploy**: the cluster API (port 6443) must be reachable from the internet; `apply` verifies this from the public address.
 - **Older runners**: `setup_system.sh` installs the pinned release and runs `apply`. Without an `ownstack.io/v1` manifest, ownstackctl builds one from the legacy lowercase environment variables.
 
