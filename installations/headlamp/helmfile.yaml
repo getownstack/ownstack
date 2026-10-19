@@ -1,8 +1,0 @@
-repositories:
-  - name: headlamp
-    url: https://kubernetes-sigs.github.io/headlamp/
-
-releases:
-  - name: headlamp
-    namespace: kube-system
-    chart: headlamp/headlamp
