@@ -27,9 +27,13 @@ const (
 	// robotSecret stores the robot credential in the registry's own namespace
 	// so reruns reuse it instead of rotating it.
 	robotSecret = "ownstack-registry-robot"
-	// PullSecretName is created in every environment namespace. The name is
-	// kept from earlier Ownstack versions because app charts reference it.
-	PullSecretName = "harbor-robot"
+)
+
+// The stored robot credential is checked this often before apply gives up,
+// so a Harbor restart or a proxy error never rotates it.
+var (
+	robotCheckAttempts = 5
+	robotCheckDelay    = 10 * time.Second
 )
 
 //go:embed values.yaml.tmpl
@@ -43,7 +47,7 @@ func (Provider) Resolve(ctx context.Context, rt *stack.Runtime) error {
 	out := &stack.ImagesOutput{
 		Host:           rt.Setting("host"),
 		Project:        rt.Setting("project"),
-		PullSecretName: PullSecretName,
+		PullSecretName: rt.Setting("pullSecretName"),
 		Login:          "user admin, password HARBOR_ADMIN_PASSWORD",
 	}
 	rt.Out.Images = out
@@ -110,11 +114,15 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	out := rt.Out.Images
 	if out.PushUsername != "" {
 		robotAPI := &client{base: api.base, user: out.PushUsername, password: out.PushPassword, http: api.http}
-		if robotAPI.canAccess(ctx, project) {
+		valid, err := checkRobot(ctx, rt.Console, robotAPI, project)
+		if err != nil {
+			return err
+		}
+		if valid {
 			rt.Logf("Harbor robot %s is valid", out.PushUsername)
 			return nil
 		}
-		rt.Logf("Stored Harbor robot credential no longer works; recreating it")
+		rt.Logf("Harbor rejects the stored robot credential; recreating it")
 	}
 	name, secret, err := api.recreateRobot(ctx)
 	if err != nil {
@@ -146,9 +154,12 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		checks = append(checks, stack.Check{Name: "robot", State: stack.Fail, Detail: "no CI robot credential stored"})
 	} else {
 		robotAPI := &client{base: api.base, user: rt.Out.Images.PushUsername, password: rt.Out.Images.PushPassword, http: api.http}
-		if robotAPI.canAccess(ctx, rt.Setting("project")) {
+		switch valid, err := robotAPI.robotAccess(ctx, rt.Setting("project")); {
+		case err != nil:
+			checks = append(checks, stack.Check{Name: "robot", State: stack.Unknown, Detail: err.Error()})
+		case valid:
 			checks = append(checks, stack.Check{Name: "robot", State: stack.OK, Detail: rt.Out.Images.PushUsername})
-		} else {
+		default:
 			checks = append(checks, stack.Check{Name: "robot", State: stack.Fail, Detail: "credential rejected; rerun apply"})
 		}
 	}
@@ -234,9 +245,33 @@ func (c *client) ensureProject(ctx context.Context, name string) error {
 	return nil
 }
 
-func (c *client) canAccess(ctx context.Context, project string) bool {
+// robotAccess reports whether the client's credential can list the
+// project's repositories: true on HTTP 200, false when Harbor rejects the
+// credential (401 or 403). Anything else (a timeout, a proxy error, Harbor
+// restarting) is an error, because it proves nothing about the credential.
+func (c *client) robotAccess(ctx context.Context, project string) (bool, error) {
 	code, _, err := c.do(ctx, http.MethodGet, "/projects/"+url.PathEscape(project)+"/repositories?page_size=1", nil)
-	return err == nil && code == http.StatusOK
+	switch {
+	case err != nil:
+		return false, err
+	case code == http.StatusOK:
+		return true, nil
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		return false, nil
+	}
+	return false, fmt.Errorf("checking the robot credential: HTTP %d", code)
+}
+
+// checkRobot retries robotAccess until Harbor gives a definite answer, so
+// the robot is only recreated when Harbor actually rejects it.
+func checkRobot(ctx context.Context, console *stack.Console, robotAPI *client, project string) (bool, error) {
+	var valid bool
+	err := stack.Retry(ctx, console, "harbor robot credential check", robotCheckAttempts, robotCheckDelay, func() error {
+		var err error
+		valid, err = robotAPI.robotAccess(ctx, project)
+		return err
+	})
+	return valid, err
 }
 
 // recreateRobot deletes the CI robot if it exists and creates it again,

@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -33,10 +35,14 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	return nil
 }
 
-const (
-	k3sConfig = "/etc/rancher/k3s/config.yaml"
-	serverCA  = "/var/lib/rancher/k3s/server/tls/server-ca.crt"
-)
+const serverCA = "/var/lib/rancher/k3s/server/tls/server-ca.crt"
+
+// k3sConfig is the k3s config file; tests point it at a temporary directory.
+var k3sConfig = "/etc/rancher/k3s/config.yaml"
+
+// helmVersion is the Helm release installed on servers that have none. The
+// official install script verifies its checksum.
+const helmVersion = "v3.22.0"
 
 // ensureK3sConfig merges Ownstack's settings into the k3s config file: the
 // bundled Traefik is disabled (Ownstack installs its own) and the public IP is
@@ -55,8 +61,10 @@ func ensureK3sConfig(host string) (bool, error) {
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
-	changed := addToList(config, "disable", "traefik")
-	changed = addToList(config, "tls-san", host) || changed
+	// k3s splits both settings on commas (util.SplitStringSlice) and trims
+	// the components it disables.
+	changed := addToList(config, "disable", "traefik", true)
+	changed = addToList(config, "tls-san", host, false) || changed
 	if !changed {
 		return false, nil
 	}
@@ -64,13 +72,16 @@ func ensureK3sConfig(host string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := os.MkdirAll("/etc/rancher/k3s", 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(k3sConfig), 0o755); err != nil {
 		return false, err
 	}
 	return true, os.WriteFile(k3sConfig, append([]byte("# Managed in part by ownstackctl.\n"), out...), 0o600)
 }
 
-func addToList(config map[string]any, key, value string) bool {
+// addToList adds value to a k3s list setting unless it is already there. The
+// setting may be a YAML list or a string; both may hold comma-separated
+// values, as k3s splits them. Existing entries are kept as they are.
+func addToList(config map[string]any, key, value string, trim bool) bool {
 	var list []any
 	switch v := config[key].(type) {
 	case []any:
@@ -79,8 +90,13 @@ func addToList(config map[string]any, key, value string) bool {
 		list = []any{v}
 	}
 	for _, item := range list {
-		if fmt.Sprint(item) == value {
-			return false
+		for _, part := range strings.Split(fmt.Sprint(item), ",") {
+			if trim {
+				part = strings.TrimSpace(part)
+			}
+			if part == value {
+				return false
+			}
 		}
 	}
 	config[key] = append(list, value)
@@ -96,14 +112,22 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 		steps = append(steps, stack.Step{Action: "create", Target: "swapfile", Detail: fmt.Sprintf("%d GiB, swappiness 10 (the server has no swap)", gib)})
 	}
 	if version, ok := k3sVersion(ctx, rt); ok {
-		steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed"})
+		want := rt.Setting("k3sVersion")
+		switch action, err := k3sAction(version, want); {
+		case err != nil:
+			steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed; apply refuses: " + err.Error()})
+		case action == k3sUpgrade:
+			steps = append(steps, stack.Step{Action: "upgrade", Target: "k3s", Detail: version + " -> " + normalizeK3sVersion(want) + "; restarts the API server briefly"})
+		default:
+			steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed"})
+		}
 	} else {
 		steps = append(steps, stack.Step{Action: "install", Target: "k3s", Detail: k3sTarget(rt) + ", bundled Traefik disabled, API certificate valid for " + rt.Setting("host")})
 	}
 	if rt.Exec.Has("helm") {
 		steps = append(steps, stack.Step{Action: "verify", Target: "helm", Detail: "installed"})
 	} else {
-		steps = append(steps, stack.Step{Action: "install", Target: "helm", Detail: "official install script"})
+		steps = append(steps, stack.Step{Action: "install", Target: "helm", Detail: helmVersion + ", official install script with checksum verification"})
 	}
 	return steps
 }
@@ -127,11 +151,28 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		return err
 	}
 
+	// Decide about the running k3s before touching its config, so a refused
+	// k3sVersion leaves the node as it was.
+	version, running := k3sVersion(ctx, rt)
+	action := k3sNone
+	if running {
+		var err error
+		if action, err = k3sAction(version, rt.Setting("k3sVersion")); err != nil {
+			return fmt.Errorf("k3s %s is running: %w", version, err)
+		}
+	}
 	configChanged, err := ensureK3sConfig(rt.Setting("host"))
 	if err != nil {
 		return err
 	}
-	if version, ok := k3sVersion(ctx, rt); ok {
+	switch {
+	case running && action == k3sUpgrade:
+		// The install script restarts k3s, which also loads a changed config.
+		rt.Logf("Upgrading k3s %s -> %s; the API server restarts briefly", version, normalizeK3sVersion(rt.Setting("k3sVersion")))
+		if err := installK3s(ctx, rt); err != nil {
+			return err
+		}
+	case running:
 		rt.Logf("k3s %s already running", version)
 		if configChanged {
 			rt.Logf("k3s configuration changed; restarting k3s")
@@ -139,12 +180,9 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 				return err
 			}
 		}
-	} else {
+	default:
 		rt.Logf("Installing k3s (%s)", k3sTarget(rt))
-		script := "curl -sfL https://get.k3s.io | " + k3sInstallEnv(rt) + " sh -s -"
-		if err := stack.Retry(ctx, rt.Console, "k3s install", 5, 15*time.Second, func() error {
-			return rt.Exec.Shell(ctx, script)
-		}); err != nil {
+		if err := installK3s(ctx, rt); err != nil {
 			return err
 		}
 	}
@@ -156,9 +194,9 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}
 
 	if !rt.Exec.Has("helm") {
-		rt.Logf("Installing helm")
+		rt.Logf("Installing helm %s", helmVersion)
 		if err := stack.Retry(ctx, rt.Console, "helm install", 5, 15*time.Second, func() error {
-			return rt.Exec.Shell(ctx, "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash")
+			return rt.Exec.Shell(ctx, helmInstallScript)
 		}); err != nil {
 			return err
 		}
@@ -187,7 +225,14 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	var checks []stack.Check
 	if version, ok := k3sVersion(ctx, rt); ok {
-		checks = append(checks, stack.Check{Name: "k3s", State: stack.OK, Detail: version})
+		check := stack.Check{Name: "k3s", State: stack.OK, Detail: version}
+		want := rt.Setting("k3sVersion")
+		if action, err := k3sAction(version, want); err != nil {
+			check.State, check.Detail = stack.Warn, version+"; apply refuses: "+err.Error()
+		} else if action == k3sUpgrade {
+			check.State, check.Detail = stack.Warn, version+"; k3sVersion pins "+normalizeK3sVersion(want)+", rerun apply to upgrade"
+		}
+		checks = append(checks, check)
 	} else {
 		checks = append(checks, stack.Check{Name: "k3s", State: stack.Fail, Detail: "k3s service is not active"})
 		return checks
@@ -258,14 +303,7 @@ func swapTotalKiB() int {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "SwapTotal:" {
-			v, _ := strconv.Atoi(fields[1])
-			return v
-		}
-	}
-	return 0
+	return parseMeminfo(string(data))["SwapTotal"]
 }
 
 func missingTools(rt *stack.Runtime) []string {
@@ -295,16 +333,115 @@ func k3sVersion(ctx context.Context, rt *stack.Runtime) (string, bool) {
 
 func k3sTarget(rt *stack.Runtime) string {
 	if v := rt.Setting("k3sVersion"); v != "" {
-		return "version " + v
+		return "version " + normalizeK3sVersion(v)
 	}
 	return "channel " + rt.Setting("k3sChannel")
 }
 
 func k3sInstallEnv(rt *stack.Runtime) string {
 	if v := rt.Setting("k3sVersion"); v != "" {
-		return "INSTALL_K3S_VERSION=" + shellQuote(v)
+		return "INSTALL_K3S_VERSION=" + shellQuote(normalizeK3sVersion(v))
 	}
 	return "INSTALL_K3S_CHANNEL=" + shellQuote(rt.Setting("k3sChannel"))
+}
+
+// installK3s runs the official install script, which installs k3s or
+// upgrades it in place and (re)starts it.
+func installK3s(ctx context.Context, rt *stack.Runtime) error {
+	script := "curl -sfL https://get.k3s.io | " + k3sInstallEnv(rt) + " sh -s -"
+	return stack.Retry(ctx, rt.Console, "k3s install", 5, 15*time.Second, func() error {
+		return rt.Exec.Shell(ctx, script)
+	})
+}
+
+// helmInstallScript installs helmVersion with the install script of that
+// same release; the script verifies the download's checksum by default.
+var helmInstallScript = "curl -fsSL https://raw.githubusercontent.com/helm/helm/" + helmVersion + "/scripts/get-helm-3 | DESIRED_VERSION=" + helmVersion + " bash"
+
+// What apply does with a running k3s.
+const (
+	k3sNone    = "none"
+	k3sUpgrade = "upgrade"
+)
+
+var k3sRelease = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?(?:\+k3s([0-9]+))?$`)
+
+type k3sRel struct {
+	major, minor, patch int
+	pre                 bool // a pre-release such as -rc1
+	build               int  // the N of +k3sN; -1 when not given
+}
+
+func parseK3sVersion(v string) (k3sRel, bool) {
+	m := k3sRelease.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return k3sRel{}, false
+	}
+	n := func(s string) int { i, _ := strconv.Atoi(s); return i }
+	r := k3sRel{major: n(m[1]), minor: n(m[2]), patch: n(m[3]), pre: m[4] != "", build: -1}
+	if m[5] != "" {
+		r.build = n(m[5])
+	}
+	return r, true
+}
+
+// normalizeK3sVersion adds the leading v that k3s release tags have.
+func normalizeK3sVersion(v string) string {
+	if v != "" && !strings.HasPrefix(v, "v") {
+		return "v" + v
+	}
+	return v
+}
+
+// k3sAction decides what apply does when k3s is running installed and the
+// manifest pins want. Without a pin nothing changes: a channel only applies
+// to new installs. Upgrades go one minor version at a time, as Kubernetes
+// supports; downgrades are refused. A pin without +k3sN matches any build.
+func k3sAction(installed, want string) (string, error) {
+	if want == "" {
+		return k3sNone, nil
+	}
+	w, ok := parseK3sVersion(want)
+	if !ok {
+		return "", fmt.Errorf("k3sVersion %q is not a k3s release such as v1.33.4+k3s1", want)
+	}
+	have, ok := parseK3sVersion(installed)
+	if !ok {
+		return "", fmt.Errorf("cannot read the installed k3s version %q", installed)
+	}
+	if w.major != have.major {
+		return "", fmt.Errorf("k3sVersion %s changes the major version of %s; k3s does not support that", normalizeK3sVersion(want), installed)
+	}
+	cmp := func(a, b int) int {
+		switch {
+		case a < b:
+			return -1
+		case a > b:
+			return 1
+		}
+		return 0
+	}
+	order := cmp(w.minor, have.minor)
+	if order == 0 {
+		order = cmp(w.patch, have.patch)
+	}
+	if order == 0 && w.build >= 0 && have.build >= 0 {
+		order = cmp(w.build, have.build)
+	}
+	if order == 0 && have.pre && !w.pre {
+		order = 1 // the release after its release candidate
+	}
+	switch {
+	case order == 0:
+		return k3sNone, nil
+	case order < 0:
+		return "", fmt.Errorf("k3sVersion %s is older than the running %s; k3s does not support downgrades", normalizeK3sVersion(want), installed)
+	case w.minor > have.minor+1:
+		return "", fmt.Errorf("k3sVersion %s skips a minor version from %s; upgrade one minor version at a time: pin v%d.%d first", normalizeK3sVersion(want), installed, have.major, have.minor+1)
+	case w.build < 0:
+		return "", fmt.Errorf("k3sVersion %s names no build; k3s releases are tagged like v%d.%d.%d+k3s1", normalizeK3sVersion(want), w.major, w.minor, w.patch)
+	}
+	return k3sUpgrade, nil
 }
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
@@ -322,20 +459,24 @@ func memory() (total, avail int, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	info := parseMeminfo(string(data))
+	return info["MemTotal"], info["MemAvailable"], info["MemTotal"] > 0
+}
+
+// parseMeminfo reads /proc/meminfo's "Key: value kB" lines.
+func parseMeminfo(data string) map[string]int {
+	out := map[string]int{}
+	for _, line := range strings.Split(data, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) < 2 || !strings.HasSuffix(fields[0], ":") {
 			continue
 		}
-		v, _ := strconv.Atoi(fields[1])
-		switch fields[0] {
-		case "MemTotal:":
-			total = v
-		case "MemAvailable:":
-			avail = v
+		v, err := strconv.Atoi(fields[1])
+		if err == nil {
+			out[strings.TrimSuffix(fields[0], ":")] = v
 		}
 	}
-	return total, avail, total > 0
+	return out
 }
 
 // parseDF reads total and available KiB from `df -Pk` output.

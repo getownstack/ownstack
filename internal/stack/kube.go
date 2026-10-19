@@ -1,11 +1,14 @@
 package stack
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -109,6 +112,86 @@ func PullSecretMismatch(raw, server, username, password string) string {
 		return "different password"
 	}
 	return ""
+}
+
+// AddImagePullSecret makes a service account pull images with the named
+// secret: Kubernetes adds a service account's pull secrets to pods that name
+// none. Pull secrets it already lists are kept. Only names are written,
+// never credentials. changed is false when the secret was already listed.
+func (k *Kube) AddImagePullSecret(ctx context.Context, namespace, serviceAccount, secret string) (bool, error) {
+	out, err := k.Exec.Output(ctx, "kubectl", "get", "serviceaccount", serviceAccount, "-n", namespace, "-o", "json")
+	if err != nil {
+		return false, err
+	}
+	patch, changed, err := imagePullSecretsPatch(out, secret)
+	if err != nil || !changed {
+		return false, err
+	}
+	_, err = k.Exec.Output(ctx, "kubectl", "patch", "serviceaccount", serviceAccount, "-n", namespace, "--type=merge", "-p", patch)
+	return err == nil, err
+}
+
+// imagePullSecretsPatch returns a merge patch that appends secret to a
+// service account's imagePullSecrets. A merge patch replaces the whole list,
+// so it carries the existing entries, and the resourceVersion makes the API
+// server refuse it (Conflict) if the account changed since it was read.
+func imagePullSecretsPatch(serviceAccountJSON, secret string) (patch string, changed bool, err error) {
+	var sa struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+		ImagePullSecrets []map[string]any `json:"imagePullSecrets"`
+	}
+	if err := json.Unmarshal([]byte(serviceAccountJSON), &sa); err != nil {
+		return "", false, fmt.Errorf("read service account: %w", err)
+	}
+	for _, ref := range sa.ImagePullSecrets {
+		if ref["name"] == secret {
+			return "", false, nil
+		}
+	}
+	data, err := json.Marshal(object{
+		"metadata":         object{"resourceVersion": sa.Metadata.ResourceVersion},
+		"imagePullSecrets": append(sa.ImagePullSecrets, map[string]any{"name": secret}),
+	})
+	return string(data), true, err
+}
+
+// NamespaceLabelWarnings labels a namespace in a server-side dry run and
+// returns the warnings the API server answers with, such as existing pods
+// that a new Pod Security level would reject. Nothing is changed.
+func (k *Kube) NamespaceLabelWarnings(ctx context.Context, name string, labels map[string]string) ([]string, error) {
+	args := []string{"label", "--dry-run=server", "--overwrite", "namespace", name}
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, key+"="+labels[key])
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Env = k.Exec.env()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, fmt.Errorf("kubectl: %w: %s", err, lastLine(msg))
+		}
+		return nil, fmt.Errorf("kubectl: %w", err)
+	}
+	return serverWarnings(stderr.String()), nil
+}
+
+// serverWarnings extracts the "Warning: ..." lines kubectl prints to stderr.
+func serverWarnings(stderr string) []string {
+	var out []string
+	for _, line := range strings.Split(stderr, "\n") {
+		if text, ok := strings.CutPrefix(strings.TrimSpace(line), "Warning: "); ok {
+			out = append(out, text)
+		}
+	}
+	return out
 }
 
 // SecretValue reads one key of a secret; ok is false when it does not exist.

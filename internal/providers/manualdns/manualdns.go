@@ -33,6 +33,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		rt.Logf("Create these records at your DNS host (not proxied):")
 		rt.Logf("  A  %s    -> %s", domain, ip)
 		rt.Logf("  A  *.%s  -> %s", domain, ip)
+		rt.Logf("Remove any AAAA records for these names unless they point at this server.")
 	}
 	return dnscheck.WaitForRecords(ctx, rt, time.Duration(rt.SettingInt("waitMinutes"))*time.Minute)
 }

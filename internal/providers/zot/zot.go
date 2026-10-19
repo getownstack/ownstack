@@ -20,8 +20,6 @@ const (
 	namespace = "zot"
 	release   = "zot"
 	chartRepo = "https://zotregistry.dev/helm-charts"
-	// PullSecretName is created in every environment namespace.
-	PullSecretName = "registry-credentials"
 )
 
 //go:embed values.yaml.tmpl
@@ -48,11 +46,14 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 }
 
 func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	return []stack.Step{
+	steps := []stack.Step{
 		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
 		{Action: "ensure", Target: "user " + rt.Setting("username"), Detail: "push and pull for CI and the environments"},
-		{Action: "verify", Target: "https://" + rt.Setting("host") + "/v2/", Detail: "authenticated registry API"},
 	}
+	if keep := rt.SettingInt("keepTags"); keep > 0 {
+		steps = append(steps, stack.Step{Action: "ensure", Target: "tag retention", Detail: fmt.Sprintf("keep the %d most recently pushed tags per repository, and tags pulled in the last 30 days", keep)})
+	}
+	return append(steps, stack.Step{Action: "verify", Target: "https://" + rt.Setting("host") + "/v2/", Detail: "authenticated registry API"})
 }
 
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -66,6 +67,9 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		"Annotations": rt.Out.Ingress.Annotations,
 		"StorageGiB":  rt.SettingInt("storageGiB"),
 		"Htpasswd":    htpasswd,
+		// 0 renders the configuration without retention byte for byte, so
+		// existing registries are not restarted.
+		"KeepTags": rt.SettingInt("keepTags"),
 	})
 	if err != nil {
 		return err
@@ -113,11 +117,8 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 // so reruns do not change the secret and restart the registry.
 func htpasswdLine(ctx context.Context, rt *stack.Runtime, user, password string) (string, error) {
 	if existing, ok := rt.Kube.SecretValue(ctx, namespace, release+"-secret", "htpasswd"); ok {
-		for _, line := range strings.Split(existing, "\n") {
-			name, hash, found := strings.Cut(strings.TrimSpace(line), ":")
-			if found && name == user && bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil {
-				return name + ":" + hash, nil
-			}
+		if line, ok := reuseHtpasswd(existing, user, password); ok {
+			return line, nil
 		}
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -125,6 +126,18 @@ func htpasswdLine(ctx context.Context, rt *stack.Runtime, user, password string)
 		return "", err
 	}
 	return user + ":" + string(hash), nil
+}
+
+// reuseHtpasswd returns user's line from an existing htpasswd file when its
+// hash still matches password.
+func reuseHtpasswd(existing, user, password string) (string, bool) {
+	for _, line := range strings.Split(existing, "\n") {
+		name, hash, found := strings.Cut(strings.TrimSpace(line), ":")
+		if found && name == user && bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil {
+			return name + ":" + hash, true
+		}
+	}
+	return "", false
 }
 
 func checkLogin(ctx context.Context, client *http.Client, host, user, password string) error {

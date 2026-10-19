@@ -21,7 +21,23 @@ mountConfig: true
 configFiles:
   config.json: |-
     {
+{{- if gt .KeepTags 0 }}
+      "storage": {
+        "rootDirectory": "/var/lib/registry",
+        "gc": true,
+        "retention": {
+          "policies": [
+            {
+              "repositories": ["**"],
+              "deleteUntagged": true,
+              "keepTags": [{ "mostRecentlyPushedCount": {{ .KeepTags }}, "pulledWithin": "720h" }]
+            }
+          ]
+        }
+      },
+{{- else }}
       "storage": { "rootDirectory": "/var/lib/registry", "gc": true },
+{{- end }}
       "http": {
         "address": "0.0.0.0",
         "port": "5000",

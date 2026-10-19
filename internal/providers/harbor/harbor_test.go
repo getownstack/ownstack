@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
 
@@ -76,5 +78,90 @@ func TestProjectAndRobot(t *testing.T) {
 	}
 	if created["name"] != "ownstack-ci" || created["level"] != "system" {
 		t.Errorf("created = %v", created)
+	}
+}
+
+func TestRobotAccess(t *testing.T) {
+	code := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/projects/product/repositories" {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		w.WriteHeader(code)
+	}))
+	defer srv.Close()
+	c := &client{base: srv.URL, user: "robot$ownstack-ci", password: "s3cret", http: srv.Client()}
+	for _, tc := range []struct {
+		code    int
+		valid   bool
+		wantErr bool
+	}{
+		{http.StatusOK, true, false},
+		{http.StatusUnauthorized, false, false},
+		{http.StatusForbidden, false, false},
+		// Harbor restarting, a proxy in between, or a missing project prove
+		// nothing about the credential.
+		{http.StatusServiceUnavailable, false, true},
+		{http.StatusBadGateway, false, true},
+		{http.StatusNotFound, false, true},
+	} {
+		code = tc.code
+		valid, err := c.robotAccess(context.Background(), "product")
+		if valid != tc.valid || (err != nil) != tc.wantErr {
+			t.Errorf("HTTP %d: valid=%v err=%v", tc.code, valid, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("error contains the secret: %v", err)
+		}
+	}
+
+	down := &client{base: "http://127.0.0.1:1", user: "u", password: "p", http: srv.Client()}
+	if _, err := down.robotAccess(context.Background(), "product"); err == nil {
+		t.Error("transport error reported as a definite answer")
+	}
+}
+
+// A Harbor that keeps failing must make apply fail, never rotate the robot.
+func TestCheckRobotDoesNotRotateOnServerErrors(t *testing.T) {
+	defer func(a int, d time.Duration) { robotCheckAttempts, robotCheckDelay = a, d }(robotCheckAttempts, robotCheckDelay)
+	robotCheckAttempts, robotCheckDelay = 3, 0
+
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/projects/product/repositories" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	rt, _ := providertest.Runtime(t)
+	c := &client{base: srv.URL, user: "robot$ownstack-ci", password: "s3cret", http: srv.Client()}
+	valid, err := checkRobot(context.Background(), rt.Console, c, "product")
+	if err == nil || valid {
+		t.Fatalf("valid=%v err=%v, want an error", valid, err)
+	}
+	if calls != 3 {
+		t.Errorf("checked %d times, want 3", calls)
+	}
+}
+
+func TestResolvePullSecretName(t *testing.T) {
+	rt, _ := providertest.Runtime(t)
+	rt.Exec.Env = append(rt.Exec.Env, "PATH=") // no kubectl: no stored robot
+	if err := (Provider{}).Resolve(context.Background(), rt.For("images")); err != nil {
+		t.Fatal(err)
+	}
+	// App charts written for earlier Ownstack clusters name harbor-robot.
+	if got := rt.Out.Images.PullSecretName; got != "harbor-robot" {
+		t.Errorf("default pull secret = %q", got)
+	}
+	rt.Manifest.Spec.Components["images"].Settings = map[string]string{"pullSecretName": "registry-credentials"}
+	if err := (Provider{}).Resolve(context.Background(), rt.For("images")); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.Out.Images.PullSecretName; got != "registry-credentials" {
+		t.Errorf("pull secret = %q", got)
 	}
 }
