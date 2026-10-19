@@ -93,3 +93,40 @@ func TestQuotedValuesRoundTrip(t *testing.T) {
 		t.Errorf("round trip = %q", got)
 	}
 }
+
+func TestGeneratedIsAnnouncedOnceStored(t *testing.T) {
+	s := newTestStore(t, nil)
+	out := s.Out.(*strings.Builder)
+	if _, err := s.Get(Request{Ref: "env:ZOT_PASSWORD", Label: "Zot password", Generate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("announced before it was stored: %q", out.String())
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if want := "Generated Zot password; stored as ZOT_PASSWORD in " + s.Path + "\n"; out.String() != want {
+		t.Errorf("output = %q, want %q", out.String(), want)
+	}
+	s.Flush()
+	if strings.Count(out.String(), "Generated Zot") != 1 {
+		t.Errorf("announced twice: %q", out.String())
+	}
+}
+
+func TestGeneratedIsNotAnnouncedWhenSaveFails(t *testing.T) {
+	s := newTestStore(t, nil)
+	blocker := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(blocker, nil, 0o600)
+	s.Path = filepath.Join(blocker, "secrets.env") // its directory is a file
+	if _, err := s.Get(Request{Ref: "env:ZOT_PASSWORD", Label: "Zot password", Generate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err == nil {
+		t.Fatal("Flush succeeded")
+	}
+	if out := s.Out.(*strings.Builder).String(); strings.Contains(out, "Generated Zot") {
+		t.Errorf("announced a secret that was not stored: %q", out)
+	}
+}

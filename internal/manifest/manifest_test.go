@@ -97,15 +97,23 @@ func TestValidationIssues(t *testing.T) {
 		from, to string
 		path     string
 	}{
-		"planned provider":   {"provider: jenkins", "provider: woodpecker", "spec.cicd.provider"},
-		"unknown provider":   {"provider: harbor", "provider: nope", "spec.images.provider"},
-		"bad ip":             {"host: 203.0.113.10", "host: not-an-ip", "spec.compute.settings.host"},
-		"unknown setting":    {"owner: acme", "owner: acme\n      colour: blue", "spec.vcs.settings.colour"},
-		"secret in settings": {"owner: acme", "owner: acme\n      token: ghp_x", "spec.vcs.settings.token"},
-		"bad secret ref":     {"apiToken: env:CF_TOKEN", "apiToken: literal-token", "spec.dns.secrets.apiToken"},
-		"missing required":   {"acmeEmail: ops@example.com", "dashboardHost: t.example.com", "spec.ingress.settings.acmeEmail"},
-		"unknown aspect":     {"  images:", "  storage:\n    provider: x\n  images:", "spec.storage"},
-		"bad domain":         {"domain: example.com", "domain: Example", "spec.domain"},
+		"planned provider":    {"provider: jenkins", "provider: woodpecker", "spec.cicd.provider"},
+		"unknown provider":    {"provider: harbor", "provider: nope", "spec.images.provider"},
+		"bad ip":              {"host: 203.0.113.10", "host: not-an-ip", "spec.compute.settings.host"},
+		"unknown setting":     {"owner: acme", "owner: acme\n      colour: blue", "spec.vcs.settings.colour"},
+		"secret in settings":  {"owner: acme", "owner: acme\n      token: ghp_x", "spec.vcs.settings.token"},
+		"bad secret ref":      {"apiToken: env:CF_TOKEN", "apiToken: literal-token", "spec.dns.secrets.apiToken"},
+		"missing required":    {"acmeEmail: ops@example.com", "dashboardHost: t.example.com", "spec.ingress.settings.acmeEmail"},
+		"unknown aspect":      {"  images:", "  storage:\n    provider: x\n  images:", "spec.storage"},
+		"bad domain":          {"domain: example.com", "domain: Example", "spec.domain"},
+		"empty pull secret":   {"provider: harbor", "provider: harbor\n    settings:\n      pullSecretName: \"\"", "spec.images.settings.pullSecretName"},
+		"bad pull secret":     {"provider: harbor", "provider: harbor\n    settings:\n      pullSecretName: Harbor_Robot", "spec.images.settings.pullSecretName"},
+		"uppercase project":   {"provider: harbor", "provider: harbor\n    settings:\n      project: Product", "spec.images.settings.project"},
+		"bad k3s version":     {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: latest", "spec.compute.settings.k3sVersion"},
+		"bad deploy branch":   {`repoFilter: "*"`, "deployBranch: main;rm", "spec.cicd.settings.deployBranch"},
+		"duplicate env":       {"domain: example.com", "domain: example.com\n  environments: [dev, prod, dev]", "spec.environments[2]"},
+		"reserved env":        {"domain: example.com", "domain: example.com\n  environments: [dev, kube-system]", "spec.environments[1]"},
+		"cicd env not listed": {"domain: example.com", "domain: example.com\n  environments: [dev, staging]", "spec.cicd.settings.environment"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -118,6 +126,86 @@ func TestValidationIssues(t *testing.T) {
 			}
 			t.Fatalf("expected issue at %s, got %v", tc.path, issues)
 		})
+	}
+}
+
+func TestPatternsAndEnvironmentsAccept(t *testing.T) {
+	for name, tc := range map[string]struct{ from, to string }{
+		"k3s version without v": {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: 1.33.4+k3s1"},
+		"k3s release candidate": {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: v1.34.0-rc1+k3s1"},
+		"deploy branch":         {`repoFilter: "*"`, "deployBranch: release/1.2"},
+		"project path":          {"provider: harbor", "provider: harbor\n    settings:\n      project: team/my--app\n      pullSecretName: harbor-robot"},
+		"custom environments":   {"domain: example.com", "domain: example.com\n  environments: [dev, staging]"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := strings.Replace(valid, tc.from, tc.to, 1)
+			if name == "custom environments" {
+				src = strings.Replace(src, `repoFilter: "*"`, "environment: staging", 1)
+			}
+			if issues := parse(t, src).Validate(providers.Catalog()); len(issues) > 0 {
+				t.Fatalf("unexpected issues: %v", issues)
+			}
+		})
+	}
+}
+
+func TestReservedEnvironments(t *testing.T) {
+	// Namespaces Kubernetes and the platform providers use. A provider that
+	// installs into a new namespace must be covered here too.
+	for _, ns := range []string{"default", "kube-system", "kube-public", "kube-node-lease", "ownstack-system", "traefik", "zot", "harbor", "jenkins"} {
+		if !manifest.ReservedEnvironment(ns) {
+			t.Errorf("%s is not reserved", ns)
+		}
+		src := strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: [prod, "+ns+"]", 1)
+		issues := parse(t, src).Validate(providers.Catalog())
+		if len(issues) != 1 || issues[0].Path != "spec.environments[1]" || !strings.Contains(issues[0].Message, "reserved") {
+			t.Errorf("%s: issues = %v", ns, issues)
+		}
+	}
+	for _, env := range []string{"dev", "qa", "prod", "staging", "kube", "ownstack", "jenkins-ci", "my-harbor"} {
+		if manifest.ReservedEnvironment(env) {
+			t.Errorf("%s is reserved", env)
+		}
+	}
+}
+
+func TestCICDEnvironmentMustBeListed(t *testing.T) {
+	ghActions := strings.Replace(valid, "provider: jenkins\n    settings:\n      repoFilter: \"*\"", "provider: gh-actions", 1)
+	ghActions = strings.Replace(ghActions, "provider: harbor", "provider: zot", 1)
+	for name, tc := range map[string]struct {
+		src   string
+		valid bool
+	}{
+		"default prod":          {ghActions, true},
+		"listed":                {strings.Replace(ghActions, "provider: gh-actions", "provider: gh-actions\n    settings:\n      environment: qa", 1), true},
+		"not listed":            {strings.Replace(ghActions, "provider: gh-actions", "provider: gh-actions\n    settings:\n      environment: staging", 1), false},
+		"default not in custom": {strings.Replace(ghActions, "domain: example.com", "domain: example.com\n  environments: [dev, staging]", 1), false},
+		"explicitly empty":      {strings.Replace(ghActions, "provider: gh-actions", "provider: gh-actions\n    settings:\n      environment: \"\"", 1), false},
+		"jenkins default prod":  {valid, true},
+		"jenkins not in custom": {strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: [dev, staging]", 1), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			issues := parse(t, tc.src).Validate(providers.Catalog())
+			if tc.valid {
+				if len(issues) > 0 {
+					t.Fatalf("unexpected issues: %v", issues)
+				}
+				return
+			}
+			if len(issues) != 1 || issues[0].Path != "spec.cicd.settings.environment" {
+				t.Fatalf("issues = %v", issues)
+			}
+		})
+	}
+}
+
+func TestZotUsername(t *testing.T) {
+	zot := strings.Replace(valid, "provider: harbor", "provider: zot\n    settings:\n      username: USER", 1)
+	for user, ok := range map[string]bool{"ownstack": true, "me@example.com": true, `"a:b"`: false, `"a b"`: false} {
+		issues := parse(t, strings.Replace(zot, "USER", user, 1)).Validate(providers.Catalog())
+		if ok != (len(issues) == 0) {
+			t.Errorf("username %s: issues = %v", user, issues)
+		}
 	}
 }
 

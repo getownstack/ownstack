@@ -59,6 +59,9 @@ type Store struct {
 	resolved map[string]string
 	dirty    bool
 	onValue  func(string)
+	// generated notes which secrets were generated, announced once Flush
+	// has stored them.
+	generated []string
 }
 
 func NewStore(path string) *Store {
@@ -124,7 +127,7 @@ func (s *Store) Get(req Request) (string, error) {
 			return "", fmt.Errorf("%s (%s): %w", req.Label, req.Ref, ErrWouldGenerate)
 		} else if req.Generate {
 			value, persist = generatePassword(24), true
-			fmt.Fprintf(s.Out, "Generated %s; stored as %s in %s\n", req.Label, name, s.Path)
+			s.generated = append(s.generated, fmt.Sprintf("Generated %s; stored as %s in %s", req.Label, name, s.Path))
 		} else if s.Prompt && isTerminal(s.In) {
 			v, err := s.prompt(req, name)
 			if err != nil {
@@ -178,6 +181,10 @@ func (s *Store) Flush() error {
 		return err
 	}
 	s.dirty = false
+	for _, note := range s.generated {
+		fmt.Fprintln(s.Out, note)
+	}
+	s.generated = nil
 	return nil
 }
 

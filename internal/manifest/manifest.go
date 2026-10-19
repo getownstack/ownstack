@@ -14,6 +14,7 @@ import (
 	"net/mail"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,27 @@ const (
 )
 
 var DefaultEnvironments = []string{"dev", "qa", "prod"}
+
+// Environments become namespaces that CI deploy credentials manage, so they
+// must not be Kubernetes' own namespaces or those of platform services.
+var (
+	reservedEnvironments        = []string{"default", "traefik", "zot", "harbor", "jenkins"}
+	reservedEnvironmentPrefixes = []string{"kube-", "ownstack-"}
+)
+
+// ReservedEnvironment reports whether name may not be used as an environment:
+// default, kube-*, ownstack-*, or a platform service's namespace.
+func ReservedEnvironment(name string) bool {
+	if slices.Contains(reservedEnvironments, name) {
+		return true
+	}
+	for _, prefix := range reservedEnvironmentPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // ErrNotV1 is returned for files that are not ownstack.io/v1 manifests, such
 // as the design metadata written by early versions of the Ownstack designer.
@@ -204,11 +226,14 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 	}
 	seenEnv := map[string]bool{}
 	for i, env := range m.Environments() {
+		path := fmt.Sprintf("spec.environments[%d]", i)
 		if !nameRe.MatchString(env) {
-			add(fmt.Sprintf("spec.environments[%d]", i), "must be a lowercase DNS label")
+			add(path, "must be a lowercase DNS label")
+		} else if ReservedEnvironment(env) {
+			add(path, "%q is reserved for Kubernetes or the Ownstack platform; choose another name", env)
 		}
 		if seenEnv[env] {
-			add(fmt.Sprintf("spec.environments[%d]", i), "duplicate environment %q", env)
+			add(path, "duplicate environment %q", env)
 		}
 		seenEnv[env] = true
 	}
@@ -274,7 +299,7 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 				}
 				continue
 			}
-			if msg := checkKind(param, value); msg != "" {
+			if msg := checkKind(param, value, m.Environments()); msg != "" {
 				add(path, "%s", msg)
 			}
 		}
@@ -297,7 +322,7 @@ func checkRef(ref string) error {
 	return nil
 }
 
-func checkKind(param catalog.Param, value string) string {
+func checkKind(param catalog.Param, value string, environments []string) string {
 	switch param.Kind {
 	case catalog.KindHostname:
 		if !hostnameRe.MatchString(value) {
@@ -320,12 +345,16 @@ func checkKind(param catalog.Param, value string) string {
 			return "must be true or false"
 		}
 	case catalog.KindEnum:
-		for _, option := range param.Enum {
-			if option == value {
-				return ""
-			}
+		if !slices.Contains(param.Enum, value) {
+			return "must be one of " + strings.Join(param.Enum, ", ")
 		}
-		return "must be one of " + strings.Join(param.Enum, ", ")
+	case catalog.KindEnvironment:
+		if !slices.Contains(environments, value) {
+			return "must be one of spec.environments (" + strings.Join(environments, ", ") + ")"
+		}
+	}
+	if !param.MatchesPattern(value) {
+		return param.PatternHelp
 	}
 	return ""
 }

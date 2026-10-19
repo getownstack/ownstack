@@ -9,7 +9,10 @@ package catalog
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
+	"sync"
 )
 
 // Param kinds.
@@ -22,7 +25,11 @@ const (
 	KindBool     = "bool"
 	KindEnum     = "enum"
 	KindSecret   = "secret"
+	// KindEnvironment values name one of the manifest's environments.
+	KindEnvironment = "environment"
 )
+
+var kinds = []string{KindString, KindHostname, KindIP, KindEmail, KindInt, KindBool, KindEnum, KindSecret, KindEnvironment}
 
 // Hosting values.
 const (
@@ -62,7 +69,13 @@ type Param struct {
 	Default     string   `json:"default,omitempty"` // may reference {domain} and {admin}
 	Placeholder string   `json:"placeholder,omitempty"`
 	Enum        []string `json:"enum,omitempty"`
-	Advanced    bool     `json:"advanced,omitempty"`
+	// Pattern is a regular expression, anchored with ^ and $, that a set
+	// value must match. It uses only syntax Go's regexp and Python's re read
+	// the same way, because the Ownstack designer checks it too. PatternHelp
+	// completes "<label> ..." when a value does not match.
+	Pattern     string `json:"pattern,omitempty"`
+	PatternHelp string `json:"patternHelp,omitempty"`
+	Advanced    bool   `json:"advanced,omitempty"`
 	// Env is the conventional environment variable a secret is read from
 	// when the manifest does not reference one explicitly.
 	Env string `json:"env,omitempty"`
@@ -72,6 +85,55 @@ type Param struct {
 }
 
 func (p Param) IsSecret() bool { return p.Kind == KindSecret }
+
+// MatchesPattern reports whether value matches the param's Pattern. A param
+// without a pattern accepts every value.
+func (p Param) MatchesPattern(value string) bool {
+	if p.Pattern == "" {
+		return true
+	}
+	re, err := compilePattern(p.Pattern)
+	return err == nil && re.MatchString(value)
+}
+
+var compiledPatterns sync.Map // pattern -> *regexp.Regexp
+
+// compilePattern compiles pattern to match whole values, as Python's
+// re.fullmatch does, so a top-level alternation such as ^a|b$ cannot match
+// a prefix or suffix in Go only.
+func compilePattern(pattern string) (*regexp.Regexp, error) {
+	if re, ok := compiledPatterns.Load(pattern); ok {
+		return re.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(`^(?:` + pattern + `)$`)
+	if err != nil {
+		return nil, err
+	}
+	compiledPatterns.Store(pattern, re)
+	return re, nil
+}
+
+// unsharedSyntax finds regular expression syntax that Go and Python read
+// differently or only one of them supports: the \d \w \s \b classes (Unicode
+// in Python), \A \z \Z anchors, \p classes, \Q quoting, [[:class:]],
+// (?flags) or named groups, and {,n} (a repeat in Python, literal in Go).
+// Only (?: groups are shared.
+var unsharedSyntax = regexp.MustCompile(`\\[dDwWsSbBAzZpPQE]|\[\[:|\(\?[^:]|\{,`)
+
+func checkPattern(pattern string) error {
+	if !strings.HasPrefix(pattern, "^") || !strings.HasSuffix(pattern, "$") || strings.HasSuffix(pattern, `\$`) {
+		return fmt.Errorf("pattern %q must be anchored with ^ and $", pattern)
+	}
+	if bad := unsharedSyntax.FindString(pattern); bad != "" {
+		return fmt.Errorf("pattern %q uses %q, which Go and Python read differently", pattern, bad)
+	}
+	// Compile it alone too: wrapping can balance a pattern such as ^a)|(b$.
+	if _, err := regexp.Compile(pattern); err != nil {
+		return err
+	}
+	_, err := compilePattern(pattern)
+	return err
+}
 
 type Path struct {
 	ID          string `json:"id"`
@@ -214,8 +276,14 @@ func (c *Catalog) Validate() error {
 				return fmt.Errorf("provider %q has duplicate param %q", key, param.Key)
 			}
 			params[param.Key] = true
+			if !contains(kinds, param.Kind) {
+				return fmt.Errorf("param %q of provider %q has unknown kind %q", param.Key, key, param.Kind)
+			}
 			if param.IsSecret() && param.Env == "" {
 				return fmt.Errorf("secret %q of provider %q needs a conventional env var", param.Key, key)
+			}
+			if err := checkParamPattern(param); err != nil {
+				return fmt.Errorf("param %q of provider %q: %w", param.Key, key, err)
 			}
 		}
 	}
@@ -230,6 +298,28 @@ func (c *Catalog) Validate() error {
 				return fmt.Errorf("preset %q is missing required aspect %q", preset.ID, a.ID)
 			}
 		}
+	}
+	return nil
+}
+
+func checkParamPattern(param Param) error {
+	if param.Pattern == "" {
+		if param.PatternHelp != "" {
+			return fmt.Errorf("patternHelp without a pattern")
+		}
+		return nil
+	}
+	if param.IsSecret() {
+		return fmt.Errorf("secrets cannot have a pattern")
+	}
+	if param.PatternHelp == "" {
+		return fmt.Errorf("pattern needs patternHelp")
+	}
+	if err := checkPattern(param.Pattern); err != nil {
+		return err
+	}
+	if param.Default != "" && !strings.Contains(param.Default, "{") && !param.MatchesPattern(param.Default) {
+		return fmt.Errorf("default %q does not match its pattern", param.Default)
 	}
 	return nil
 }

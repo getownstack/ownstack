@@ -3,6 +3,25 @@ package catalog
 // Version of the catalog format exported to the stack designer.
 const Version = "1"
 
+// Value formats shared by several params, in the regular expression syntax Go
+// and Python share (see Param.Pattern).
+const (
+	// A Kubernetes object name (DNS-1123 subdomain), such as a pull secret.
+	kubeNamePattern = `^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`
+	kubeNameHelp    = "must be a lowercase Kubernetes name: letters, digits, '-' and '.'"
+	// A repository path as OCI registries accept it: lowercase components
+	// joined by '.', '_', '__', dashes, or '/'.
+	imagePathPattern = `^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`
+	imagePathHelp    = "must be lowercase letters and digits joined by '.', '_', '-' or '/' (registries reject uppercase)"
+)
+
+// pullSecretParam is the images providers' pull secret name setting.
+func pullSecretParam(def string) Param {
+	return Param{Key: "pullSecretName", Label: "Pull secret name", Kind: KindString, Required: true, Default: def, Advanced: true,
+		Help:    "Name of the image pull secret in each environment. Use harbor-robot for charts written for older Ownstack clusters.",
+		Pattern: kubeNamePattern, PatternHelp: kubeNameHelp}
+}
+
 // Default returns the Ownstack catalog. Availability is filled in by the
 // providers package from the implementations it actually registers.
 func Default() *Catalog {
@@ -49,7 +68,8 @@ func Default() *Catalog {
 					Summary: "Hosts the customer-owned cluster repo and application repos, with a credential CI can clone with.",
 					Outputs: []Output{
 						{Key: "owner", Description: "Account or organization that owns the repos."},
-						{Key: "clusterRepo", Description: "Clone URL of the cluster repo (pipeline and Helm libraries)."},
+						{Key: "clusterRepo", Description: "Name and clone URL of the cluster repo (pipeline and Helm libraries)."},
+						{Key: "demoRepo", Description: "Demo application repo, when the stack has one."},
 						{Key: "credential", Description: "Username and token for cloning and repository discovery."},
 					},
 				},
@@ -113,7 +133,8 @@ func Default() *Catalog {
 						Help: "Swapfile created when the server has no swap, so a build spike does not take services down. 0 disables."},
 					{Key: "k3sChannel", Label: "k3s channel", Kind: KindString, Default: "stable", Advanced: true},
 					{Key: "k3sVersion", Label: "k3s version", Kind: KindString, Advanced: true,
-						Help: "Pin an exact k3s release, for example v1.33.4+k3s1. Overrides the channel."},
+						Help:    "Pin an exact k3s release, for example v1.33.4+k3s1. Overrides the channel.",
+						Pattern: `^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+k3s[0-9]+)?$`, PatternHelp: "must be a k3s release such as v1.33.4+k3s1"},
 				},
 				Paths: []Path{
 					{ID: "cli-agent", Name: "CLI agent", Recommended: true,
@@ -138,6 +159,8 @@ func Default() *Catalog {
 						HelpURL: "https://dash.cloudflare.com/profile/api-tokens"},
 					{Key: "zone", Label: "Zone", Kind: KindHostname, Advanced: true,
 						Help: "Cloudflare zone name. Detected from the domain when empty."},
+					{Key: "replaceRecords", Label: "Replace existing records", Kind: KindBool, Default: "false", Advanced: true,
+						Help: "Let ownstackctl replace records for the domain and its wildcard that it did not create. When off, apply stops instead of overwriting them."},
 				},
 			},
 			{
@@ -199,7 +222,9 @@ func Default() *Catalog {
 					{Key: "host", Label: "Host", Kind: KindHostname, Default: "harbor.{adminDomain}"},
 					{Key: "adminPassword", Label: "Admin password", Kind: KindSecret, Required: true, Generate: true, Env: "HARBOR_ADMIN_PASSWORD",
 						Help: "Generated on the server when not provided."},
-					{Key: "project", Label: "Project", Kind: KindString, Default: "product", Advanced: true},
+					{Key: "project", Label: "Project", Kind: KindString, Default: "product", Advanced: true,
+						Pattern: imagePathPattern, PatternHelp: imagePathHelp},
+					pullSecretParam("harbor-robot"),
 					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: "1.17.2", Advanced: true},
 				},
 			},
@@ -210,13 +235,17 @@ func Default() *Catalog {
 				Resources: Resources{MemoryMiB: 100, DiskGiB: 10},
 				Params: []Param{
 					{Key: "host", Label: "Host", Kind: KindHostname, Default: "registry.{adminDomain}"},
-					{Key: "username", Label: "Username", Kind: KindString, Default: "ownstack"},
+					{Key: "username", Label: "Username", Kind: KindString, Default: "ownstack",
+						Pattern: `^[^:\x00-\x20\x7f]+$`, PatternHelp: "must not contain ':', spaces, or control characters"},
 					{Key: "password", Label: "Password", Kind: KindSecret, Required: true, Generate: true, Env: "ZOT_PASSWORD",
 						Help: "Generated on the server when not provided. Use it to docker login."},
-					{Key: "project", Label: "Image namespace", Kind: KindString, Default: "apps", Advanced: true},
+					{Key: "project", Label: "Image namespace", Kind: KindString, Default: "apps", Advanced: true,
+						Pattern: imagePathPattern, PatternHelp: imagePathHelp},
 					{Key: "storageGiB", Label: "Storage (GiB)", Kind: KindInt, Default: "10", Advanced: true},
-					{Key: "pullSecretName", Label: "Pull secret name", Kind: KindString, Default: "registry-credentials", Advanced: true,
-						Help: "Name of the image pull secret in each environment. Use harbor-robot for charts written for older Ownstack clusters."},
+					{Key: "keepTags", Label: "Tags to keep", Kind: KindInt, Default: "0", Advanced: true,
+						Help:    "How many of the most recently pushed tags to keep in each repository; older tags are deleted unless pulled in the last 30 days. 0 keeps everything.",
+						Pattern: `^[0-9]+$`, PatternHelp: "must be 0 or more"},
+					pullSecretParam("registry-credentials"),
 					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: "0.1.128", Advanced: true},
 				},
 			},
@@ -228,13 +257,13 @@ func Default() *Catalog {
 					{Key: "host", Label: "Registry host", Kind: KindHostname, Required: true, Placeholder: "harbor.example.com",
 						Help: "For example harbor.yourcompany.com, ghcr.io, or docker.io."},
 					{Key: "project", Label: "Project / namespace", Kind: KindString, Required: true, Placeholder: "product",
-						Help: "Path images are pushed under: a Harbor project, your GitHub user for ghcr.io, or your Docker Hub user."},
+						Help:    "Path images are pushed under: a Harbor project, your GitHub user for ghcr.io, or your Docker Hub user.",
+						Pattern: imagePathPattern, PatternHelp: imagePathHelp},
 					{Key: "username", Label: "Username", Kind: KindString, Required: true,
 						Help: "A robot or service account is best (Harbor robot, GitHub user, Docker Hub user)."},
 					{Key: "password", Label: "Password or token", Kind: KindSecret, Required: true, Env: "REGISTRY_PASSWORD",
 						Help: "Needs push and pull on the project. For ghcr.io use a token with write:packages."},
-					{Key: "pullSecretName", Label: "Pull secret name", Kind: KindString, Default: "registry-credentials", Advanced: true,
-						Help: "Name of the image pull secret in each environment. Use harbor-robot for charts written for older Ownstack clusters."},
+					pullSecretParam("registry-credentials"),
 				},
 			},
 
@@ -275,8 +304,14 @@ func Default() *Catalog {
 					{Key: "adminPassword", Label: "Admin password", Kind: KindSecret, Required: true, Generate: true, Env: "JENKINS_ADMIN_PASSWORD",
 						Help: "Generated on the server when not provided."},
 					{Key: "orgFolder", Label: "Organization folder", Kind: KindString, Default: "Repositories", Advanced: true},
-					{Key: "repoFilter", Label: "Repository filter", Kind: KindString, Default: "*", Advanced: true},
+					{Key: "repoFilter", Label: "Repository filter", Kind: KindString, Default: "*", Advanced: true,
+						Help: "Space-separated wildcards, such as app-* api-*. Matching repos with a Jenkinsfile get a pipeline."},
 					{Key: "jenkinsfilePath", Label: "Jenkinsfile path", Kind: KindString, Default: "infrastructure/Jenkinsfile", Advanced: true},
+					{Key: "environment", Label: "Deploy environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
+						Help: "Environment the deploy branch deploys into, exported to Jenkins as OWNSTACK_NAMESPACE. Cluster repos with an older pipeline library always deploy to prod."},
+					{Key: "deployBranch", Label: "Deploy branch", Kind: KindString, Required: true, Default: "main", Advanced: true,
+						Help:    "Branch the organization folder builds automatically and the pipeline pushes and deploys from, exported as OWNSTACK_DEPLOY_BRANCH. Other branches build only.",
+						Pattern: `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, PatternHelp: "must be a branch name of letters, digits, '.', '_', '-' and '/'"},
 					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: "5.8.79", Advanced: true},
 				},
 			},
@@ -288,10 +323,11 @@ func Default() *Catalog {
 				Requires: []string{"compute", "ingress", "vcs", "images"},
 				Params: []Param{
 					{Key: "repoFilter", Label: "Repository filter", Kind: KindString, Default: "*", Advanced: true,
-						Help: "Repos whose name matches get the deploy credential when they contain .github/workflows/ownstack.yml."},
-					{Key: "libraryRef", Label: "Ownstack library ref", Kind: KindString, Default: "main", Advanced: true,
-						Help: "Branch or tag of getownstack/ownstack-cluster-template the workflow takes the Helm library from."},
-					{Key: "environment", Label: "Deploy environment", Kind: KindString, Default: "prod", Advanced: true},
+						Help: "Space-separated wildcards, such as app-* api-*. Matching repos that contain .github/workflows/ownstack.yml get the deploy credential."},
+					{Key: "libraryRef", Label: "Ownstack library ref", Kind: KindString, Advanced: true,
+						Help: "Branch or tag of getownstack/ownstack-cluster-template the workflow takes the Helm library from. Empty: the ownstackctl release running on the server, or main for development builds."},
+					{Key: "environment", Label: "Deploy environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
+						Help: "Environment that pushes to main deploy into."},
 					{Key: "additionalOwners", Label: "Additional owners", Kind: KindString, Advanced: true,
 						Help: "Comma-separated GitHub users or organizations whose repos also deploy here. The token must be able to administer them."},
 				},
