@@ -98,7 +98,7 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	checks := []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
-		stack.CheckHTTPS(ctx, out.Host, rt.Out.Compute.PublicIP, "/v2/", false),
+		rt.CheckHTTPS(ctx, out.Host, "/v2/"),
 	}
 	if out.PushPassword == "" {
 		return append(checks, stack.Check{Name: "credential", State: stack.Unknown, Detail: "password not available on this node"})

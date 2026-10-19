@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,9 @@ type Reporter struct {
 	buf     []string
 	dropped int
 	failed  bool
+	// closed is set once Ownstack refuses the run for good (bad token,
+	// unknown or finished run); later lines are dropped without posting.
+	closed  bool
 	stop    chan struct{}
 	stopped chan struct{}
 }
@@ -85,6 +89,12 @@ func (r *Reporter) Finish(runErr error) {
 
 func (r *Reporter) flush(ctx context.Context, result map[string]any) {
 	r.mu.Lock()
+	if r.closed {
+		r.dropped += len(r.buf)
+		r.buf = nil
+		r.mu.Unlock()
+		return
+	}
 	lines := r.buf
 	r.buf = nil
 	dropped := r.dropped
@@ -93,21 +103,38 @@ func (r *Reporter) flush(ctx context.Context, result map[string]any) {
 	if len(lines) == 0 && result == nil {
 		return
 	}
+	batch := lines
 	if dropped > 0 {
-		lines = append(lines, fmt.Sprintf("[%d lines were not reported to Ownstack]", dropped))
+		batch = append(lines[:len(lines):len(lines)], fmt.Sprintf("[%d lines were not reported to Ownstack]", dropped))
 	}
-	body := map[string]any{"lines": lines}
+	body := map[string]any{"lines": batch}
 	for k, v := range result {
 		body[k] = v
 	}
 	data, _ := json.Marshal(body)
 
 	var err error
+	var refused statusError
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = r.post(ctx, data); err == nil {
 			return
 		}
+		if errors.As(err, &refused) && refused.permanent() {
+			break
+		}
 		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	if result != nil && errors.As(err, &refused) && refused.permanent() && !refused.closesRun() {
+		// The batch was refused (too large), not the run: send the result
+		// alone so the run still finishes in Ownstack.
+		alone := map[string]any{"lines": []string{fmt.Sprintf("[%d lines were not reported to Ownstack]", dropped+len(lines))}}
+		for k, v := range result {
+			alone[k] = v
+		}
+		data, _ := json.Marshal(alone)
+		if err = r.post(ctx, data); err == nil {
+			return
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -115,10 +142,40 @@ func (r *Reporter) flush(ctx context.Context, result map[string]any) {
 		r.failed = true
 		fmt.Fprintf(os.Stderr, "note: could not report progress to Ownstack (%v); the run continues\n", err)
 	}
-	// Keep the lines for the next attempt rather than losing them.
-	if len(r.buf)+len(lines) <= maxBuffered {
+	// The count, not the marker line, carries over: the next batch reports it.
+	r.dropped += dropped
+	switch {
+	case errors.As(err, &refused) && refused.permanent():
+		// Resending cannot succeed.
+		r.dropped += len(lines)
+		r.closed = refused.closesRun()
+	case len(r.buf)+len(lines) <= maxBuffered:
+		// Keep the lines for the next attempt rather than losing them.
 		r.buf = append(lines, r.buf...)
+	default:
+		r.dropped += len(lines)
 	}
+}
+
+// statusError is an HTTP answer other than success.
+type statusError struct{ code int }
+
+func (e statusError) Error() string { return fmt.Sprintf("HTTP %d", e.code) }
+
+// permanent answers do not change on retry: the token or run is not accepted
+// (401, 404, 409), or this batch is refused (413, 422).
+func (e statusError) permanent() bool {
+	switch e.code {
+	case http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict,
+		http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
+// closesRun answers refuse every later batch too.
+func (e statusError) closesRun() bool {
+	return e.code == http.StatusUnauthorized || e.code == http.StatusNotFound || e.code == http.StatusConflict
 }
 
 func (r *Reporter) post(ctx context.Context, data []byte) error {
@@ -135,7 +192,7 @@ func (r *Reporter) post(ctx context.Context, data []byte) error {
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, res.Body)
 	if res.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d", res.StatusCode)
+		return statusError{res.StatusCode}
 	}
 	return nil
 }

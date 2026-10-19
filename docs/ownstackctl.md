@@ -22,7 +22,7 @@ ownstackctl up -f ownstack.yaml       # build it
 | **Standard** | 4 GB+ | Harbor on the server | Jenkins on the server | `examples/standard.yaml` |
 | **Bring your registry** | 2 GB+ | Your Harbor, GHCR, Docker Hub, any OCI registry | GitHub Actions | `examples/byo-registry.yaml` |
 
-`apply` refuses a stack that clearly does not fit the server's memory (override with `--allow-low-memory`).
+`apply` and `up` refuse a stack that clearly does not fit the server's memory: the estimate may exceed the server's memory by up to 25% (override with `--allow-low-memory`). `doctor` uses the same rule.
 
 ## Providers
 
@@ -30,7 +30,7 @@ ownstackctl up -f ownstack.yaml       # build it
 | --- | --- | --- |
 | compute | `own-vps` | k3s on the server ownstackctl runs on. The public IP is added to the API certificate. |
 | dns | `cloudflare`, `manual` | Cloudflare manages A records and DNS-01 certificates. Manual: you create `A domain` and `A *.domain`; certificates use TLS-ALPN. |
-| ingress | `traefik` | Let's Encrypt certificates; `acmeStaging: true` for test runs. |
+| ingress | `traefik` | Let's Encrypt certificates; `acmeStaging: true` for test runs (health checks then accept the staging certificate, but CI pushing from outside the server will not trust it). |
 | vcs | `github` | Cluster repo and app repos; optionally a demo app repo. |
 | images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified, nothing is installed. |
 | alerts | `slack` | Pipeline notifications (Jenkins). |
@@ -101,13 +101,17 @@ Values that came from the environment, a prompt, or generation are saved to `/et
 | `up` | Bootstrap the cluster repo with the manifest, then `apply`. First run. |
 | `apply` | Converge the server to the manifest, then wait until every part is healthy. Idempotent. |
 | `plan [--json]` | What `apply` would install, upgrade, verify, or remove; memory and disk needed vs. available; missing secrets. Changes nothing. |
-| `status [--json]` | Read-only health: node, DNS, certificates, releases, pods, registry credential, pipelines, and every deployed app. Exit code 2 when something is failing. |
+| `status [--json]` | Read-only health: node, DNS, certificates, releases, pods, registry credential, environment pull secrets, pipelines, and every deployed app (IngressRoute, Ingress, or HTTPRoute host). Exit code 2 when something is failing. |
 | `validate [--json]` | Check the manifest against the catalog. |
 | `doctor` | Check the server: root, OS, architecture, memory for this stack, missing secrets. |
 | `catalog` | Aspects, providers, and presets as JSON. |
 | `workflow` | The GitHub Actions workflow for app repos. |
 
 Flags for `apply` and `up`: `--only aspect,...`, `--prune` (remove providers no longer in the manifest, including their data), `--allow-low-memory`, `--no-verify`, `--report URL` (stream progress to an Ownstack run; token in `OWNSTACK_REPORT_TOKEN`).
+
+- `--only` takes aspects that are in the manifest, plus `environments`. `--only images` also refreshes the environments' pull secrets. If the registry credential changed, apply names the stages that still hold the old one (usually `cicd`) so you can rerun them.
+- `--prune` runs after the new stack is applied, so a replacement (Harbor to Zot) is running before the old provider and its data are removed. Nothing is removed when apply fails. With `--only`, only the selected aspects are pruned. Give the new provider its own hostname: until the prune, both answer.
+- Only one `apply` or `up` runs at a time on a server (`apply.lock` next to the secrets file); a second one stops with the first one's process id.
 
 ## Live health in Ownstack
 
@@ -127,7 +131,7 @@ ownstack.event=stage_failed error="..." id="cicd"
 ownstack.event=run_completed duration="2m6s"
 ```
 
-Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune-<provider>`, and `verify`.
+Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune-<provider>` (after the aspects), and `verify`.
 
 ## Troubleshooting
 

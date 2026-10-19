@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,8 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 		Kubeconfig:   stack.Kubeconfig,
 		StorageClass: "local-path",
 		APIServer:    "https://" + rt.Setting("host") + ":6443",
+		// ownstackctl runs on the node, so its own architecture is the node's.
+		Arch: runtime.GOARCH,
 	}
 	if ca, err := os.ReadFile(serverCA); err == nil {
 		rt.Out.Compute.CACert = string(ca)

@@ -44,6 +44,7 @@ func (Provider) Resolve(ctx context.Context, rt *stack.Runtime) error {
 		Host:           rt.Setting("host"),
 		Project:        rt.Setting("project"),
 		PullSecretName: PullSecretName,
+		Login:          "user admin, password HARBOR_ADMIN_PASSWORD",
 	}
 	rt.Out.Images = out
 	if user, ok := rt.Kube.SecretValue(ctx, namespace, robotSecret, "username"); ok {
@@ -133,7 +134,7 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	checks := []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
-		stack.CheckHTTPS(ctx, host, rt.Out.Compute.PublicIP, "/api/v2.0/ping", false),
+		rt.CheckHTTPS(ctx, host, "/api/v2.0/ping"),
 	}
 	api := &client{base: "https://" + host + "/api/v2.0", http: rt.ServiceClient()}
 	if err := api.healthy(ctx); err != nil {

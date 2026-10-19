@@ -45,7 +45,7 @@ var (
 type Provider struct{}
 
 func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
-	rt.Out.CICD = &stack.CICDOutput{URL: "https://" + rt.Setting("host")}
+	rt.Out.CICD = &stack.CICDOutput{URL: "https://" + rt.Setting("host"), Login: "user admin, password JENKINS_ADMIN_PASSWORD"}
 	_, err := rt.Secret("adminPassword")
 	return err
 }
@@ -155,7 +155,7 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	checks := []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
-		stack.CheckHTTPS(ctx, rt.Setting("host"), rt.Out.Compute.PublicIP, "/login", false),
+		rt.CheckHTTPS(ctx, rt.Setting("host"), "/login"),
 	}
 	password, err := rt.Secret("adminPassword")
 	if err != nil {

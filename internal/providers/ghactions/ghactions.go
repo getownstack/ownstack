@@ -28,7 +28,6 @@ const (
 	tokenSecret     = "ownstack-deployer-token"
 	workflowFile    = "ownstack.yml"
 	workflowPath    = ".github/workflows/" + workflowFile
-	demoRepo        = "lumen-yard"
 )
 
 // Workflow is the pipeline committed to app repos; docs link to it too.
@@ -60,8 +59,8 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	for _, r := range repos {
 		steps = append(steps, stack.Step{Action: "configure", Target: r.String(), Detail: "OWNSTACK_* secrets and variables"})
 	}
-	if rt.Manifest.Settings(rt.Catalog, "vcs")["demoApp"] == "true" {
-		steps = append(steps, stack.Step{Action: "ensure", Target: rt.Out.VCS.Owner + "/" + demoRepo, Detail: "commit " + workflowPath + " (first build deploys the demo)"})
+	if demo := rt.Out.VCS.DemoRepo; demo != "" {
+		steps = append(steps, stack.Step{Action: "ensure", Target: rt.Out.VCS.Owner + "/" + demo, Detail: "commit " + workflowPath + " (first build deploys the demo)"})
 	}
 	return steps
 }
@@ -69,6 +68,10 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if rt.Out.VCS.Kind != "github" {
 		return fmt.Errorf("GitHub Actions needs the github VCS provider")
+	}
+	// App repos would otherwise get an empty registry credential.
+	if images := rt.Out.Images; images == nil || images.PushUsername == "" || images.PushPassword == "" {
+		return fmt.Errorf("the registry did not provide a push credential; apply the images aspect first")
 	}
 	kubeconfig, err := p.ensureDeployer(ctx, rt)
 	if err != nil {
@@ -84,7 +87,8 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err != nil {
 		return err
 	}
-	demo := rt.Manifest.Settings(rt.Catalog, "vcs")["demoApp"] == "true"
+	demoRepo := rt.Out.VCS.DemoRepo
+	demo := demoRepo != ""
 	demoTarget := target{rt.Out.VCS.Owner, demoRepo}
 	if demo && !containsTarget(repos, demoTarget) {
 		repos = append(repos, demoTarget)
@@ -182,7 +186,7 @@ func (p Provider) targetRepos(ctx context.Context, rt *stack.Runtime) ([]target,
 		login = l
 	}
 	filter := rt.Setting("repoFilter")
-	clusterRepo := rt.Manifest.Settings(rt.Catalog, "vcs")["clusterRepo"]
+	clusterRepo := rt.Out.VCS.ClusterRepo
 	var out []target
 	for _, owner := range owners(rt) {
 		all, err := gh.Repos(ctx, owner, login)

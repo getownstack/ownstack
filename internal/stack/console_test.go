@@ -43,3 +43,52 @@ func TestLineWriterSplitsCarriageReturns(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// Event fields are %q-quoted; a secret with a quote or backslash must be
+// redacted before quoting, or its escaped form slips through.
+func TestEventRedactsBeforeQuoting(t *testing.T) {
+	var out bytes.Buffer
+	c := NewConsole(&out)
+	secret := `pa"ss\word99`
+	c.Redact(secret)
+	c.Event("stage_failed", map[string]string{"id": "images", "error": "login failed for " + secret})
+	got := out.String()
+	if strings.Contains(got, "word99") {
+		t.Fatalf("secret leaked: %s", got)
+	}
+	if !strings.Contains(got, `error="login failed for [redacted]"`) {
+		t.Errorf("event = %q", got)
+	}
+}
+
+func TestRedactAll(t *testing.T) {
+	type check struct {
+		Name, Detail string
+		hidden       string
+	}
+	doc := struct {
+		Title  string
+		Checks []check
+		Steps  []*check
+		Notes  map[string]string
+		Any    any
+		Count  int
+	}{
+		Title:  "token abcd-secret",
+		Checks: []check{{Name: "x", Detail: `rejected "abcd-secret"`, hidden: "abcd-secret"}},
+		Steps:  []*check{{Detail: "abcd-secret"}, nil},
+		Notes:  map[string]string{"k": "abcd-secret!"},
+		Any:    check{Detail: "abcd-secret"},
+		Count:  3,
+	}
+	c := NewConsole(&bytes.Buffer{})
+	c.Redact("abcd-secret")
+	c.RedactAll(&doc)
+	if doc.Title != "token [redacted]" || doc.Checks[0].Detail != `rejected "[redacted]"` || doc.Steps[0].Detail != "[redacted]" ||
+		doc.Notes["k"] != "[redacted]!" || doc.Any.(check).Detail != "[redacted]" {
+		t.Errorf("not redacted: %+v", doc)
+	}
+	if doc.Checks[0].hidden != "abcd-secret" || doc.Count != 3 {
+		t.Errorf("unexported or non-string fields changed: %+v", doc)
+	}
+}

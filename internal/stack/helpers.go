@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -21,13 +22,30 @@ func Render(t *template.Template, data any) (string, error) {
 func HelmStep(ctx context.Context, rt *Runtime, release, namespace, version string) Step {
 	target := fmt.Sprintf("helm release %s/%s", namespace, release)
 	if r, ok := rt.Kube.Release(ctx, release, namespace); ok {
-		installed := r.Chart[strings.LastIndex(r.Chart, "-")+1:]
+		installed := chartVersion(r.Chart, version)
 		if installed == version && r.Status == "deployed" {
 			return Step{Action: "upgrade", Target: target, Detail: "chart " + version + " (reapply values)"}
 		}
 		return Step{Action: "upgrade", Target: target, Detail: fmt.Sprintf("chart %s -> %s (%s)", installed, version, r.Status)}
 	}
 	return Step{Action: "install", Target: target, Detail: "chart " + version}
+}
+
+// chartSemver matches the version at the end of helm's "<name>-<version>"
+// chart column, including pre-release and build suffixes.
+var chartSemver = regexp.MustCompile(`-(v?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]*)?)$`)
+
+// chartVersion extracts the installed version from helm's chart column
+// ("harbor-1.15.0", "app-1.2.3-rc.1"). want is the expected version, which
+// settles names that themselves contain a version-like part.
+func chartVersion(chart, want string) string {
+	if want != "" && strings.HasSuffix(chart, "-"+want) {
+		return want
+	}
+	if m := chartSemver.FindStringSubmatch(chart); m != nil {
+		return m[1]
+	}
+	return chart[strings.LastIndex(chart, "-")+1:]
 }
 
 // ReleaseCheck reports a Helm release's status.

@@ -207,11 +207,13 @@ func open(ctx context.Context, c common, out io.Writer) (*session, error) {
 
 func (s *session) finish(err error) error {
 	if s.reporter != nil {
+		var reported error
 		if err != nil {
 			// main prints the error to the terminal; the run log needs it too.
 			s.reporter.Line(s.console.Redacted("ERROR: " + err.Error()))
+			reported = errors.New(s.console.Redacted(err.Error()))
 		}
-		s.reporter.Finish(err)
+		s.reporter.Finish(reported)
 	}
 	return err
 }
@@ -235,15 +237,29 @@ func cmdApply(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if only != "" {
-		opts.Only = strings.Split(only, ",")
+	unlock, err := lockNode(c.secretsFile)
+	if err != nil {
+		return s.finish(err)
 	}
+	defer unlock()
+	opts.Only = parseOnly(only)
 	err = s.engine.Apply(ctx, opts)
 	if err == nil {
 		printSummary(s)
 		setupHealth(ctx, s, hf, c.reportURL, c.file)
 	}
 	return s.finish(err)
+}
+
+// parseOnly splits --only, ignoring spaces and empty entries.
+func parseOnly(s string) []string {
+	var ids []string
+	for _, id := range strings.Split(s, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func cmdUp(ctx context.Context, args []string) error {
@@ -262,8 +278,13 @@ func cmdUp(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockNode(c.secretsFile)
+	if err != nil {
+		return s.finish(err)
+	}
+	defer unlock()
 	err = func() error {
-		if err := s.engine.Bootstrap(ctx, s.loaded.raw, dir); err != nil {
+		if err := s.engine.Bootstrap(ctx, s.loaded.raw, dir, opts); err != nil {
 			return err
 		}
 		checkout := filepath.Join(dir, manifest.FileName)
@@ -297,6 +318,7 @@ func cmdPlan(ctx context.Context, args []string) error {
 	}
 	s.store.Generate, s.store.Save = false, false
 	plan := s.engine.Plan(ctx)
+	s.console.RedactAll(&plan)
 	if c.jsonOut {
 		return printJSON(plan)
 	}
@@ -353,6 +375,8 @@ func cmdStatus(ctx context.Context, args []string) error {
 	}
 	s.store.Generate, s.store.Save = false, false
 	st := s.engine.Status(ctx)
+	// Check details are free-form provider and API errors.
+	s.console.RedactAll(&st)
 	if healthURL != "" {
 		if err := health.Send(ctx, healthURL, os.Getenv("OWNSTACK_REPORT_TOKEN"), st); err != nil {
 			fmt.Fprintf(os.Stderr, "note: could not send health to Ownstack: %v\n", err)
@@ -441,11 +465,8 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		store.Overrides = l.overrides
 		eng := engine.New(l.manifest, store, stack.NewConsole(io.Discard))
 		plan := eng.Plan(ctx)
-		if data, err := os.ReadFile("/proc/meminfo"); err == nil {
-			var totalKiB int
-			fmt.Sscanf(strings.SplitN(string(data), "\n", 2)[0], "MemTotal: %d kB", &totalKiB)
-			need := plan.Resources.MemoryMiB
-			report(totalKiB/1024 >= need, "memory", fmt.Sprintf("%d MiB available, stack needs about %d MiB", totalKiB/1024, need))
+		if total, need := plan.MemTotalMiB, plan.Resources.MemoryMiB; total > 0 {
+			report(engine.MemoryFits(total, need), "memory", fmt.Sprintf("%d MiB on this server, stack needs about %d MiB", total, need))
 		}
 		report(len(plan.Missing) == 0, "secrets", fmt.Sprintf("%d secret(s) still to provide", len(plan.Missing)))
 	} else {
@@ -472,20 +493,20 @@ func printSummary(s *session) {
 	c := s.console
 	c.Printf("")
 	c.Printf("Your stack is ready.")
-	if out.Ingress != nil {
-		c.Printf("  %-18s https://%s", name("ingress")+" dashboard", m.Settings(cat, "ingress")["dashboardHost"])
+	if out.Ingress != nil && out.Ingress.DashboardURL != "" {
+		c.Printf("  %-18s %s", name("ingress")+" dashboard", out.Ingress.DashboardURL)
 	}
 	if out.Images != nil {
 		line := fmt.Sprintf("  %-18s %s/%s  (user %s)", name("images"), out.Images.Host, out.Images.Project, out.Images.PushUsername)
-		if c, ok := m.Component("images"); ok && c.Provider == "harbor" {
-			line = fmt.Sprintf("  %-18s https://%s  (user admin, password HARBOR_ADMIN_PASSWORD)", name("images"), out.Images.Host)
+		if out.Images.Login != "" {
+			line = fmt.Sprintf("  %-18s https://%s  (%s)", name("images"), out.Images.Host, out.Images.Login)
 		}
 		c.Printf("%s", line)
 	}
 	if out.CICD != nil {
 		line := fmt.Sprintf("  %-18s %s", name("cicd"), out.CICD.URL)
-		if c, ok := m.Component("cicd"); ok && c.Provider == "jenkins" {
-			line += "  (user admin, password JENKINS_ADMIN_PASSWORD)"
+		if out.CICD.Login != "" {
+			line += "  (" + out.CICD.Login + ")"
 		}
 		c.Printf("%s", line)
 	}
@@ -517,11 +538,17 @@ func setupHealth(ctx context.Context, s *session, h healthFlags, reportURL, mani
 		return
 	}
 	abs, err := filepath.Abs(manifestPath)
+	var secretsFile string
 	if err == nil {
-		err = health.Install(ctx, s.engine.RT.Exec, url, token, abs)
+		secretsFile, err = filepath.Abs(s.store.Path)
 	}
 	if err == nil {
-		err = health.Send(ctx, url, token, s.engine.Status(ctx))
+		err = health.Install(ctx, s.engine.RT.Exec, url, token, abs, secretsFile)
+	}
+	if err == nil {
+		st := s.engine.Status(ctx)
+		s.console.RedactAll(&st)
+		err = health.Send(ctx, url, token, st)
 	}
 	if err != nil {
 		s.console.Printf("note: health reports to Ownstack are not set up: %v", err)

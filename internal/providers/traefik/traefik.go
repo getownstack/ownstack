@@ -37,6 +37,8 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 			"traefik.ingress.kubernetes.io/router.entrypoints":      entryPoint,
 			"traefik.ingress.kubernetes.io/router.tls.certresolver": certResolver,
 		},
+		UntrustedCerts: rt.SettingBool("acmeStaging"),
+		DashboardURL:   "https://" + rt.Setting("dashboardHost"),
 	}
 	return nil
 }
@@ -99,7 +101,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	host := rt.Setting("dashboardHost")
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
-		check := stack.CheckHTTPS(ctx, host, rt.Out.Compute.PublicIP, "/", rt.SettingBool("acmeStaging"))
+		check := rt.CheckHTTPS(ctx, host, "/")
 		if check.State == stack.OK {
 			rt.Logf("Traefik: %s", check.Detail)
 			return nil
@@ -121,6 +123,6 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	return []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
-		stack.CheckHTTPS(ctx, rt.Setting("dashboardHost"), rt.Out.Compute.PublicIP, "/", rt.SettingBool("acmeStaging")),
+		rt.CheckHTTPS(ctx, rt.Setting("dashboardHost"), "/"),
 	}
 }

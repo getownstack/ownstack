@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strings"
 
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
@@ -28,6 +29,9 @@ func (e environments) plan(ctx context.Context) []stack.Step {
 
 func (e environments) apply(ctx context.Context) error {
 	images := e.rt.Out.Images
+	if images != nil && images.PushUsername == "" {
+		e.rt.Logf("warning: the registry has no credential yet, so the environments get no pull secret %s; apply the images aspect", images.PullSecretName)
+	}
 	for _, env := range e.rt.Manifest.Environments() {
 		if err := e.rt.Kube.EnsureNamespace(ctx, env); err != nil {
 			return err
@@ -51,9 +55,17 @@ func (e environments) status(ctx context.Context) []stack.Check {
 			continue
 		}
 		if images != nil {
-			if _, ok := e.rt.Kube.SecretValue(ctx, env, images.PullSecretName, ".dockerconfigjson"); !ok {
+			raw, ok := e.rt.Kube.SecretValue(ctx, env, images.PullSecretName, ".dockerconfigjson")
+			if !ok {
 				checks = append(checks, stack.Check{Name: env, State: stack.Fail, Detail: "pull secret missing"})
 				continue
+			}
+			// The reason never contains a credential: status goes to health reports.
+			if images.PushUsername != "" {
+				if reason := stack.PullSecretMismatch(raw, images.PullSecretServer(), images.PushUsername, images.PushPassword); reason != "" {
+					checks = append(checks, stack.Check{Name: env, State: stack.Fail, Detail: "stale pull secret (" + reason + "); rerun apply --only environments"})
+					continue
+				}
 			}
 		}
 		checks = append(checks, stack.Check{Name: env, State: stack.OK, Detail: "ready"})
@@ -62,40 +74,89 @@ func (e environments) status(ctx context.Context) []stack.Check {
 	return checks
 }
 
-var hostRule = regexp.MustCompile("Host\\(`([^`]+)`\\)")
+// routeResources are the kinds applications publish hosts with: Traefik
+// IngressRoutes (common_helm_library), standard Ingresses, and Gateway API
+// HTTPRoutes.
+var routeResources = []string{"ingressroutes.traefik.io", "ingresses.networking.k8s.io", "httproutes.gateway.networking.k8s.io"}
 
 // appChecks reports every application published in an environment: one
-// check per IngressRoute host, with its HTTPS and certificate state.
+// check per host, with its HTTPS and certificate state.
 func (e environments) appChecks(ctx context.Context, env string) []stack.Check {
-	out, err := e.rt.Exec.Output(ctx, "kubectl", "get", "ingressroutes.traefik.io", "-n", env, "-o", "json")
-	if err != nil {
-		return nil
+	var routes []route
+	for _, resource := range routeResources {
+		out, err := e.rt.Exec.Output(ctx, "kubectl", "get", resource, "-n", env, "-o", "json")
+		if err != nil {
+			continue // that kind is not installed: no routes of it
+		}
+		routes = append(routes, parseRoutes(out)...)
 	}
+	var checks []stack.Check
+	for _, r := range uniqueHosts(routes) {
+		c := e.rt.CheckHTTPS(ctx, r.host, "/")
+		c.Name = "app " + env + "/" + r.name
+		c.Detail = "https://" + r.host + " " + c.Detail
+		if c.State == stack.Fail {
+			// An app being down is reported, but is not a platform failure.
+			c.State = stack.Warn
+		}
+		checks = append(checks, c)
+	}
+	return checks
+}
+
+// route is one host an application object publishes.
+type route struct{ name, host string }
+
+var hostRule = regexp.MustCompile("Host\\(`([^`]+)`\\)")
+
+// parseRoutes reads the hosts from `kubectl get -o json` of IngressRoutes
+// (Host() rules), Ingresses (spec.rules[].host), or HTTPRoutes
+// (spec.hostnames). Empty and wildcard hosts are skipped.
+func parseRoutes(data string) []route {
 	var list struct {
 		Items []struct {
 			Metadata struct{ Name string } `json:"metadata"`
 			Spec     struct {
-				Routes []struct{ Match string } `json:"routes"`
+				Routes    []struct{ Match string } `json:"routes"`
+				Rules     []struct{ Host string }  `json:"rules"`
+				Hostnames []string                 `json:"hostnames"`
 			} `json:"spec"`
 		} `json:"items"`
 	}
-	if json.Unmarshal([]byte(out), &list) != nil {
+	if json.Unmarshal([]byte(data), &list) != nil {
 		return nil
 	}
-	var checks []stack.Check
+	var out []route
 	for _, item := range list.Items {
-		for _, route := range item.Spec.Routes {
-			for _, m := range hostRule.FindAllStringSubmatch(route.Match, -1) {
-				c := stack.CheckHTTPS(ctx, m[1], e.rt.Out.Compute.PublicIP, "/", false)
-				c.Name = "app " + env + "/" + item.Metadata.Name
-				c.Detail = "https://" + m[1] + " " + c.Detail
-				if c.State == stack.Fail {
-					// An app being down is reported, but is not a platform failure.
-					c.State = stack.Warn
-				}
-				checks = append(checks, c)
+		var hosts []string
+		for _, r := range item.Spec.Routes {
+			for _, m := range hostRule.FindAllStringSubmatch(r.Match, -1) {
+				hosts = append(hosts, m[1])
+			}
+		}
+		for _, r := range item.Spec.Rules {
+			hosts = append(hosts, r.Host)
+		}
+		hosts = append(hosts, item.Spec.Hostnames...)
+		for _, h := range hosts {
+			if h != "" && !strings.HasPrefix(h, "*") {
+				out = append(out, route{item.Metadata.Name, h})
 			}
 		}
 	}
-	return checks
+	return out
+}
+
+// uniqueHosts keeps the first route for each host, so an app published by
+// more than one kind of object is checked once.
+func uniqueHosts(routes []route) []route {
+	seen := map[string]bool{}
+	var out []route
+	for _, r := range routes {
+		if !seen[r.host] {
+			seen[r.host] = true
+			out = append(out, r)
+		}
+	}
+	return out
 }

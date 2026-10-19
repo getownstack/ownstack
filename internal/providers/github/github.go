@@ -49,8 +49,12 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 		Kind:           "github",
 		Owner:          owner,
 		APIURL:         p.api(),
+		ClusterRepo:    repo,
 		ClusterRepoURL: fmt.Sprintf("https://github.com/%s/%s.git", owner, repo),
 		Username:       owner,
+	}
+	if rt.SettingBool("demoApp") {
+		out.DemoRepo = demoRepo
 	}
 	rt.Out.VCS = out
 	token, err := rt.Secret("token")
@@ -173,9 +177,9 @@ func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir s
 type repoSpec struct{ name, template, description string }
 
 func (p Provider) repos(rt *stack.Runtime) []repoSpec {
-	repos := []repoSpec{{rt.Setting("clusterRepo"), Template(), "Ownstack cluster configuration"}}
-	if rt.SettingBool("demoApp") {
-		repos = append(repos, repoSpec{demoRepo, demoTemplate, "Ownstack demo application"})
+	repos := []repoSpec{{rt.Out.VCS.ClusterRepo, Template(), "Ownstack cluster configuration"}}
+	if rt.Out.VCS.DemoRepo != "" {
+		repos = append(repos, repoSpec{rt.Out.VCS.DemoRepo, demoTemplate, "Ownstack demo application"})
 	}
 	return repos
 }

@@ -18,8 +18,11 @@ import (
 func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool) Check {
 	name := "https://" + host
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	// One request per transport: no keep-alive, so polling loops (verify,
+	// WaitForCertificate) do not pile up idle connections.
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if ip != "" {
 				_, port, _ := net.SplitHostPort(addr)
@@ -28,6 +31,7 @@ func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool)
 			return dialer.DialContext(ctx, network, addr)
 		},
 	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 15 * time.Second, Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
@@ -64,6 +68,24 @@ func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool)
 	}
 }
 
+// CheckHTTPS checks host on this stack's node. It accepts certificates the
+// ingress marks as untrusted (Let's Encrypt staging), so staging stacks can
+// become healthy.
+func (rt *Runtime) CheckHTTPS(ctx context.Context, host, path string) Check {
+	return CheckHTTPS(ctx, host, rt.publicIP(), path, rt.untrustedCerts())
+}
+
+func (rt *Runtime) publicIP() string {
+	if rt.Out.Compute == nil {
+		return ""
+	}
+	return rt.Out.Compute.PublicIP
+}
+
+func (rt *Runtime) untrustedCerts() bool {
+	return rt.Out.Ingress != nil && rt.Out.Ingress.UntrustedCerts
+}
+
 func stateForStatus(code int) string {
 	if code >= 500 {
 		return Fail
@@ -87,15 +109,15 @@ func (rt *Runtime) ServiceClient() *http.Client {
 	if rt.ServiceHTTP != nil {
 		return rt.ServiceHTTP
 	}
-	ip := ""
-	if rt.Out.Compute != nil {
-		ip = rt.Out.Compute.PublicIP
-	}
+	ip := rt.publicIP()
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			// Callers build a client per attempt; idle connections must not
+			// outlive the retry loop.
+			IdleConnTimeout: 30 * time.Second,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				if ip != "" {
 					_, port, _ := net.SplitHostPort(addr)
@@ -107,15 +129,20 @@ func (rt *Runtime) ServiceClient() *http.Client {
 	}
 }
 
-// WaitForCertificate waits until host serves a publicly trusted certificate.
-// Services other machines connect to (registries pushed to from CI) are not
-// usable before that, so their stages wait instead of finishing early.
+// WaitForCertificate waits until host serves a publicly trusted certificate,
+// or any issued certificate when the ingress issues untrusted ones (Let's
+// Encrypt staging). Services other machines connect to (registries pushed to
+// from CI) are not usable before that, so their stages wait instead of
+// finishing early.
 func WaitForCertificate(ctx context.Context, rt *Runtime, host, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		check := CheckHTTPS(ctx, host, rt.Out.Compute.PublicIP, path, false)
+		check := rt.CheckHTTPS(ctx, host, path)
 		if check.State == OK {
 			rt.Logf("%s: %s", host, check.Detail)
+			if rt.untrustedCerts() {
+				rt.Logf("  note: %s uses a staging certificate; clients outside this server (such as CI pushes) will not trust it", host)
+			}
 			return nil
 		}
 		if time.Now().After(deadline) {

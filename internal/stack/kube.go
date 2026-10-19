@@ -57,15 +57,58 @@ func (k *Kube) ApplySecret(ctx context.Context, namespace, name, secretType stri
 
 // ApplyPullSecret creates or updates a kubernetes.io/dockerconfigjson secret.
 func (k *Kube) ApplyPullSecret(ctx context.Context, namespace, name, server, username, password string) error {
-	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-	config, err := json.Marshal(object{"auths": object{server: object{
-		"username": username, "password": password, "auth": auth,
-	}}})
+	config, err := DockerConfigJSON(server, username, password)
 	if err != nil {
 		return err
 	}
 	return k.ApplySecret(ctx, namespace, name, "kubernetes.io/dockerconfigjson",
-		map[string]string{".dockerconfigjson": string(config)}, nil)
+		map[string]string{".dockerconfigjson": config}, nil)
+}
+
+// DockerConfigJSON is the .dockerconfigjson of a pull secret for one registry.
+func DockerConfigJSON(server, username, password string) (string, error) {
+	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	config, err := json.Marshal(object{"auths": object{server: object{
+		"username": username, "password": password, "auth": auth,
+	}}})
+	return string(config), err
+}
+
+// PullSecretMismatch compares a stored .dockerconfigjson with the registry
+// credential it should hold. It returns "" when they match, or a reason that
+// never contains a credential value. An empty password compares only the
+// server and the username.
+func PullSecretMismatch(raw, server, username, password string) string {
+	var config struct {
+		Auths map[string]struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Auth     string `json:"auth"`
+		} `json:"auths"`
+	}
+	if json.Unmarshal([]byte(raw), &config) != nil {
+		return "unreadable"
+	}
+	entry, ok := config.Auths[server]
+	if !ok {
+		return "no entry for " + server
+	}
+	user, pass := entry.Username, entry.Password
+	if entry.Auth != "" {
+		// The kubelet prefers auth over the separate fields.
+		decoded, err := base64.StdEncoding.DecodeString(entry.Auth)
+		if err != nil {
+			return "unreadable"
+		}
+		user, pass, _ = strings.Cut(string(decoded), ":")
+	}
+	switch {
+	case user != username:
+		return "different username"
+	case password != "" && pass != password:
+		return "different password"
+	}
+	return ""
 }
 
 // SecretValue reads one key of a secret; ok is false when it does not exist.

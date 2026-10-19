@@ -3,6 +3,7 @@ package stack
 import (
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -86,9 +87,66 @@ func (c *Console) Event(name string, fields map[string]string) {
 	sort.Strings(keys)
 	parts := []string{"ownstack.event=" + name}
 	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%q", k, fields[k]))
+		// Redact before quoting: %q escapes quotes and backslashes, after
+		// which a registered secret would no longer match.
+		parts = append(parts, fmt.Sprintf("%s=%q", k, c.Redacted(fields[k])))
 	}
 	c.Line(strings.Join(parts, " "))
+}
+
+// RedactAll masks every registered secret in every exported string reachable
+// from v, in place. v must be a pointer. Use it on documents printed or sent
+// outside the console (plan and status JSON, health reports); redacting the
+// marshalled JSON instead would miss secrets that JSON escapes.
+func (c *Console) RedactAll(v any) {
+	redactValue(reflect.ValueOf(v), c.Redacted)
+}
+
+func redactValue(v reflect.Value, redact func(string) string) {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return
+		}
+		elem := v.Elem()
+		if v.Kind() == reflect.Interface && !elem.CanSet() {
+			// Values held in an interface are not addressable: redact a copy.
+			cp := reflect.New(elem.Type()).Elem()
+			cp.Set(elem)
+			redactValue(cp, redact)
+			if v.CanSet() {
+				v.Set(cp)
+			}
+			return
+		}
+		redactValue(elem, redact)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).IsExported() {
+				redactValue(v.Field(i), redact)
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			redactValue(v.Index(i), redact)
+		}
+	case reflect.Map:
+		if v.IsNil() {
+			return
+		}
+		iter := v.MapRange()
+		for iter.Next() {
+			// Map values are not addressable: redact a copy and store it back.
+			cp := reflect.New(iter.Value().Type()).Elem()
+			cp.Set(iter.Value())
+			redactValue(cp, redact)
+			v.SetMapIndex(iter.Key(), cp)
+		}
+	case reflect.String:
+		if v.CanSet() {
+			v.SetString(redact(v.String()))
+		}
+	}
 }
 
 // lineWriter splits written bytes into lines for the console.

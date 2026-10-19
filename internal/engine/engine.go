@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,12 +26,23 @@ type Engine struct {
 	Manifest *manifest.Manifest
 	Catalog  *catalog.Catalog
 	RT       *stack.Runtime
+
+	lookup Lookup
 }
 
+// Lookup finds a provider's implementation.
+type Lookup func(aspect, id string) (stack.Provider, bool)
+
+// New builds an engine over the registered providers.
 func New(m *manifest.Manifest, store *secrets.Store, console *stack.Console) *Engine {
-	cat := providers.Catalog()
+	return NewWith(m, store, console, providers.Catalog(), providers.Lookup)
+}
+
+// NewWith builds an engine over a given catalog and set of providers (tests
+// pass fakes).
+func NewWith(m *manifest.Manifest, store *secrets.Store, console *stack.Console, cat *catalog.Catalog, lookup Lookup) *Engine {
 	store.OnValue(console.Redact)
-	return &Engine{Manifest: m, Catalog: cat, RT: stack.NewRuntime(m, cat, store, console)}
+	return &Engine{Manifest: m, Catalog: cat, RT: stack.NewRuntime(m, cat, store, console), lookup: lookup}
 }
 
 type unit struct {
@@ -50,7 +62,7 @@ func (e *Engine) units() []unit {
 			continue
 		}
 		spec, _ := e.Catalog.Provider(aspect.ID, c.Provider)
-		impl, ok := providers.Lookup(aspect.ID, c.Provider)
+		impl, ok := e.lookup(aspect.ID, c.Provider)
 		if !ok {
 			continue
 		}
@@ -72,22 +84,44 @@ func (e *Engine) Validate() error {
 	return fmt.Errorf("ownstack.yaml is not valid:\n%s", strings.Join(lines, "\n"))
 }
 
-// resolve fills every provider's static outputs. It returns per-aspect
-// errors; outputs are still set as far as they could be.
-func (e *Engine) resolve(ctx context.Context) map[string]error {
-	errs := map[string]error{}
+// resolveIssue is a problem resolving one provider.
+type resolveIssue struct {
+	aspect string
+	err    error
+}
+
+// resolve fills every provider's static outputs, in catalog order. It first
+// resolves every secret the catalog declares for the provider, so all missing
+// secrets are reported together and generated ones are saved by the next
+// Flush even when Resolve does not ask for them. Outputs are still set as far
+// as they could be.
+func (e *Engine) resolve(ctx context.Context) []resolveIssue {
+	var issues []resolveIssue
 	for _, u := range e.units() {
-		if err := u.impl.Resolve(ctx, u.rt); err != nil {
-			errs[u.aspect.ID] = err
+		reported := map[string]bool{}
+		for _, param := range u.spec.Params {
+			if !param.IsSecret() || !(param.Required || param.Generate) {
+				continue
+			}
+			if _, err := u.rt.Secret(param.Key); err != nil {
+				issues = append(issues, resolveIssue{u.aspect.ID, err})
+				reported[err.Error()] = true
+			}
+		}
+		// Resolve usually fails on the same secret; report it once.
+		if err := u.impl.Resolve(ctx, u.rt); err != nil && !reported[err.Error()] {
+			issues = append(issues, resolveIssue{u.aspect.ID, err})
 		}
 	}
-	return errs
+	return issues
 }
 
 // ── Apply ────────────────────────────────────────────────────────────────────
 
 type ApplyOptions struct {
-	// Only limits apply to these aspects (and the environments stage).
+	// Only limits apply to these stages: aspects in the manifest, or the
+	// environments stage. Selecting images also runs the environments stage,
+	// which hands the registry credential to every environment.
 	Only []string
 	// AllowLowMemory skips the memory preflight.
 	AllowLowMemory bool
@@ -105,11 +139,10 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 	if err := e.Validate(); err != nil {
 		return err
 	}
-	for _, id := range opts.Only {
-		if _, ok := e.Catalog.Aspect(id); !ok && id != EnvironmentsStage {
-			return fmt.Errorf("--only: unknown aspect %q", id)
-		}
+	if err := e.checkOnly(opts.Only); err != nil {
+		return err
 	}
+	only := expandOnly(opts.Only)
 
 	start := time.Now()
 	console.Event("run_started", map[string]string{
@@ -127,43 +160,42 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 		}
 	}()
 
-	if err := e.memoryPreflight(opts); err != nil {
+	if err := e.prepare(ctx, opts); err != nil {
 		return err
-	}
-	if errs := e.resolve(ctx); len(errs) > 0 {
-		return resolveError(errs)
-	}
-	// Persist generated and supplied secrets before anything uses them, so a
-	// failed run never leaves an installed service with a forgotten password.
-	if err := e.RT.Secrets.Flush(); err != nil {
-		return fmt.Errorf("save secrets: %w", err)
-	}
-
-	if orphans := e.orphans(ctx); len(orphans) > 0 {
-		if opts.Prune {
-			if err := e.prune(ctx, orphans); err != nil {
-				return err
-			}
-		} else {
-			for _, o := range orphans {
-				console.Printf("warning: %s is installed but no longer in ownstack.yaml; rerun with --prune to remove it and its data", o.title())
-			}
-		}
 	}
 
 	var applied []stage
+	var credentialChanged bool
 	for _, stage := range e.stages() {
-		if !selected(opts.Only, stage.id) {
+		if !selected(only, stage.id) {
 			continue
+		}
+		credentialBefore := e.pushCredential()
+		if stage.id == EnvironmentsStage && e.pullSecretsStale(ctx) {
+			credentialChanged = true
 		}
 		console.Event("stage_started", map[string]string{"id": stage.id, "title": stage.title, "provider": stage.provider})
 		stageStart := time.Now()
 		if err := stage.apply(ctx); err != nil {
 			console.Event("stage_failed", map[string]string{"id": stage.id, "error": err.Error()})
+			if opts.Prune {
+				console.Printf("--prune: nothing was removed because apply failed")
+			}
 			return fmt.Errorf("%s: %w", stage.title, err)
 		}
 		console.Event("stage_completed", map[string]string{"id": stage.id, "duration": time.Since(stageStart).Round(time.Second).String()})
 		applied = append(applied, stage)
+		if e.pushCredential() != credentialBefore {
+			credentialChanged = true
+		}
+	}
+	if credentialChanged {
+		e.warnCredentialConsumers(only)
+	}
+	// Prune only once the new stack runs, so replacing a provider (Harbor by
+	// Zot) never leaves the node without one when the new one fails.
+	if err := e.pruneOrphans(ctx, only, opts.Prune); err != nil {
+		return err
 	}
 	if opts.SkipVerify {
 		return nil
@@ -171,8 +203,98 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 	return e.verify(ctx, applied)
 }
 
-// VerifyTimeout bounds the final health check.
-var VerifyTimeout = 5 * time.Minute
+// prepare runs what apply and up need before changing anything: the memory
+// preflight, then every provider's outputs and secrets, which it saves.
+func (e *Engine) prepare(ctx context.Context, opts ApplyOptions) error {
+	if err := e.memoryPreflight(opts); err != nil {
+		return err
+	}
+	if issues := e.resolve(ctx); len(issues) > 0 {
+		return resolveError(issues)
+	}
+	// Persist generated and supplied secrets before anything uses them, so a
+	// failed run never leaves an installed service with a forgotten password.
+	if err := e.RT.Secrets.Flush(); err != nil {
+		return fmt.Errorf("save secrets: %w", err)
+	}
+	return nil
+}
+
+// checkOnly rejects --only ids that would apply nothing.
+func (e *Engine) checkOnly(only []string) error {
+	for _, id := range only {
+		if id == EnvironmentsStage {
+			continue
+		}
+		if _, ok := e.Catalog.Aspect(id); !ok {
+			return fmt.Errorf("--only: unknown aspect %q", id)
+		}
+		if _, ok := e.Manifest.Component(id); !ok {
+			return fmt.Errorf("--only: %s is not in ownstack.yaml", id)
+		}
+	}
+	return nil
+}
+
+// expandOnly adds the stages a selection implies: the environments stage
+// holds the registry's pull credential, so applying images refreshes it too.
+func expandOnly(only []string) []string {
+	if len(only) == 0 || !selected(only, "images") || selected(only, EnvironmentsStage) {
+		return only
+	}
+	return append(append([]string(nil), only...), EnvironmentsStage)
+}
+
+// pushCredential identifies the registry credential for change detection.
+// It is only compared, never printed.
+func (e *Engine) pushCredential() [2]string {
+	if images := e.RT.Out.Images; images != nil {
+		return [2]string{images.PushUsername, images.PushPassword}
+	}
+	return [2]string{}
+}
+
+// pullSecretsStale reports whether an existing environment pull secret holds
+// a different credential than the registry now provides (a rotated robot or
+// a changed password).
+func (e *Engine) pullSecretsStale(ctx context.Context) bool {
+	images := e.RT.Out.Images
+	if images == nil || images.PushUsername == "" {
+		return false
+	}
+	for _, env := range e.Manifest.Environments() {
+		raw, ok := e.RT.Kube.SecretValue(ctx, env, images.PullSecretName, ".dockerconfigjson")
+		if ok && stack.PullSecretMismatch(raw, images.PullSecretServer(), images.PushUsername, images.PushPassword) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// warnCredentialConsumers names the stages that still hold the old registry
+// credential because this run did not apply them.
+func (e *Engine) warnCredentialConsumers(only []string) {
+	var stale []string
+	for _, s := range e.stages() {
+		if selected(only, s.id) {
+			continue
+		}
+		aspect, _ := e.Catalog.Aspect(s.id)
+		if s.id == EnvironmentsStage || slices.Contains(aspect.Consumes, "images") {
+			stale = append(stale, s.id)
+		}
+	}
+	if len(stale) > 0 {
+		e.RT.Console.Printf("warning: registry credential changed; run `ownstackctl apply --only %s` so they use the new one", strings.Join(stale, ","))
+	}
+}
+
+// VerifyTimeout bounds the final health check; verifyInterval is how often
+// it polls.
+var (
+	VerifyTimeout  = 5 * time.Minute
+	verifyInterval = 15 * time.Second
+)
 
 // verify waits until every applied stage reports no failing checks. A stack
 // whose services fall over once everything runs together (for example on a
@@ -205,9 +327,16 @@ func (e *Engine) verify(ctx context.Context, applied []stage) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(15 * time.Second):
+		case <-time.After(verifyInterval):
 		}
 	}
+}
+
+// MemoryFits reports whether a stack that needs about need MiB fits a server
+// with total MiB. The catalog estimates are generous, so 80% is enough. The
+// apply preflight and doctor share this rule.
+func MemoryFits(total, need int) bool {
+	return float64(total) >= float64(need)*0.8
 }
 
 // memoryPreflight refuses stacks that clearly do not fit the server. The
@@ -231,7 +360,7 @@ func (e *Engine) memoryPreflight(opts ApplyOptions) error {
 			heavy = append(heavy, fmt.Sprintf("%s (~%.1f GB)", u.spec.Name, float64(u.spec.Resources.MemoryMiB)/1024))
 		}
 	}
-	if float64(total) >= float64(need)*0.8 {
+	if MemoryFits(total, need) {
 		return nil
 	}
 	msg := fmt.Sprintf("this stack needs about %.1f GB of memory but the server has %.1f GB", float64(need)/1024, float64(total)/1024)
@@ -269,7 +398,7 @@ func (e *Engine) orphans(ctx context.Context) []orphan {
 		if c, ok := e.Manifest.Component(p.Aspect); ok && c.Provider == p.ID {
 			continue
 		}
-		impl, ok := providers.Lookup(p.Aspect, p.ID)
+		impl, ok := e.lookup(p.Aspect, p.ID)
 		if !ok {
 			continue
 		}
@@ -281,6 +410,24 @@ func (e *Engine) orphans(ctx context.Context) []orphan {
 		out = append(out, orphan{aspect: aspect, spec: p, impl: removable})
 	}
 	return out
+}
+
+// pruneOrphans removes the selected aspects' orphans with prune, and only
+// warns about them otherwise.
+func (e *Engine) pruneOrphans(ctx context.Context, only []string, prune bool) error {
+	var orphans []orphan
+	for _, o := range e.orphans(ctx) {
+		if selected(only, o.aspect.ID) {
+			orphans = append(orphans, o)
+		}
+	}
+	if prune {
+		return e.prune(ctx, orphans)
+	}
+	for _, o := range orphans {
+		e.RT.Console.Printf("warning: %s is installed but no longer in ownstack.yaml; rerun with --prune to remove it and its data", o.title())
+	}
+	return nil
 }
 
 func (e *Engine) prune(ctx context.Context, orphans []orphan) error {
@@ -336,9 +483,10 @@ func (e *Engine) stages() []stage {
 }
 
 func (e *Engine) stageIDs(opts ApplyOptions) []string {
+	only := expandOnly(opts.Only)
 	var ids []string
 	for _, s := range e.stages() {
-		if selected(opts.Only, s.id) {
+		if selected(only, s.id) {
 			ids = append(ids, s.id)
 		}
 	}
@@ -357,13 +505,13 @@ func selected(only []string, id string) bool {
 	return false
 }
 
-func resolveError(errs map[string]error) error {
+func resolveError(issues []resolveIssue) error {
 	var missing, other []string
-	for aspect, err := range errs {
-		if errors.Is(err, secrets.ErrMissing) {
-			missing = append(missing, "  "+err.Error())
+	for _, issue := range issues {
+		if errors.Is(issue.err, secrets.ErrMissing) {
+			missing = append(missing, "  "+issue.err.Error())
 		} else {
-			other = append(other, fmt.Sprintf("  %s: %v", aspect, err))
+			other = append(other, fmt.Sprintf("  %s: %v", issue.aspect, issue.err))
 		}
 	}
 	msg := ""
@@ -407,14 +555,14 @@ func (e *Engine) Plan(ctx context.Context) Plan {
 	if !plan.Valid {
 		return plan
 	}
-	for aspect, err := range e.resolve(ctx) {
-		switch {
+	for _, issue := range e.resolve(ctx) {
+		switch err := issue.err; {
 		case errors.Is(err, secrets.ErrMissing):
 			plan.Missing = append(plan.Missing, err.Error())
 		case errors.Is(err, secrets.ErrWouldGenerate):
 			plan.Generated = append(plan.Generated, err.Error())
 		default:
-			plan.Issues = append(plan.Issues, manifest.Issue{Path: "spec." + aspect, Message: err.Error()})
+			plan.Issues = append(plan.Issues, manifest.Issue{Path: "spec." + issue.aspect, Message: err.Error()})
 		}
 	}
 	for _, u := range e.units() {
@@ -481,8 +629,10 @@ func worst(checks []stack.Check) string {
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
 // Bootstrap creates the cluster repo, commits the manifest, and checks the
-// repo out in dir, using the stack's VCS provider.
-func (e *Engine) Bootstrap(ctx context.Context, manifestYAML []byte, dir string) error {
+// repo out in dir, using the stack's VCS provider. It first runs the checks
+// apply would (memory, every provider's secrets), so a run that cannot
+// succeed fails before the repo is touched.
+func (e *Engine) Bootstrap(ctx context.Context, manifestYAML []byte, dir string, opts ApplyOptions) error {
 	if err := e.Validate(); err != nil {
 		return err
 	}
@@ -490,15 +640,15 @@ func (e *Engine) Bootstrap(ctx context.Context, manifestYAML []byte, dir string)
 	if !ok {
 		return fmt.Errorf("spec.vcs is required to bootstrap a cluster repo")
 	}
-	impl, _ := providers.Lookup("vcs", c.Provider)
+	impl, _ := e.lookup("vcs", c.Provider)
 	boot, ok := impl.(providers.RepoBootstrapper)
 	if !ok {
 		return fmt.Errorf("vcs provider %s cannot bootstrap a cluster repo", c.Provider)
 	}
-	rt := e.RT.For("vcs")
-	if err := impl.Resolve(ctx, rt); err != nil {
-		return resolveError(map[string]error{"vcs": err})
+	if err := e.prepare(ctx, opts); err != nil {
+		return err
 	}
+	rt := e.RT.For("vcs")
 	console := e.RT.Console
 	console.Event("stage_started", map[string]string{"id": "repo", "title": "Cluster repo", "provider": c.Provider})
 	start := time.Now()

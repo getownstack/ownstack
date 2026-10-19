@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -35,5 +36,13 @@ func TestSend(t *testing.T) {
 	}
 	if err := Send(context.Background(), srv.URL, "wrong", nil); err == nil {
 		t.Error("rejected token reported as success")
+	}
+}
+
+func TestServiceUnitQuotesPaths(t *testing.T) {
+	unit := serviceUnit("/usr/local/bin/ownstackctl", `/root/my stack/50%$"x".yaml`, "/etc/ownstack/secrets.env")
+	want := `ExecStart=/usr/local/bin/ownstackctl status -f "/root/my stack/50%%$$\"x\".yaml" --secrets-file "/etc/ownstack/secrets.env" --no-prompt --health-url ${OWNSTACK_HEALTH_URL}`
+	if !strings.Contains(unit, want+"\n") {
+		t.Errorf("unit:\n%s\nwant line:\n%s", unit, want)
 	}
 }
