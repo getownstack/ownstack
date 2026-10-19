@@ -1,15 +1,10 @@
 def call(String applicationId) {
     def values = values()
+    def image_name_with_tag = "${values.imageRepositoryProject}/${applicationId}:${imageTag()}"
 
-    // Recreate the same tag used in dockerBuildAndPush to reference the just-built image
-    def sha = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-    def branch = env.BRANCH_NAME ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
-    branch = branch.replaceAll('[^a-zA-Z0-9_.-]', '-')
-    def tag = "${branch}-${sha}"
-    def image_name_with_tag = "${values.imageRepositoryProject}/${applicationId}:${tag}"
-
+    // The pipeline's agent has already checked out the app repo into the
+    // shared pod workspace; only the Helm library needs fetching here.
     container('helm') {
-        checkout scm
         dir('./tmp-infrastructure'){
             checkout([
                 $class: 'GitSCM',
@@ -31,9 +26,10 @@ def call(String applicationId) {
         if (env.OWNSTACK_DOMAIN) { extra += " --set domain=${env.OWNSTACK_DOMAIN}" }
         if (env.IMAGE_PULL_SECRET) { extra += " --set imagePullSecret=${env.IMAGE_PULL_SECRET}" }
         sh """
-            helm upgrade ${applicationId} ./infrastructure/${applicationId}/helm --install --namespace prod \
+            helm upgrade ${applicationId} ./infrastructure/${applicationId}/helm --install --namespace ${values.namespace} \
             --set image=\"${env.IMAGE_REGISTRY}/${image_name_with_tag}\" \
-            --set id=${applicationId}${extra}
+            --set id=${applicationId}${extra} \
+            --wait --timeout 5m
         """
     }
 }

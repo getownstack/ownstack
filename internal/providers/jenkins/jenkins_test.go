@@ -3,6 +3,8 @@ package jenkins
 import (
 	"context"
 	"encoding/xml"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -76,6 +78,31 @@ func TestOrgFolderXML(t *testing.T) {
 	}
 	if !strings.Contains(out, "<repoOwner>acme</repoOwner>") || !strings.Contains(out, "app-* &lt;&amp;&gt;") {
 		t.Errorf("unexpected XML:\n%s", out)
+	}
+	// Fork pull requests run outside code on agents with the host Docker
+	// socket and a cluster-admin service account; they must not be discovered.
+	if strings.Contains(out, "ForkPullRequestDiscoveryTrait") {
+		t.Error("org folder must not discover fork pull requests")
+	}
+}
+
+// The org folder builds only the deploy branch automatically, and the shared
+// library deploys only from it. Both default to the same branch.
+func TestOrgFolderTriggerMatchesLibraryDeployBranch(t *testing.T) {
+	triggered := regexp.MustCompile(`(?s)<jenkins\.branch\.NoTriggerOrganizationFolderProperty>\s*<branches>([^<]*)</branches>`).FindStringSubmatch(orgFolderTemplate)
+	if triggered == nil {
+		t.Fatal("org folder has no NoTriggerOrganizationFolderProperty branches")
+	}
+	lib, err := os.ReadFile("../../../jenkins_pipeline_library/vars/values.groovy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploy := regexp.MustCompile(`env\.OWNSTACK_DEPLOY_BRANCH \?: '([^']*)'`).FindSubmatch(lib)
+	if deploy == nil {
+		t.Fatal("values.groovy has no OWNSTACK_DEPLOY_BRANCH default")
+	}
+	if triggered[1] != string(deploy[1]) {
+		t.Errorf("org folder triggers %q but the library deploys %q", triggered[1], deploy[1])
 	}
 }
 

@@ -11,11 +11,30 @@ def call(Object applicationIds) {
         error "Unsupported type for applicationIds: ${applicationIds.getClass().name}. Use String or String[]/List<String>."
     }
 
+    // Fork pull requests would run outside code on agents that mount the host
+    // Docker socket with a cluster-admin service account; never build them.
+    if (env.CHANGE_FORK) {
+        echo "Fork pull requests are not built (${env.CHANGE_FORK})"
+        currentBuild.result = 'NOT_BUILT'
+        return
+    }
+
+    // Only the deploy branch pushes and deploys. Other branches and pull
+    // requests are build-only checks, so a manual build never replaces the
+    // release from unreviewed code.
+    def deployBranch = values().deployBranch
+    boolean deployable = !env.CHANGE_ID && env.BRANCH_NAME == deployBranch
+    def mode = deployable ? '' : ' (build only)'
+
     pipeline {
         agent {
             kubernetes {
                 yaml agentPodTemplate()
             }
+        }
+        options {
+            // Concurrent helm upgrades of one release fail with "another operation is in progress".
+            disableConcurrentBuilds()
         }
         stages {
             stage('Build') {
@@ -24,7 +43,7 @@ def call(Object applicationIds) {
                         notify(
                                 'warning',
                                 """
-                                    :rocket: Pipeline Started!
+                                    :rocket: Pipeline Started${mode}!
                                     Job: ${env.JOB_NAME}
                                     Build: ${env.BUILD_NUMBER}
                                     Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
@@ -42,6 +61,7 @@ def call(Object applicationIds) {
                 }
             }
             stage('Push') {
+                when { expression { deployable } }
                 steps {
                     script {
                         def branches = ids.collectEntries { id ->
@@ -52,6 +72,7 @@ def call(Object applicationIds) {
                 }
             }
             stage('Before Deploy') {
+                when { expression { deployable } }
                 steps {
                     script {
                         ids.each { id ->
@@ -61,6 +82,7 @@ def call(Object applicationIds) {
                 }
             }
             stage('Deploy') {
+                when { expression { deployable } }
                 steps {
                     script {
                         ids.each { id ->
@@ -80,7 +102,7 @@ def call(Object applicationIds) {
                 notify(
                         'good',
                         """
-                                :white_check_mark: Pipeline Succeeded!
+                                :white_check_mark: Pipeline Succeeded${mode}!
                                 Job: ${env.JOB_NAME}
                                 Build: ${env.BUILD_NUMBER}
                                 Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
@@ -94,7 +116,7 @@ def call(Object applicationIds) {
                 notify(
                         'danger',
                         """
-                                :x: Pipeline Failed!
+                                :x: Pipeline Failed${mode}!
                                 Job: ${env.JOB_NAME}
                                 Build: ${env.BUILD_NUMBER}
                                 Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
