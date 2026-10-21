@@ -34,7 +34,7 @@ ownstackctl up -f ownstack.yaml       # build it
 | vcs | `github` | Cluster repo and app repos; optionally a demo app repo. |
 | images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified (push access too, where the registry's token lists it), nothing is installed. Zot keeps every tag unless `keepTags` is set: then it keeps that many most recently pushed tags per repository, plus tags pulled in the last 30 days, and deletes the rest. Set it well above the number of tags you might roll back to. |
 | alerts | `slack` | Pipeline notifications (Jenkins). |
-| cicd | `gh-actions`, `jenkins` | See "Deploying apps". `environment` (default `prod`) is the production environment, where the default branch deploys (`main`, or Jenkins' `deployBranch`); `branches` sends other branches to other environments, such as `develop=dev release/*=qa`. See "Environments and promotion". |
+| cicd | `gh-actions`, `jenkins` | See "Deploying apps". `environment` (default `prod`) is the production environment, where the default branch deploys (`main`, or Jenkins' `deployBranch`); `branches` sends other branches to other environments, such as `develop=dev release/*=qa`. See "Environments and promotion". Jenkins installs locked plugins: every plugin, dependencies included, at the version each ownstackctl release resolved and tested for the Jenkins release of its default `chartVersion` (`plan` shows `Jenkins <version>, <N> locked plugins`). `extraPlugins` adds space-separated `name:version` pairs; a pair naming a locked plugin replaces its version. Plugins installed through the Jenkins UI are removed when Jenkins restarts. Another `chartVersion` still applies, with a warning that the plugins are locked for a different Jenkins. |
 
 `ownstackctl catalog` prints every aspect, contract, provider, setting, and preset as JSON.
 
@@ -198,3 +198,5 @@ Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune
 ## Releases
 
 Tag `ownstackctl-vX.Y.Z` to test and build Linux amd64/arm64 binaries with checksums; `-rc` tags publish as prereleases. `install.sh` pins the version through `OWNSTACKCTL_VERSION`.
+
+A release fixes the versions it installs by default: Helm chart versions, the Jenkins controller image and every Jenkins plugin, and the Helm version for servers without one. Applying a stack with the same release installs the same versions; applying it with a newer release upgrades them. k3s is the exception: new servers get the `k3sChannel` release unless `k3sVersion` pins one.

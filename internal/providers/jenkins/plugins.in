@@ -1,0 +1,26 @@
+# Top-level Jenkins plugins. lockgen resolves them, with every non-optional
+# dependency, into plugins.lock for the Jenkins core of the locked chart:
+#   go run ./internal/providers/jenkins/lockgen
+# One plugin name per line, no versions.
+
+# Configuration as code (JCasC), from the Helm values.
+configuration-as-code
+# Pipelines and the shared library.
+workflow-aggregator
+pipeline-utility-steps
+timestamper
+ws-cleanup
+# Pod agents.
+kubernetes
+docker-workflow
+# Credentials from Kubernetes secrets (github-pat, harbor-robot, slack-token).
+credentials
+kubernetes-credentials-provider
+# The organization folder and checkouts.
+git
+github
+github-branch-source
+# Pipeline notifications through the alerts aspect.
+slack
+# Pipeline UI.
+blueocean

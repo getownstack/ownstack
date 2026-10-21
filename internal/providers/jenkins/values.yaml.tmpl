@@ -1,4 +1,7 @@
 controller:
+  image:
+    # The Jenkins core plugins.lock is verified for, whatever the chart's default.
+    tag: {{ printf "%q" .ImageTag }}
   ingress:
     enabled: true
     hostName: {{ .Host }}
@@ -11,22 +14,17 @@ controller:
     password: {{ printf "%q" .Password }}
     createSecret: true
   jenkinsUrl: https://{{ .Host }}
+  # Every plugin at its locked version (plugins.lock plus extraPlugins), and
+  # nothing newer: dependencies are all listed.
   installPlugins:
-    - configuration-as-code
-    - workflow-aggregator
-    - kubernetes
-    - git
-    - docker-workflow
-    - credentials
-    - github
-    - kubernetes-credentials-provider
-    - blueocean
-    - ws-cleanup
-    - timestamper
-    - github-branch-source
-    - pipeline-utility-steps
-    - slack
-  overridePlugins: true
+{{- range .Plugins }}
+    - {{ printf "%q" . }}
+{{- end }}
+  installLatestPlugins: false
+  installLatestSpecifiedPlugins: false
+  # Reinstall exactly this set on every start, so upgrades and removals take
+  # effect and plugins installed outside it do not linger.
+  overwritePlugins: true
   JCasC:
     enabled: true
     configScripts:

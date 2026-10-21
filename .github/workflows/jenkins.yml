@@ -1,0 +1,251 @@
+name: Jenkins plugin lock
+
+# The jenkins provider installs exactly the plugins in
+# internal/providers/jenkins/plugins.lock, locked for the Jenkins core of its
+# pinned chart. verify proves a changed lock installs, boots, and runs in
+# Kubernetes; bump proposes a new lock every week.
+on:
+  pull_request:
+    paths:
+      - "internal/providers/jenkins/**"
+      - "scripts/verify-jenkins.sh"
+      - ".github/workflows/jenkins.yml"
+  push:
+    branches: [main]
+    paths:
+      - "internal/providers/jenkins/**"
+      - "scripts/verify-jenkins.sh"
+      - ".github/workflows/jenkins.yml"
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      chart:
+        description: "jenkins/jenkins chart version to lock for (empty: the newest 5.x/6.x chart)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jenkins-lock-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Cluster repos are generated from this template and inherit its workflows.
+# Every job checks the repository so they never run (or bill) there.
+jobs:
+  verify:
+    name: Verify the plugin lock
+    if: >-
+      github.repository == 'getownstack/ownstack-cluster-template' &&
+      (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+      - name: Test the provider and the lock
+        run: go test ./internal/providers/jenkins/...
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          kubectl_version: v1.37.1
+          cluster_name: jenkins-verify
+      # Installs the lock with jenkins-plugin-cli, boots Jenkins with it and
+      # a JCasC configuration like Ownstack's, then installs the chart at the
+      # lock's version with testdata/values.golden.yaml into the kind cluster
+      # (helm install --wait --timeout 15m).
+      - name: Install, boot, and deploy the locked plugins
+        run: scripts/verify-jenkins.sh --boot --kind
+
+  bump:
+    name: Propose a new plugin lock
+    if: >-
+      github.repository == 'getownstack/ownstack-cluster-template' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: jenkins-lock-bump
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      # Scheduled runs carry no repository in their event payload, and run
+      # on the default branch; a manual run may start from another branch.
+      BASE: ${{ github.event.repository.default_branch || github.ref_name }}
+      LOCK: internal/providers/jenkins/plugins.lock
+      BRANCH: jenkins-lock-bump
+      WARNINGS_TITLE: "Jenkins: security warnings block the plugin lock update"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+
+      # lockgen writes plugins.lock, the catalog's JenkinsChartVersion, and
+      # the golden values. Exit status 3: only security warnings stopped it.
+      - name: Lock the plugins for the chart
+        id: lockgen
+        env:
+          CHART: ${{ inputs.chart }}
+        run: |
+          if [ -n "$CHART" ]; then
+            [[ "$CHART" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::chart must be a version such as 5.9.72"; exit 1; }
+            args=(-chart "$CHART")
+          else
+            args=(-latest-chart)
+          fi
+          # Build, then run: `go run` reports every failure as status 1, which
+          # would hide status 3.
+          go build -o "$RUNNER_TEMP/lockgen" ./internal/providers/jenkins/lockgen
+          status=0
+          "$RUNNER_TEMP/lockgen" "${args[@]}" \
+            >"$RUNNER_TEMP/lockgen.out" 2>"$RUNNER_TEMP/lockgen.err" || status=$?
+          cat "$RUNNER_TEMP/lockgen.err" "$RUNNER_TEMP/lockgen.out"
+          case "$status" in
+            0)
+              if git diff --quiet; then changed=false; else changed=true; fi
+              echo "result=locked" >>"$GITHUB_OUTPUT"
+              echo "changed=$changed" >>"$GITHUB_OUTPUT"
+              git status --short
+              ;;
+            3)
+              git diff --quiet || { echo "::error::lockgen changed files although it refused the lock"; exit 1; }
+              echo "result=warnings" >>"$GITHUB_OUTPUT"
+              ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Open or update the security warnings issue
+        if: steps.lockgen.outputs.result == 'warnings'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "The Jenkins plugin lock update stopped because published security warnings match plugin versions it would lock. \`plugins.lock\` is unchanged."
+            echo
+            echo '```text'
+            grep -E '^(Resolving|security warning:)' "$RUNNER_TEMP/lockgen.err" | head -c 60000 || true
+            echo '```'
+            echo
+            echo "Options: wait for fixed releases (the next scheduled run retries), drop the plugin from \`plugins.in\`, or lock anyway with \`go run ./internal/providers/jenkins/lockgen -latest-chart -allow-warnings\` after reviewing the advisories."
+            echo
+            echo "Run: $RUN_URL"
+          } >"$RUNNER_TEMP/issue.md"
+          number=$(gh issue list --state open --search "\"$WARNINGS_TITLE\" in:title" --json number,title \
+            --jq "map(select(.title == env.WARNINGS_TITLE)) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file "$RUNNER_TEMP/issue.md"
+            echo "Updated issue #$number"
+          else
+            gh issue create --title "$WARNINGS_TITLE" --body-file "$RUNNER_TEMP/issue.md"
+          fi
+
+      - name: Close the security warnings issue
+        if: steps.lockgen.outputs.result == 'locked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue list --state open --search "\"$WARNINGS_TITLE\" in:title" --json number,title \
+            --jq "map(select(.title == env.WARNINGS_TITLE)) | .[].number" |
+            while read -r number; do
+              [ -n "$number" ] || continue
+              gh issue close "$number" --comment "The plugins now lock without security warnings: $RUN_URL"
+            done
+
+      - name: Vet and test
+        if: steps.lockgen.outputs.changed == 'true'
+        run: go vet ./... && go test ./...
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        if: steps.lockgen.outputs.changed == 'true'
+        with:
+          version: v0.33.0
+          kubectl_version: v1.37.1
+          cluster_name: jenkins-verify
+      # Pull requests opened with GITHUB_TOKEN do not start pull_request
+      # workflows, so this job runs everything the verify job would.
+      - name: Install, boot, and deploy the locked plugins
+        if: steps.lockgen.outputs.changed == 'true'
+        run: scripts/verify-jenkins.sh --boot --kind
+
+      - name: Open or update the pull request
+        if: steps.lockgen.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          chart=$(sed -n 's/^# chart: //p' "$LOCK")
+          core=$(sed -n 's/^# jenkins: //p' "$LOCK")
+          title="Jenkins: lock plugins for chart $chart / Jenkins $core"
+          {
+            echo "Generated by \`go run ./internal/providers/jenkins/lockgen\` in [this run]($RUN_URL) of the Jenkins plugin lock workflow."
+            echo
+            sed -n '1p' "$RUNNER_TEMP/lockgen.out"
+            echo
+            grep '^- ' "$RUNNER_TEMP/lockgen.out" || true
+            echo
+            echo "The run verified it before opening this pull request: \`go vet ./...\`, \`go test ./...\`, and \`scripts/verify-jenkins.sh --boot --kind\` (jenkins-plugin-cli installs exactly the lock with no security warnings, Jenkins boots with it and a JCasC configuration like Ownstack's, and the chart installs in kind with the golden values)."
+            echo
+            echo "Pull requests opened by GitHub Actions do not start CI; close and reopen this one to run it."
+            echo
+            echo "After merging:"
+            echo
+            if git diff --quiet -- internal/catalog/data.go; then
+              echo "- The chart is unchanged; the SaaS catalog needs no sync."
+            else
+              echo "- Run \`scripts/sync-catalog.sh\` in the SaaS repo (getownstack/ownstack) so the designer's Jenkins chart version default is $chart."
+            fi
+            echo "- Stacks get these plugins when an ownstackctl release that contains this lock applies them."
+          } >"$RUNNER_TEMP/pr.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          git config --local "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
+
+          files=("$LOCK" internal/catalog/data.go internal/providers/jenkins/testdata)
+          git switch -C "$BRANCH"
+          git add -A -- "${files[@]}"
+          git commit -q -m "$title"
+          # When the branch already proposes this exact lock (even on an older
+          # base), leave its pull request (and reviews) alone, and do not
+          # propose it again after a person closed it.
+          if git fetch -q origin "$BRANCH" 2>/dev/null && git diff --quiet FETCH_HEAD HEAD -- "${files[@]}"; then
+            head=$(git rev-parse FETCH_HEAD)
+            number=$(gh pr list --head "$BRANCH" --base "$BASE" --state all --json number,headRefOid \
+              --jq "map(select(.headRefOid == \"$head\")) | .[0].number // empty")
+            if [ -n "$number" ]; then
+              echo "Pull request #$number already proposes this lock"
+              exit 0
+            fi
+          else
+            git push -q --force origin "HEAD:refs/heads/$BRANCH"
+          fi
+          number=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body-file "$RUNNER_TEMP/pr.md"
+            echo "Updated pull request #$number"
+          else
+            gh pr create --head "$BRANCH" --base "$BASE" --title "$title" --body-file "$RUNNER_TEMP/pr.md"
+          fi

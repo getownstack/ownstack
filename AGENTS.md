@@ -63,6 +63,8 @@ Internet ── HTTPS (*.admin.<domain>, app hosts) ──> Traefik on k3s
 - `internal/stack/`: shared runtime, the redacting console and structured events, the exec/kubectl/helm wrappers, HTTPS checks, and contract output types.
 - `internal/engine/`: validate, resolve, plan, apply, status, and repo bootstrap. `lifecycle_test.go` drives whole runs with fake providers (`NewWith`) and kubectl/helm stubs on `PATH`.
 - `internal/providers/<id>/`: implementations: `ownvps` (compute), `cloudflare` and `manualdns` (dns), `traefik` (ingress), `github` (vcs), `zot`, `harbor`, and `registry` (images), `slack` (alerts), `ghactions` and `jenkins` (cicd). Helm values are embedded `values.yaml.tmpl` files. `ghactions/ownstack.yml` is the app-repo workflow (`ownstackctl workflow`).
+- `internal/providers/jenkins/`: besides the provider, `plugins.in` (the top-level plugins), `plugins.lock` (generated, embedded: every plugin including dependencies at the exact version for the Jenkins core of the pinned chart), `lockgen/` (writes the lock), `pluginlock/` (resolution and Jenkins version comparison, tested on fixture update-center JSON), and `testdata/values.golden.yaml` (the rendered values of a representative stack with fake secrets; CI installs the chart with them). See "Jenkins Plugins".
+- `scripts/verify-jenkins.sh`: installs the plugin lock with `jenkins-plugin-cli` in the lock's image, optionally boots it (`--boot`) and installs the chart into a kind cluster (`--kind`).
 - `internal/githubapi/`: GitHub REST client shared by the VCS and CI providers, including sealed-box Actions secrets.
 - `internal/report/`: optional progress reporting to an Ownstack run (`--report`). Answers a retry cannot change (401, 404, 409, 413, 422) are not retried; after 401, 404, or 409 it stops posting, and when a final batch is refused (413, 422) it sends the run result alone. Lines it could not deliver are counted in a `[N lines were not reported]` marker.
 - `internal/health/`: live health reporting: `status --health-url` and the `ownstack-health.timer` systemd unit installed after a reported run (it runs `status` with that run's manifest and `--secrets-file`).
@@ -74,6 +76,7 @@ Internet ── HTTPS (*.admin.<domain>, app hosts) ──> Traefik on k3s
 - `docs/ownstackctl.md`: customer-facing CLI and manifest docs.
 - `.github/workflows/release-ownstackctl.yml`: tests, then builds Linux amd64/arm64 binaries and checksums for `ownstackctl-v*` tags.
 - `.github/workflows/ci.yml`: vet, tests, and shell checks on pushes to `main` and pull requests. Its jobs run only in this repository, not in cluster repos generated from it.
+- `.github/workflows/jenkins.yml`: `verify` (pull requests and pushes to `main` that touch the jenkins provider or `verify-jenkins.sh`: provider tests, `verify-jenkins.sh --boot --kind`) and `bump` (Mondays 03:17 UTC and by hand: a new lock as a pull request from `jenkins-lock-bump`, or an issue when security warnings block it). Guarded to this repository like `ci.yml`; actions are pinned to commits.
 
 ## Adding a Provider
 
@@ -84,6 +87,25 @@ Internet ── HTTPS (*.admin.<domain>, app hosts) ──> Traefik on k3s
 5. In the SaaS repo, run `scripts/sync-catalog.sh`.
 
 A contract is only proven once it has two implementations. Prefer lightweight self-hosted second providers (Zot, Woodpecker, Gitea) next.
+
+## Jenkins Plugins
+
+Jenkins plugins publish new releases daily, and new releases require newer Jenkins cores. Unpinned plugin lists therefore break installs of a pinned chart without any change here. The provider never asks for "latest": it installs `plugins.lock`.
+
+- `plugins.lock` is generated. Its header names the chart, its Jenkins core (the chart's `appVersion`), and the controller image `jenkins/jenkins:<core>-jdk21`; then one `name:version` line per plugin, sorted, every non-optional dependency included. Versions come from the Jenkins update center tailored to that core, so each one runs on it.
+- `go run ./internal/providers/jenkins/lockgen` (from the repo root) re-resolves `plugins.in` for the locked chart; `-chart <version>` or `-latest-chart` (newest released 5.x/6.x) moves to another chart. It refuses a set where a plugin needs a newer core or a dependency newer than the update center offers, and one that matches a published security warning (exit status 3; `-allow-warnings` locks anyway and prints them). It writes `plugins.lock`, `JenkinsChartVersion` in `internal/catalog/data.go` (the `chartVersion` default; a test keeps them equal), and `testdata/values.golden.yaml`. Output is deterministic.
+- To add a plugin for every stack, add it to `plugins.in`, run lockgen, then `scripts/verify-jenkins.sh --boot`. To upgrade, run lockgen (same chart: newest plugin releases for that core) or lockgen `-latest-chart`. Commit the lock, `data.go`, and the golden values together. When the chart changed, run `scripts/sync-catalog.sh` in the SaaS repo.
+- Customers add plugins with the jenkins `extraPlugins` setting: space-separated `name:version` pairs added to the locked set; a pair whose name is locked replaces that version. Versions are required, so installs stay reproducible.
+- The `bump` job of `jenkins.yml` runs `lockgen -latest-chart` every Monday. When the lock changed it runs `go vet`, `go test`, and `verify-jenkins.sh --boot --kind`, then opens or updates a pull request from `jenkins-lock-bump` (titled `Jenkins: lock plugins for chart <ver> / Jenkins <core>`, listing the plugin changes). It leaves an open or closed pull request that already proposes the same lock alone. When only security warnings stop lockgen, it opens or updates the issue "Jenkins: security warnings block the plugin lock update" instead, and closes it once a later run locks cleanly. Run it by hand (Actions, Jenkins plugin lock, Run workflow) with an optional chart version. Pull requests opened with `GITHUB_TOKEN` start no workflows: close and reopen the pull request to run CI on it. The repository setting "Allow GitHub Actions to create and approve pull requests" must be on.
+- `scripts/verify-jenkins.sh` reads the lock header and runs `jenkins-plugin-cli --latest false` with the lock in that image, the way the chart's init container does. It fails when the CLI fails, prints `requires a greater version` or `SECURITY-`, or resolves any set other than the lock (a missing dependency or a pin below a minimum). `--boot` starts Jenkins with those plugins and a JCasC configuration shaped like the provider's (global env, a Kubernetes cloud, the global library from git, Slack, the chart's local security realm), waits up to 5 minutes for `/login` to answer 200, checks the configuration was applied, and fails on `Failed Loading plugin` or `SEVERE` log lines; outside Kubernetes the credentials provider's "Failed to initialise k8s secret provider" is the one expected `SEVERE` line. `--kind` refuses any kubectl context not named `kind-*`; it creates what the provider creates before its release (namespace, `jenkins-cluster-admin`, the three credential secrets with fake values), runs `helm install --wait --timeout 15m` of the lock's chart with `testdata/values.golden.yaml` (ingress off, a throwaway admin password from a values file), and checks the controller image, the init container's plugin install, the log, and JCasC.
+
+## Releases
+
+A release is a tested bill of materials: an `ownstackctl-vX.Y.Z` tag fixes what a stack installs by default (chart versions, the Jenkins core and every plugin, `helmVersion`, Jenkins agent images in new cluster repos, the GitHub Actions Helm library at that tag). Applying a stack with a newer release is how it upgrades. k3s is not part of it unless `k3sVersion` pins it (new installs follow `k3sChannel`). Before tagging:
+
+1. `main` is green in `ci.yml` and `jenkins.yml` (`verify` ran on the current `plugins.lock`).
+2. The open `jenkins-lock-bump` pull request and any security warnings issue are merged, closed, or deliberately deferred. Run the `bump` job by hand first when its last run is more than a few days old: the lock should carry the newest plugin releases for its core.
+3. The SaaS catalog was synced (`scripts/sync-catalog.sh`) after any default changed.
 
 ## Secrets
 
@@ -109,6 +131,7 @@ A contract is only proven once it has two implementations. Prefer lightweight se
 - GitHub Actions repos get their secrets and variables (including `OWNSTACK_BRANCHES`) re-set on every apply; the demo workflow is committed only when it changed. Apply records the configured repos in the ConfigMap `ownstack-system/ownstack-ci-targets`; status checks only those (the workflow file and the latest run, two requests per repo) and scans every repo only when there is no record yet. A repo that could not be checked (403, rate limit) fails the apply after the others are configured and stays recorded; a repo that drops out of discovery is reported because it keeps its credentials.
 - `--prune` of GitHub Actions deletes the recorded repos' `OWNSTACK_*` secrets and variables when the GitHub token is available, before the deploy identity; GitHub failures are warnings and never stop the cluster cleanup.
 - Namespaces and secrets use `kubectl apply`.
+- Jenkins runs the controller image and plugins of the lock embedded in the ownstackctl that applies it: `controller.image.tag` is the lock's `<core>-jdk21`, `installPlugins` lists every locked plugin (plus `extraPlugins`) at its exact version, `installLatestPlugins` and `installLatestSpecifiedPlugins` are false, and `overwritePlugins` is true. Nothing resolves "latest" at install time, so a stack installs the same plugins whenever it is applied. Re-applying with a newer ownstackctl upgrades Jenkins and replaces the plugins with that release's lock; the init container reinstalls exactly the set on every pod start, so plugins installed through the UI disappear on the next restart (use `extraPlugins`). An explicit `chartVersion` other than the lock's chart still applies, with a plan and apply warning that the plugins are locked for another Jenkins.
 - The Jenkins organization folder is created once. On later applies, ownstackctl compares the fields it manages (owner, API URL, credential, repository filter, Jenkinsfile path, auto-build branches) and rewrites `config.xml` only when one differs, replacing admin edits to the folder; plan shows the update. Each apply triggers a scan.
 - GitHub repos are created only if missing; `ownstack.yaml` is committed only when it changed.
 
@@ -155,9 +178,20 @@ Deliberate single-tenant defaults (document any change to them):
 go vet ./... && go test ./...
 go run ./cmd/ownstackctl validate -f examples/starter.yaml
 go run ./cmd/ownstackctl plan -f examples/starter.yaml --secrets-file /tmp/none.env
-for f in install.sh setup_system.sh; do bash -n "$f"; done
-shellcheck install.sh setup_system.sh
+for f in install.sh setup_system.sh scripts/verify-jenkins.sh; do bash -n "$f"; done
+shellcheck install.sh setup_system.sh scripts/verify-jenkins.sh
 ```
+
+Jenkins plugin lock (needs Docker; reads Docker Hub, updates.jenkins.io, and charts.jenkins.io):
+
+```bash
+go test ./internal/providers/jenkins/...
+scripts/verify-jenkins.sh --boot                       # install and boot the locked plugins (2-3 minutes)
+kind create cluster --name jenkins-verify && scripts/verify-jenkins.sh --kind   # the chart in Kubernetes (about 5 minutes)
+go test ./internal/providers/jenkins -run TestValuesGolden -update               # after changing values.yaml.tmpl
+```
+
+`--kind` only runs against a `kind-*` context; delete the cluster afterwards with `kind delete cluster --name jenkins-verify`.
 
 `internal/helmlib` renders `common_helm_library` with `helm template`, using the flags both pipelines pass. Without helm on `PATH` it skips locally (run `go test -v ./internal/helmlib` to see) and fails in CI. CI (`ci.yml`) and the release workflow install a pinned helm and run it.
 

@@ -36,8 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax
-        run: for f in install.sh setup_system.sh; do bash -n "$f"; done
+        run: for f in install.sh setup_system.sh scripts/verify-jenkins.sh; do bash -n "$f"; done
       - name: ShellCheck
         run: |
           command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck install.sh setup_system.sh
+          shellcheck install.sh setup_system.sh scripts/verify-jenkins.sh

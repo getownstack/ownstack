@@ -3,6 +3,14 @@ package catalog
 // Version of the catalog format exported to the stack designer.
 const Version = "1"
 
+// JenkinsChartVersion is the jenkins/jenkins chart the Jenkins provider's
+// plugin lock (internal/providers/jenkins/plugins.lock) is resolved and
+// verified for. lockgen rewrites this line; a test keeps the two equal.
+const JenkinsChartVersion = "5.9.72"
+
+// Jenkins plugin pins: space-separated <name>:<version> pairs.
+const jenkinsPluginsPattern = `^[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+( +[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+)*$`
+
 // Value formats shared by several params, in the regular expression syntax Go
 // and Python share (see Param.Pattern).
 const (
@@ -338,7 +346,11 @@ func Default() *Catalog {
 						Help:    "Branch the organization folder builds automatically and the pipeline pushes and deploys into the production environment, exported as OWNSTACK_DEPLOY_BRANCH. Other branches build only unless Branch environments maps them.",
 						Pattern: `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, PatternHelp: "must be a branch name of letters, digits, '.', '_', '-' and '/'"},
 					branchesParam("The deploy branch", "Branches that match no pair build only.", "Cluster repos with an older pipeline library deploy only the deploy branch."),
-					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: "5.8.79", Advanced: true},
+					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: JenkinsChartVersion, Advanced: true,
+						Help: "jenkins/jenkins Helm chart. Each ownstackctl release locks Jenkins and every plugin for its default chart; with another chart the locked plugins may not start."},
+					{Key: "extraPlugins", Label: "Extra plugins", Kind: KindString, Advanced: true, Placeholder: "build-timeout:1.41 ansicolor:542.v03d235fee02d",
+						Help:    "Plugins to add to the locked set, as space-separated name:version pairs; versions are required so installs stay reproducible. A locked plugin listed here gets this version instead. Dependencies missing from the locked set are installed at the oldest version the plugin accepts, so list them too.",
+						Pattern: jenkinsPluginsPattern, PatternHelp: "must be space-separated name:version pairs, such as build-timeout:1.41"},
 				},
 			},
 			{ID: "woodpecker", Aspect: "cicd", Name: "Woodpecker CI", Mono: "WP", Hosting: SelfHosted,

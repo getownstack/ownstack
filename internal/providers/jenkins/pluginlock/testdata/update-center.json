@@ -1,0 +1,71 @@
+{
+  "connectionCheckUrl": "https://www.google.com/",
+  "core": {"name": "core", "version": "2.580.1"},
+  "id": "default",
+  "updateCenterVersion": "1",
+  "deprecations": {
+    "retired": {"url": "https://www.jenkins.io/doc/developer/plugin-governance/deprecating-or-removing-plugin/"}
+  },
+  "plugins": {
+    "app": {
+      "name": "app", "version": "4560.vc25b_83890c34", "requiredCore": "2.516.3",
+      "dependencies": [
+        {"name": "lib", "optional": false, "version": "1.9"},
+        {"name": "api", "optional": false, "version": "2.263"},
+        {"name": "extra", "optional": true, "version": "1.0"}
+      ]
+    },
+    "lib": {
+      "name": "lib", "version": "1.10", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "api", "optional": false, "version": "2.263.v941d21defef7"}]
+    },
+    "api": {"name": "api", "version": "2.263.v941d21defef7", "requiredCore": "2.479.1", "dependencies": []},
+    "extra": {"name": "extra", "version": "1.0", "requiredCore": "2.479.1", "dependencies": []},
+    "needs-newer-extra": {
+      "name": "needs-newer-extra", "version": "1.0", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "extra", "optional": true, "version": "2.0"}]
+    },
+    "needs-newer-lib": {
+      "name": "needs-newer-lib", "version": "1.0", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "lib", "optional": false, "version": "1.11"}]
+    },
+    "newer-core": {"name": "newer-core", "version": "3.0", "requiredCore": "2.581", "dependencies": []},
+    "dangling": {
+      "name": "dangling", "version": "1.0", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "ghost", "optional": false, "version": "1.0"}]
+    },
+    "vulnerable": {"name": "vulnerable", "version": "1.36", "requiredCore": "2.479.1", "dependencies": []},
+    "java-pattern": {"name": "java-pattern", "version": "1.2", "requiredCore": "2.479.1", "dependencies": []},
+    "retired": {"name": "retired", "version": "2.0", "requiredCore": "2.479.1", "dependencies": []},
+    "cycle-a": {
+      "name": "cycle-a", "version": "1.0", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "cycle-b", "optional": false, "version": "1.0"}]
+    },
+    "cycle-b": {
+      "name": "cycle-b", "version": "1.0", "requiredCore": "2.479.1",
+      "dependencies": [{"name": "cycle-a", "optional": false, "version": "1.0"}]
+    }
+  },
+  "warnings": [
+    {
+      "id": "SECURITY-1", "message": "Stored XSS vulnerability", "name": "vulnerable", "type": "plugin",
+      "url": "https://www.jenkins.io/security/advisory/2026-01-01/#SECURITY-1",
+      "versions": [{"lastVersion": "425", "pattern": "([01]|42[45])(|[.-].+)"}]
+    },
+    {
+      "id": "SECURITY-2", "message": "Fixed long ago", "name": "app", "type": "plugin",
+      "url": "https://www.jenkins.io/security/advisory/2020-01-01/#SECURITY-2",
+      "versions": [{"lastVersion": "4000.v1", "pattern": "([0-9]{1,3}|[0-3][0-9]{3})(|[.-].+)"}]
+    },
+    {
+      "id": "SECURITY-3", "message": "Pattern Go cannot read", "name": "java-pattern", "type": "plugin",
+      "url": "https://www.jenkins.io/security/advisory/2026-02-01/#SECURITY-3",
+      "versions": [{"firstVersion": "1.1", "lastVersion": "1.5", "pattern": "1[.][0-9]++"}]
+    },
+    {
+      "id": "core-2_516_2", "message": "Multiple security vulnerabilities in LTS 2.516.1 and earlier", "name": "core", "type": "core",
+      "url": "https://www.jenkins.io/security/advisory/2026-03-01/",
+      "versions": [{"lastVersion": "2.516.1", "pattern": "2[.]516[.]1(|[-].*)"}]
+    }
+  ]
+}

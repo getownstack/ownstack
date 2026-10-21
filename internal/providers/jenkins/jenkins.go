@@ -18,6 +18,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins/pluginlock"
 	"github.com/getownstack/ownstack-cluster-template/internal/stack"
 )
 
@@ -44,6 +45,23 @@ var valuesTemplate string
 //go:embed org-folder.xml.tmpl
 var orgFolderTemplate string
 
+// plugins.lock is every plugin Jenkins installs, at exact versions resolved
+// and verified for one chart and Jenkins core. Regenerate it with
+// `go run ./internal/providers/jenkins/lockgen`.
+//
+//go:embed plugins.lock
+var lockFile []byte
+
+var pluginLock = mustParseLock(lockFile)
+
+func mustParseLock(data []byte) *pluginlock.Lock {
+	l, err := pluginlock.ParseLock(data)
+	if err != nil {
+		panic(err)
+	}
+	return l
+}
+
 var (
 	valuesTmpl    = template.Must(template.New("jenkins").Parse(valuesTemplate))
 	orgFolderTmpl = template.Must(template.New("org-folder").Funcs(template.FuncMap{"xml": xmlEscape}).Parse(orgFolderTemplate))
@@ -53,8 +71,64 @@ type Provider struct{}
 
 func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	rt.Out.CICD = &stack.CICDOutput{URL: "https://" + rt.Setting("host"), Login: "user admin, password JENKINS_ADMIN_PASSWORD"}
+	if _, err := extraPlugins(rt); err != nil {
+		return err
+	}
 	_, err := rt.Secret("adminPassword")
 	return err
+}
+
+// extraPlugins parses the extraPlugins setting: name:version pairs added to,
+// or replacing versions in, the locked set.
+func extraPlugins(rt *stack.Runtime) ([]pluginlock.Entry, error) {
+	extra, err := pluginlock.ParseExtra(rt.Setting("extraPlugins"))
+	if err != nil {
+		return nil, fmt.Errorf("extraPlugins: %w", err)
+	}
+	return extra, nil
+}
+
+// installPlugins is controller.installPlugins: the lock plus extraPlugins,
+// as name:version lines. Resolve rejects a malformed extraPlugins first.
+func installPlugins(rt *stack.Runtime) []string {
+	extra, _ := extraPlugins(rt)
+	entries := pluginLock.With(extra)
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.String()
+	}
+	return out
+}
+
+// chartMismatch describes the risk of a chartVersion other than the one the
+// plugins are locked for, or is empty.
+func chartMismatch(rt *stack.Runtime) string {
+	if chart := rt.Setting("chartVersion"); chart != "" && chart != pluginLock.Chart {
+		return fmt.Sprintf("plugins are locked for chart %s / Jenkins %s; a different chart may not start", pluginLock.Chart, pluginLock.Jenkins)
+	}
+	return ""
+}
+
+// pluginSummary describes the Jenkins version and plugin set, for plan.
+func pluginSummary(rt *stack.Runtime) string {
+	summary := fmt.Sprintf("Jenkins %s, %d locked plugins", pluginLock.Jenkins, len(pluginLock.Plugins))
+	if extra, err := extraPlugins(rt); err == nil && len(extra) > 0 {
+		var overrides []string
+		for _, e := range extra {
+			if v, ok := pluginLock.Version(e.Name); ok && v != e.Version {
+				overrides = append(overrides, fmt.Sprintf("%s %s → %s", e.Name, v, e.Version))
+			}
+		}
+		summary += fmt.Sprintf(" (+%d extra", len(extra))
+		if len(overrides) > 0 {
+			summary += "; " + strings.Join(overrides, ", ")
+		}
+		summary += ")"
+	}
+	if warning := chartMismatch(rt); warning != "" {
+		summary += "; warning: " + warning
+	}
+	return summary
 }
 
 func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
@@ -65,6 +139,7 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	steps = append(steps,
 		stack.Step{Action: "ensure", Target: "credentials", Detail: credentialSummary(rt)},
 		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
+		stack.Step{Action: "ensure", Target: "plugins", Detail: pluginSummary(rt)},
 		folderStep(ctx, rt),
 	)
 	return steps
@@ -109,6 +184,9 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err != nil {
 		return err
 	}
+	if _, err := extraPlugins(rt); err != nil {
+		return err
+	}
 
 	if !rt.Exec.Has("docker") {
 		rt.Logf("Installing Docker (agent pods build through the host Docker socket)")
@@ -136,7 +214,10 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err != nil {
 		return err
 	}
-	rt.Logf("Applying Jenkins %s at https://%s", rt.Setting("chartVersion"), host)
+	if warning := chartMismatch(rt); warning != "" {
+		rt.Logf("warning: %s", warning)
+	}
+	rt.Logf("Applying Jenkins %s (chart %s, %d plugins) at https://%s", pluginLock.Jenkins, rt.Setting("chartVersion"), len(installPlugins(rt)), host)
 	if err := stack.Retry(ctx, rt.Console, "jenkins helm release", 3, 20*time.Second, func() error {
 		return rt.Kube.HelmUpgrade(ctx, stack.Chart{
 			Release: release, Namespace: namespace, Repo: chartRepo, Name: "jenkins",
@@ -424,6 +505,8 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 	}
 	return map[string]any{
 		"Host":               rt.Setting("host"),
+		"ImageTag":           pluginLock.ImageTag(),
+		"Plugins":            installPlugins(rt),
 		"Password":           password,
 		"Annotations":        rt.Out.Ingress.Annotations,
 		"GlobalEnv":          env,
