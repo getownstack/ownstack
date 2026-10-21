@@ -312,6 +312,9 @@ type Chart struct {
 // HelmUpgrade installs or upgrades a release and waits for it to be ready.
 // Values files contain secrets, so they are written 0600 and removed after.
 func (k *Kube) HelmUpgrade(ctx context.Context, c Chart) error {
+	if err := k.recoverRelease(ctx, c.Release, c.Namespace); err != nil {
+		return err
+	}
 	dir, err := os.MkdirTemp("", "ownstack-helm-")
 	if err != nil {
 		return err
@@ -358,10 +361,11 @@ type Release struct {
 	AppVersion string `json:"app_version"`
 }
 
-// Release returns the installed release, or ok=false when it is not
-// installed or the cluster cannot be reached.
+// Release returns the installed release in any state (pending ones
+// included), or ok=false when it is not installed or the cluster cannot be
+// reached.
 func (k *Kube) Release(ctx context.Context, name, namespace string) (Release, bool) {
-	out, err := k.Exec.Output(ctx, "helm", "list", "-n", namespace, "--filter", "^"+name+"$", "-o", "json")
+	out, err := k.Exec.Output(ctx, "helm", "list", "-a", "-n", namespace, "--filter", "^"+name+"$", "-o", "json")
 	if err != nil {
 		return Release{}, false
 	}
@@ -370,6 +374,65 @@ func (k *Kube) Release(ctx context.Context, name, namespace string) (Release, bo
 		return Release{}, false
 	}
 	return releases[0], true
+}
+
+type helmRevision struct {
+	Revision int    `json:"revision"`
+	Status   string `json:"status"`
+}
+
+// recoverRelease unblocks a release that an interrupted run (a closed SSH
+// session, Ctrl-C, a reboot) left in a pending state, where Helm refuses any
+// further upgrade. It is safe because apply holds the node lock, so no other
+// ownstackctl is running Helm. A release that never installed is removed
+// (StatefulSet volumes stay); an interrupted upgrade or rollback is rolled
+// back, without waiting, to the last deployed revision (or the one before it)
+// so the upgrade that follows can converge it.
+func (k *Kube) recoverRelease(ctx context.Context, release, namespace string) error {
+	out, err := k.Exec.Output(ctx, "helm", "history", release, "--namespace", namespace, "--max", "20", "-o", "json")
+	if err != nil {
+		return nil // not installed yet, or Helm will report the real problem
+	}
+	var history []helmRevision
+	if json.Unmarshal([]byte(out), &history) != nil || len(history) == 0 {
+		return nil
+	}
+	action, target := recoveryAction(history)
+	latest := history[len(history)-1]
+	switch action {
+	case "uninstall":
+		k.Exec.Console.Printf("Helm release %s/%s was left %s by an interrupted run; removing it to install again", namespace, release, latest.Status)
+		return k.Exec.Run(ctx, "helm", "uninstall", release, "--namespace", namespace, "--wait", "--timeout", "5m")
+	case "rollback":
+		k.Exec.Console.Printf("Helm release %s/%s was left %s (revision %d) by an interrupted run; rolling back to revision %d", namespace, release, latest.Status, latest.Revision, target)
+		if err := k.Exec.Run(ctx, "helm", "rollback", release, fmt.Sprint(target), "--namespace", namespace); err != nil {
+			return fmt.Errorf("recover Helm release %s/%s from %s: %w", namespace, release, latest.Status, err)
+		}
+	}
+	return nil
+}
+
+// recoveryAction decides how to unblock a release from its history (oldest
+// first): "" when its latest revision is not pending, "uninstall" when it never
+// got past installing, or "rollback" to the returned revision.
+func recoveryAction(history []helmRevision) (string, int) {
+	latest := history[len(history)-1]
+	if !strings.HasPrefix(latest.Status, "pending-") {
+		return "", 0
+	}
+	if latest.Status == "pending-install" || len(history) == 1 {
+		return "uninstall", 0
+	}
+	target := 0
+	for _, r := range history[:len(history)-1] {
+		if r.Status == "deployed" || r.Status == "superseded" {
+			target = r.Revision
+		}
+	}
+	if target == 0 {
+		target = history[len(history)-2].Revision
+	}
+	return "rollback", target
 }
 
 func (k *Kube) outputInput(ctx context.Context, stdin, name string, args ...string) (string, error) {

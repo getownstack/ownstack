@@ -188,6 +188,8 @@ Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune
 
 ## Troubleshooting
 
+- **A run was interrupted** (SSH session closed, Ctrl-C, reboot) while Helm was installing or upgrading: just rerun `ownstackctl apply`. It finds the release Helm left `pending-install`/`pending-upgrade` and removes or rolls it back before upgrading again.
+
 - **"needs about X GB of memory"**: pick a lighter preset (Starter fits 2 GB) or a bigger server.
 - **Waiting for a certificate**: DNS must point at the server and port 443 must be reachable. With Cloudflare the records must be DNS-only (grey cloud). AAAA records for the names must point at this server or be removed; Let's Encrypt uses them.
 - **"DNS records that ownstackctl did not create already exist"**: the domain or its wildcard has A, AAAA, or CNAME records that point elsewhere, such as an existing website. Nothing was changed. Remove them, point them at the server, or set `replaceRecords: true` under `spec.dns.settings` to let ownstackctl replace them, then remove the setting again. Moving to a new server needs the setting only for records written by ownstackctl versions that did not mark them.
