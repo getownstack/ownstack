@@ -9,7 +9,7 @@
 #   OWNSTACKCTL_INSTALL_DIR  where to put the binary (default /usr/local/bin)
 set -euo pipefail
 
-version="${OWNSTACKCTL_VERSION:-ownstackctl-v0.3.0}"
+version="${OWNSTACKCTL_VERSION:-ownstackctl-v0.3.1}"
 repo="${OWNSTACKCTL_REPO:-getownstack/ownstack-cluster-template}"
 install_dir="${OWNSTACKCTL_INSTALL_DIR:-/usr/local/bin}"
 
