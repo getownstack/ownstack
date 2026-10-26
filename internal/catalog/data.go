@@ -6,7 +6,7 @@ const Version = "1"
 // JenkinsChartVersion is the jenkins/jenkins chart the Jenkins provider's
 // plugin lock (internal/providers/jenkins/plugins.lock) is resolved and
 // verified for. lockgen rewrites this line; a test keeps the two equal.
-const JenkinsChartVersion = "5.9.72"
+const JenkinsChartVersion = "5.10.0"
 
 // Jenkins plugin pins: space-separated <name>:<version> pairs.
 const jenkinsPluginsPattern = `^[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+( +[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+)*$`
