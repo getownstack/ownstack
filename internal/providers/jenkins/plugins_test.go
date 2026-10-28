@@ -6,6 +6,7 @@ import (
 	"flag"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -49,7 +50,7 @@ func TestLockCoversPluginsIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range requested {
-		if _, ok := lock.Version(name); !ok {
+		if !slices.ContainsFunc(lock.Plugins, func(e pluginlock.Entry) bool { return e.Name == name }) {
 			t.Errorf("plugins.in lists %s, which plugins.lock does not; run lockgen", name)
 		}
 	}

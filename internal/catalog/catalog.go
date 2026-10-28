@@ -17,16 +17,15 @@ import (
 
 // Param kinds.
 const (
-	KindString   = "string"
-	KindHostname = "hostname"
-	KindIP       = "ip"
-	KindEmail    = "email"
-	KindInt      = "int"
-	KindBool     = "bool"
-	KindSecret   = "secret"
+	KindString = "string"
+	KindIP     = "ip"
+	KindEmail  = "email"
+	KindInt    = "int"
+	KindBool   = "bool"
+	KindSecret = "secret"
 )
 
-var kinds = []string{KindString, KindHostname, KindIP, KindEmail, KindInt, KindBool, KindSecret}
+var kinds = []string{KindString, KindIP, KindEmail, KindInt, KindBool, KindSecret}
 
 // Hosting values.
 const (

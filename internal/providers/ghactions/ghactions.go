@@ -216,7 +216,7 @@ func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
 	return &githubapi.Client{Base: base, Token: rt.Out.VCS.Token, HTTP: rt.HTTP}
 }
 
-// settings is the OWNSTACK repo variable the workflow reads (C6).
+// settings is the OWNSTACK repo variable the workflow reads.
 // Environments are <name>[=<branch glob>] items, production first.
 type settings struct {
 	Domain       string   `json:"domain"`

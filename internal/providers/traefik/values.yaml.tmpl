@@ -29,10 +29,11 @@ certificatesResolvers:
 {{- end }}
       dnsChallenge:
         provider: {{ .DNSProvider }}
-        # Give the DNS provider time to publish the TXT record before Let's
-        # Encrypt looks; without it new hosts can fail validation.
+        # A short pause before checking the authoritative servers for the TXT
+        # record. The delay applies per name (3 for the wildcard certificate),
+        # so keep it small; the propagation check itself still waits.
         propagation:
-          delayBeforeChecks: 30s
+          delayBeforeChecks: 5s
         resolvers:
           - 1.1.1.1:53
           - 8.8.8.8:53

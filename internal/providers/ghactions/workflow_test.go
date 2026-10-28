@@ -144,9 +144,10 @@ func TestWorkflowShape(t *testing.T) {
 			t.Errorf("the workflow does not read %s", name)
 		}
 	}
-	for _, gone := range []string{"before-deployment", "imagePullSecret", "docker login", "inputs."} {
-		if strings.Contains(Workflow, gone) {
-			t.Errorf("the workflow still contains %q", gone)
+	// Credentials come from the cluster, and no input reaches a script.
+	for _, unwanted := range []string{"docker login", "inputs."} {
+		if strings.Contains(Workflow, unwanted) {
+			t.Errorf("the workflow contains %q", unwanted)
 		}
 	}
 	if !strings.Contains(Workflow, "\n# ownstack-workflow: 5\n") {
@@ -379,9 +380,9 @@ type deployRun struct {
 	err                             error
 }
 
-// runDeploy runs the deploy step in a repo with the apps web (with a
-// before-deployment.sh, which must not run) and api, plus docs, which has no
-// Dockerfile, as the resolve step's outputs for develop would.
+// runDeploy runs the deploy step in a repo with the apps web and api, plus
+// docs, which has no Dockerfile, as the resolve step's outputs for develop
+// would.
 func runDeploy(t *testing.T, env map[string]string, existing []string) deployRun {
 	t.Helper()
 	needUnix(t)
@@ -398,7 +399,6 @@ func runDeploy(t *testing.T, env map[string]string, existing []string) deployRun
 		filepath.Join(stub, "existing"):                                 strings.Join(existing, "\n") + "\n",
 		filepath.Join(repo, "infrastructure/web/Dockerfile"):            "FROM scratch\n",
 		filepath.Join(repo, "infrastructure/web/helm/Chart.yaml"):       "apiVersion: v2\nname: web\nversion: 0.1.0\n",
-		filepath.Join(repo, "infrastructure/web/before-deployment.sh"):  "echo ran > \"$STUB/hook\"\n",
 		filepath.Join(repo, "infrastructure/api/Dockerfile"):            "FROM scratch\n",
 		filepath.Join(repo, "infrastructure/api/helm/Chart.yaml"):       "apiVersion: v2\nname: api\nversion: 0.1.0\n",
 		filepath.Join(repo, "infrastructure/docs/README.md"):            "no Dockerfile\n",
@@ -434,9 +434,6 @@ func runDeploy(t *testing.T, env map[string]string, existing []string) deployRun
 		return string(data)
 	}
 	run.summary, run.pushedWith, run.kubeconfig = read("summary"), read("pushed-with"), read("kubeconfig")
-	if read("hook") != "" {
-		t.Error("before-deployment.sh ran")
-	}
 	if strings.Contains(run.log+strings.Join(run.calls, "\n")+run.summary, "Y2k6czNjcmV0LXB3") {
 		t.Error("the registry credential reached the log or a command line")
 	}

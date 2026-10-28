@@ -183,12 +183,6 @@ func TestLockRoundTrip(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(parsed, l) || parsed.ImageTag() != "2.580.1-jdk21" {
 		t.Fatalf("parse: %v %+v", err, parsed)
 	}
-	if v, ok := parsed.Version("app"); !ok || v != "4560.vc25b_83890c34" {
-		t.Errorf("Version(app) = %q %v", v, ok)
-	}
-	if _, ok := parsed.Version("ap"); ok {
-		t.Error("Version(ap) found")
-	}
 	head := Header + "\n# chart: 5.9.72\n# jenkins: 2.580.1\n# image: jenkins/jenkins:2.580.1-jdk21\n"
 	for name, bad := range map[string]string{
 		"no header":   "# chart: 5.9.72\n# jenkins: 2.580.1\n# image: jenkins/jenkins:2.580.1-jdk21\na:1\n",

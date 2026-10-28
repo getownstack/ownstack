@@ -117,12 +117,11 @@ func TestCatalogJSON(t *testing.T) {
 	}
 }
 
-func TestRemovedCommandsAndFlags(t *testing.T) {
+// Unknown commands and flags fail, and so do positional arguments, which
+// would otherwise be ignored.
+func TestRejectsUnknownArguments(t *testing.T) {
 	for _, args := range [][]string{
-		{"up"}, {"doctor"},
-		{"apply", "--no-verify"}, {"apply", "--secrets-file", "x"}, {"apply", "--no-prompt"}, {"apply", "--health-url", "x"},
-		{"apply", "--no-health-reports"}, {"apply", "--dir", "x"}, {"plan", "--secrets-file", "x"},
-		{"validate", "ownstack.yaml"},
+		{"deploy"}, {"apply", "--force"}, {"status", "--verbose"}, {"validate", "ownstack.yaml"},
 	} {
 		if _, err := runCmd(t, "", args...); err == nil {
 			t.Errorf("%v accepted", args)

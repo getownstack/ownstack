@@ -133,9 +133,12 @@ func TestReuseHtpasswd(t *testing.T) {
 // images under apps/.
 func TestResolveOutputs(t *testing.T) {
 	rt, _ := providertest.Runtime(t, Spec)
-	_ = (Provider{}).Resolve(context.Background(), rt.For("images"))
+	providertest.Set(rt, "images", "zot", nil)
+	if err := (Provider{}).Resolve(context.Background(), rt.For("images")); err != nil {
+		t.Fatal(err)
+	}
 	out := rt.Out.Images
-	if out == nil || out.Host != "registry.admin.example.com" || out.Project != "apps" || out.PushUsername != "ownstack" {
+	if out.Host != "registry.admin.example.com" || out.Project != "apps" || out.PushUsername != "ownstack" || out.PushPassword == "" {
 		t.Errorf("images output = %+v", out)
 	}
 }

@@ -94,7 +94,7 @@ func globalEnv(t *testing.T, rt *stack.Runtime) [][2]string {
 	return out
 }
 
-// Jenkins global env is exactly the five C7 variables.
+// Jenkins global env is exactly the five variables the library reads.
 func TestGlobalEnv(t *testing.T) {
 	for _, c := range []struct {
 		environments []string
@@ -114,13 +114,6 @@ func TestGlobalEnv(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("environments %q: global env\n%v\nwant\n%v", c.environments, got, want)
 		}
-	}
-	values, err := stack.Render(valuesTmpl, valuesData(jenkinsRuntime(t, nil), "pw"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(strings.ToLower(jcasc(t, values)), "slack") {
-		t.Error("JCasC configures Slack")
 	}
 }
 
@@ -153,7 +146,7 @@ func TestLibraryReadsGlobalEnv(t *testing.T) {
 	}
 }
 
-// Every credential the shared library uses is one the provider creates (C7).
+// Every credential the shared library uses is one the provider creates.
 func TestLibraryUsesProviderCredentials(t *testing.T) {
 	created := map[string]bool{}
 	for _, obj := range clusterObjects(jenkinsRuntime(t, nil)) {

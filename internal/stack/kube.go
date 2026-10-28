@@ -300,11 +300,8 @@ func (k *Kube) pullChart(ctx context.Context, c Chart) (string, error) {
 }
 
 type Release struct {
-	Name       string `json:"name"`
-	Namespace  string `json:"namespace"`
-	Status     string `json:"status"`
-	Chart      string `json:"chart"`
-	AppVersion string `json:"app_version"`
+	Status string `json:"status"`
+	Chart  string `json:"chart"`
 }
 
 // Release returns the installed release in any state (pending ones

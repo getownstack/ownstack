@@ -20,8 +20,5 @@ kubernetes-credentials-provider
 git
 github
 github-branch-source
-# Unused since Slack notifications were removed: delete this line when the
-# lock is next regenerated.
-slack
 # Pipeline UI.
 blueocean

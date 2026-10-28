@@ -406,7 +406,7 @@ type envVar struct{ Key, Value string }
 func valuesData(rt *stack.Runtime, password string) map[string]any {
 	images := rt.Out.Images
 	ref := stack.LibraryRef(stack.EngineVersion)
-	// The shared library reads exactly these (C7).
+	// The shared library reads exactly these.
 	env := []envVar{
 		{"OWNSTACK_DOMAIN", rt.Domain()},
 		{"OWNSTACK_REGISTRY", images.Host + "/" + images.Project},

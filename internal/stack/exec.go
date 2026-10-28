@@ -21,11 +21,6 @@ func (e *Exec) Run(ctx context.Context, name string, args ...string) error {
 	return e.run(ctx, "", name, args...)
 }
 
-// RunInput executes a command with stdin, streaming its combined output.
-func (e *Exec) RunInput(ctx context.Context, stdin, name string, args ...string) error {
-	return e.run(ctx, stdin, name, args...)
-}
-
 // Shell runs a bash script, streaming its output.
 func (e *Exec) Shell(ctx context.Context, script string) error {
 	return e.run(ctx, script, "bash", "-euo", "pipefail", "-s")

@@ -50,7 +50,7 @@ func Runtime(t *testing.T, specs ...catalog.Provider) (*stack.Runtime, *bytes.Bu
 	rt := stack.NewRuntime(m, cat, store, console)
 	rt.Out.Compute = &stack.ComputeOutput{PublicIP: "203.0.113.10"}
 	rt.Out.DNS = &stack.DNSOutput{ACMEProvider: "cloudflare", ACMEEnv: map[string]string{"CF_DNS_API_TOKEN": Env["CLOUDFLARE_API_TOKEN"]}}
-	rt.Out.Ingress = &stack.IngressOutput{EntryPoint: "websecure", CertResolver: "main", Annotations: map[string]string{
+	rt.Out.Ingress = &stack.IngressOutput{Annotations: map[string]string{
 		"traefik.ingress.kubernetes.io/router.entrypoints":      "websecure",
 		"traefik.ingress.kubernetes.io/router.tls.certresolver": "main",
 	}}

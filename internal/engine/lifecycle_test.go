@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,14 +22,12 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-// The environments stage calls kubectl. These stubs answer like an empty,
-// reachable cluster; a pull secret is returned when the test writes one to
-// $OWNSTACK_STUB_DIR/secret.json.
+// The environments stage calls kubectl. This stub answers like an empty,
+// reachable cluster.
 const kubectlStub = `#!/bin/sh
 case "$*" in
   "apply "*) cat >/dev/null ;;
-  "get --raw /readyz"|"get namespace "*) ;;
-  "get secret "*) [ -f "$OWNSTACK_STUB_DIR/secret.json" ] && cat "$OWNSTACK_STUB_DIR/secret.json" || exit 1 ;;
+  "get namespace "*) ;;
   "get ingressroutes.traefik.io "*|"get ingresses.networking.k8s.io "*|"get httproutes.gateway.networking.k8s.io "*) echo '{"items":[]}' ;;
   *) exit 1 ;;
 esac
@@ -357,55 +354,5 @@ func TestPlanListsSecretsInCatalogOrder(t *testing.T) {
 		if _, err := os.Stat(h.secret); !os.IsNotExist(err) {
 			t.Fatal("plan wrote the secrets file")
 		}
-	}
-}
-
-// pullSecret writes the stubbed cluster's pull secret.
-func pullSecret(t *testing.T, h *harness, server, user, pass string) {
-	t.Helper()
-	config, _ := stack.DockerConfigJSON(server, user, pass)
-	data := `{"data":{".dockerconfigjson":"` + base64.StdEncoding.EncodeToString([]byte(config)) + `"}}`
-	if err := os.WriteFile(filepath.Join(h.stubs, "secret.json"), []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestEnvironmentsStatusDetectsStalePullSecret(t *testing.T) {
-	h := newHarness(t, providertest.Manifest, providertest.Env)
-	h.e.RT.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PushUsername: "robot$ci", PushPassword: "current-pw"}
-	env := environments{rt: h.e.RT}
-	pullSecret(t, h, "harbor.admin.example.com", "robot$ci", "rotated-pw")
-	checks := env.status(context.Background())
-	if len(checks) == 0 || checks[0].State != stack.Fail || checks[0].Detail != "stale pull secret (different password); rerun apply" {
-		t.Fatalf("checks = %+v", checks)
-	}
-	for _, c := range checks {
-		if strings.Contains(c.Detail, "-pw") {
-			t.Errorf("detail contains a password: %q", c.Detail)
-		}
-	}
-	pullSecret(t, h, "harbor.admin.example.com", "robot$ci", "current-pw")
-	if checks := env.status(context.Background()); checks[0].State != stack.OK {
-		t.Errorf("current pull secret reported %+v", checks[0])
-	}
-}
-
-func TestParseRoutes(t *testing.T) {
-	ingressRoutes := `{"items":[{"metadata":{"name":"shop"},"spec":{"routes":[
-		{"match":"Host(` + "`shop.example.com`" + `) || Host(` + "`www.shop.example.com`" + `)"}]}}]}`
-	ingresses := `{"items":[{"metadata":{"name":"ownstack-web"},"spec":{"rules":[
-		{"host":"app.ownstack.io","http":{}},{"host":"*.ownstack.io"},{"http":{}},{"host":"shop.example.com"}]}}]}`
-	httpRoutes := `{"items":[{"metadata":{"name":"docs"},"spec":{"hostnames":["docs.example.com"],"rules":[{"matches":[]}]}}]}`
-
-	var routes []route
-	for _, list := range []string{ingressRoutes, ingresses, httpRoutes, "not json"} {
-		routes = append(routes, parseRoutes(list)...)
-	}
-	want := []route{
-		{"shop", "shop.example.com"}, {"shop", "www.shop.example.com"},
-		{"ownstack-web", "app.ownstack.io"}, {"docs", "docs.example.com"},
-	}
-	if got := uniqueHosts(routes); !slices.Equal(got, want) {
-		t.Errorf("routes = %v", got)
 	}
 }

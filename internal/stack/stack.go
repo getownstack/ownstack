@@ -98,7 +98,26 @@ func (rt *Runtime) For(aspect string) *Runtime {
 	return &scoped
 }
 
+// param is one of the aspect's provider's params. Keys are constants in
+// provider code, so a key the provider's Spec does not declare (or declares
+// as the other kind) is a bug that would otherwise read nothing: it panics,
+// and the provider's tests catch it.
+func (rt *Runtime) param(key string, secret bool) (catalog.Provider, catalog.Param) {
+	p, _ := rt.Catalog.Provider(rt.aspect, rt.Manifest.Provider(rt.Catalog, rt.aspect))
+	param, ok := p.Param(key)
+	if !ok || param.IsSecret() != secret {
+		what := "setting"
+		if secret {
+			what = "secret"
+		}
+		panic(fmt.Sprintf("the %s provider %q declares no %s %q", rt.aspect, p.ID, what, key))
+	}
+	return p, param
+}
+
+// Setting is one of this aspect's settings, with its default applied.
 func (rt *Runtime) Setting(key string) string {
+	rt.param(key, false)
 	return rt.Manifest.Settings(rt.Catalog, rt.aspect)[key]
 }
 
@@ -119,11 +138,7 @@ func (rt *Runtime) Values() map[string]any { return rt.Manifest.Values(rt.aspect
 // variable, the node's secrets file, generation, or a prompt (package
 // secrets).
 func (rt *Runtime) Secret(key string) (string, error) {
-	p, _ := rt.Catalog.Provider(rt.aspect, rt.Manifest.Provider(rt.Catalog, rt.aspect))
-	param, ok := p.Param(key)
-	if !ok || !param.IsSecret() {
-		return "", fmt.Errorf("%s has no secret %q", rt.aspect, key)
-	}
+	p, param := rt.param(key, true)
 	return rt.Secrets.Get(secrets.Request{Env: param.Env, Label: p.Label(param), Help: param.Help, Generate: param.Generate})
 }
 
@@ -143,9 +158,7 @@ type Outputs struct {
 }
 
 type ComputeOutput struct {
-	PublicIP     string
-	Kubeconfig   string
-	StorageClass string
+	PublicIP string
 	// APIServer is the cluster API URL reachable from outside the node, for
 	// CI systems that deploy remotely; CACert is its PEM CA bundle.
 	APIServer string
@@ -162,8 +175,6 @@ type DNSOutput struct {
 }
 
 type IngressOutput struct {
-	EntryPoint   string
-	CertResolver string
 	// Annotations make a standard Kubernetes Ingress use this ingress over HTTPS.
 	Annotations map[string]string
 	// UntrustedCerts is set when certificates are issued by a CA that clients

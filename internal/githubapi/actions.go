@@ -80,7 +80,6 @@ type Run struct {
 	Conclusion string `json:"conclusion"`
 	HTMLURL    string `json:"html_url"`
 	HeadSHA    string `json:"head_sha"`
-	CreatedAt  string `json:"created_at"`
 }
 
 // LatestRun returns the most recent run of a workflow file on branch (any

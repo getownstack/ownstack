@@ -361,10 +361,6 @@ func (m *Manifest) validateAspect(cat *catalog.Catalog, aspect catalog.Aspect) [
 
 func checkKind(param catalog.Param, value string) string {
 	switch param.Kind {
-	case catalog.KindHostname:
-		if !hostnameRe.MatchString(value) {
-			return "must be a hostname"
-		}
 	case catalog.KindIP:
 		if ip := net.ParseIP(value); ip == nil || ip.To4() == nil {
 			return "must be an IPv4 address"

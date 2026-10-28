@@ -48,15 +48,6 @@ func (l *Lock) ImageTag() string {
 	return tag
 }
 
-// Version returns the locked version of a plugin.
-func (l *Lock) Version(name string) (string, bool) {
-	i := sort.Search(len(l.Plugins), func(i int) bool { return l.Plugins[i].Name >= name })
-	if i < len(l.Plugins) && l.Plugins[i].Name == name {
-		return l.Plugins[i].Version, true
-	}
-	return "", false
-}
-
 var (
 	pluginName    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	pluginVersion = regexp.MustCompile(`^[A-Za-z0-9_.+-]+$`)

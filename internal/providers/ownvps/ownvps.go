@@ -36,10 +36,8 @@ type Provider struct{}
 
 func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	rt.Out.Compute = &stack.ComputeOutput{
-		PublicIP:     rt.Setting("host"),
-		Kubeconfig:   stack.Kubeconfig,
-		StorageClass: "local-path",
-		APIServer:    "https://" + rt.Setting("host") + ":6443",
+		PublicIP:  rt.Setting("host"),
+		APIServer: "https://" + rt.Setting("host") + ":6443",
 		// ownstackctl runs on the node, so its own architecture is the node's.
 		Arch: runtime.GOARCH,
 	}
