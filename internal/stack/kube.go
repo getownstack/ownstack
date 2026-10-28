@@ -1,14 +1,11 @@
 package stack
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"sort"
 	"strings"
 	"time"
 
@@ -157,43 +154,6 @@ func imagePullSecretsPatch(serviceAccountJSON, secret string) (patch string, cha
 	return string(data), true, err
 }
 
-// NamespaceLabelWarnings labels a namespace in a server-side dry run and
-// returns the warnings the API server answers with, such as existing pods
-// that a new Pod Security level would reject. Nothing is changed.
-func (k *Kube) NamespaceLabelWarnings(ctx context.Context, name string, labels map[string]string) ([]string, error) {
-	args := []string{"label", "--dry-run=server", "--overwrite", "namespace", name}
-	keys := make([]string, 0, len(labels))
-	for key := range labels {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, key+"="+labels[key])
-	}
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	cmd.Env = k.Exec.env()
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return nil, fmt.Errorf("kubectl: %w: %s", err, lastLine(msg))
-		}
-		return nil, fmt.Errorf("kubectl: %w", err)
-	}
-	return serverWarnings(stderr.String()), nil
-}
-
-// serverWarnings extracts the "Warning: ..." lines kubectl prints to stderr.
-func serverWarnings(stderr string) []string {
-	var out []string
-	for _, line := range strings.Split(stderr, "\n") {
-		if text, ok := strings.CutPrefix(strings.TrimSpace(line), "Warning: "); ok {
-			out = append(out, text)
-		}
-	}
-	return out
-}
-
 // SecretValue reads one key of a secret; ok is false when it does not exist.
 func (k *Kube) SecretValue(ctx context.Context, namespace, name, key string) (string, bool) {
 	out, err := k.Exec.Output(ctx, "kubectl", "get", "secret", name, "-n", namespace, "-o", "json")
@@ -215,14 +175,6 @@ func (k *Kube) SecretValue(ctx context.Context, namespace, name, key string) (st
 		return "", false
 	}
 	return string(value), true
-}
-
-// Reachable reports whether the cluster API answers.
-func (k *Kube) Reachable(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err := k.Exec.Output(ctx, "kubectl", "get", "--raw", "/readyz")
-	return err == nil
 }
 
 type NodeStatus struct {
@@ -444,18 +396,4 @@ func timeoutOr(d, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
-}
-
-// HelmUninstall removes a release; a missing release is not an error.
-func (k *Kube) HelmUninstall(ctx context.Context, release, namespace string) error {
-	if _, ok := k.Release(ctx, release, namespace); !ok {
-		return nil
-	}
-	return k.Exec.Run(ctx, "helm", "uninstall", release, "--namespace", namespace, "--wait", "--timeout", "5m")
-}
-
-// Delete removes cluster objects by kind and name, ignoring missing ones.
-// Namespaced kinds take "-n namespace" in args.
-func (k *Kube) Delete(ctx context.Context, args ...string) error {
-	return k.Exec.Run(ctx, "kubectl", append([]string{"delete", "--ignore-not-found", "--wait=true", "--timeout=5m"}, args...)...)
 }

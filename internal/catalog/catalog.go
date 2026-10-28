@@ -23,13 +23,10 @@ const (
 	KindEmail    = "email"
 	KindInt      = "int"
 	KindBool     = "bool"
-	KindEnum     = "enum"
 	KindSecret   = "secret"
-	// KindEnvironment values name one of the manifest's environments.
-	KindEnvironment = "environment"
 )
 
-var kinds = []string{KindString, KindHostname, KindIP, KindEmail, KindInt, KindBool, KindEnum, KindSecret, KindEnvironment}
+var kinds = []string{KindString, KindHostname, KindIP, KindEmail, KindInt, KindBool, KindSecret}
 
 // Hosting values.
 const (
@@ -55,6 +52,8 @@ type Aspect struct {
 	Contract Contract `json:"contract"`
 	// Consumes lists aspects whose contracts this aspect's providers may use.
 	Consumes []string `json:"consumes,omitempty"`
+	// Default is the provider the Starter preset uses for this aspect.
+	Default string `json:"default"`
 }
 
 type Param struct {
@@ -63,12 +62,11 @@ type Param struct {
 	Help  string `json:"help,omitempty"`
 	// HelpURL points at the page where the user creates this value, such as
 	// a token creation form with the right scopes preselected.
-	HelpURL     string   `json:"helpURL,omitempty"`
-	Kind        string   `json:"kind"`
-	Required    bool     `json:"required,omitempty"`
-	Default     string   `json:"default,omitempty"` // may reference {domain} and {admin}
-	Placeholder string   `json:"placeholder,omitempty"`
-	Enum        []string `json:"enum,omitempty"`
+	HelpURL     string `json:"helpURL,omitempty"`
+	Kind        string `json:"kind"`
+	Required    bool   `json:"required,omitempty"`
+	Default     string `json:"default,omitempty"` // may reference {domain} and {adminDomain}
+	Placeholder string `json:"placeholder,omitempty"`
 	// Pattern is a regular expression, anchored with ^ and $, that a set
 	// value must match. It uses only syntax Go's regexp and Python's re read
 	// the same way, because the Ownstack designer checks it too. PatternHelp
@@ -135,31 +133,22 @@ func checkPattern(pattern string) error {
 	return err
 }
 
-type Path struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Recommended bool   `json:"recommended,omitempty"`
-}
-
 type Resources struct {
 	MemoryMiB int `json:"memoryMiB,omitempty"`
 	DiskGiB   int `json:"diskGiB,omitempty"`
 }
 
+// Provider is one implementation of an aspect. Each provider package
+// declares its own as Spec; internal/providers lists them.
 type Provider struct {
-	ID          string    `json:"id"`
-	Aspect      string    `json:"aspect"`
-	Name        string    `json:"name"`
-	Mono        string    `json:"mono"`
-	Hosting     string    `json:"hosting"`
-	Summary     string    `json:"summary"`
-	Params      []Param   `json:"params,omitempty"`
-	Requires    []string  `json:"requires,omitempty"`
-	Paths       []Path    `json:"paths,omitempty"`
-	Resources   Resources `json:"resources,omitempty"`
-	Available   bool      `json:"available"`
-	Recommended bool      `json:"recommended,omitempty"`
+	ID        string    `json:"id"`
+	Aspect    string    `json:"aspect"`
+	Name      string    `json:"name"`
+	Mono      string    `json:"mono"`
+	Hosting   string    `json:"hosting"`
+	Summary   string    `json:"summary"`
+	Params    []Param   `json:"params,omitempty"`
+	Resources Resources `json:"resources,omitempty"`
 }
 
 func (p Provider) Param(key string) (Param, bool) {
@@ -225,18 +214,6 @@ func (c *Catalog) Order() []string {
 	return ids
 }
 
-// WithAvailability returns a copy of the catalog where providers present in
-// implemented are marked available.
-func (c *Catalog) WithAvailability(implemented map[string]bool) *Catalog {
-	out := &Catalog{Version: c.Version, Aspects: c.Aspects, Presets: c.Presets}
-	out.Providers = make([]Provider, len(c.Providers))
-	for i, p := range c.Providers {
-		p.Available = implemented[Key(p.Aspect, p.ID)]
-		out.Providers[i] = p
-	}
-	return out
-}
-
 func Key(aspect, provider string) string { return aspect + "/" + provider }
 
 // Validate checks the catalog's internal consistency. It runs in tests.
@@ -261,14 +238,8 @@ func (c *Catalog) Validate() error {
 			return fmt.Errorf("duplicate provider %q", key)
 		}
 		seen[key] = true
-		aspect, ok := c.Aspect(p.Aspect)
-		if !ok {
+		if _, ok := c.Aspect(p.Aspect); !ok {
 			return fmt.Errorf("provider %q references unknown aspect", key)
-		}
-		for _, req := range p.Requires {
-			if !contains(aspect.Consumes, req) {
-				return fmt.Errorf("provider %q requires %q which aspect %q does not consume", key, req, p.Aspect)
-			}
 		}
 		params := map[string]bool{}
 		for _, param := range p.Params {
@@ -285,6 +256,11 @@ func (c *Catalog) Validate() error {
 			if err := checkParamPattern(param); err != nil {
 				return fmt.Errorf("param %q of provider %q: %w", param.Key, key, err)
 			}
+		}
+	}
+	for _, a := range c.Aspects {
+		if _, ok := c.Provider(a.ID, a.Default); !ok {
+			return fmt.Errorf("aspect %q has unknown default provider %q", a.ID, a.Default)
 		}
 	}
 	for _, preset := range c.Presets {

@@ -42,7 +42,7 @@ func TestUpsertFileSkipsIdenticalContent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	p := Provider{APIURL: srv.URL}
 	rt = rt.For("vcs")
 	if err := p.Resolve(context.Background(), rt); err != nil {
@@ -60,7 +60,7 @@ func TestUpsertFileSkipsIdenticalContent(t *testing.T) {
 }
 
 func TestResolveOutputs(t *testing.T) {
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	if err := (Provider{}).Resolve(context.Background(), rt.For("vcs")); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func stubGit(t *testing.T) (calls func() []string) {
 func bootstrap(t *testing.T, gh *fakeGitHub, manifestYAML string) (*stack.Runtime, error) {
 	t.Helper()
 	srv := gh.serve(t)
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	rt = rt.For("vcs")
 	p := Provider{APIURL: srv.URL}
 	if err := p.Resolve(context.Background(), rt); err != nil {

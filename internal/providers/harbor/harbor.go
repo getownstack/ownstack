@@ -15,13 +15,31 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
+// Spec is the harbor provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "harbor", Aspect: "images", Name: "Harbor", Mono: "HB", Hosting: catalog.SelfHosted,
+	Summary:   "A full private registry in your cluster, with projects and robot accounts.",
+	Resources: catalog.Resources{MemoryMiB: 1500, DiskGiB: 20},
+	Params: []catalog.Param{
+		{Key: "adminPassword", Label: "Admin password", Kind: catalog.KindSecret, Required: true, Generate: true, Env: "HARBOR_ADMIN_PASSWORD",
+			Help: "Generated on the server when not provided."},
+	},
+}
+
 const (
-	namespace = "harbor"
-	release   = "harbor"
-	chartRepo = "https://helm.goharbor.io"
+	namespace    = "harbor"
+	release      = "harbor"
+	chartRepo    = "https://helm.goharbor.io"
+	chartVersion = "1.17.2"
+	// project is the Harbor project CI pushes images to.
+	project = "apps"
+	// pullSecret is the image pull secret in every environment, the same
+	// for every registry.
+	pullSecret = "registry-credentials"
 	// robotName is the CI robot account; Harbor reports it as robot$ownstack-ci.
 	robotName = "ownstack-ci"
 	// robotSecret stores the robot credential in the registry's own namespace
@@ -29,12 +47,10 @@ const (
 	robotSecret = "ownstack-registry-robot"
 )
 
-// The stored robot credential is checked this often before apply gives up,
-// so a Harbor restart or a proxy error never rotates it.
-var (
-	robotCheckAttempts = 5
-	robotCheckDelay    = 10 * time.Second
-)
+// robotCheckTimeout is how long apply waits for Harbor to accept or reject
+// the stored robot credential, so a Harbor restart or a proxy error never
+// rotates it.
+var robotCheckTimeout = time.Minute
 
 //go:embed values.yaml.tmpl
 var valuesTemplate string
@@ -45,9 +61,9 @@ type Provider struct{}
 
 func (Provider) Resolve(ctx context.Context, rt *stack.Runtime) error {
 	out := &stack.ImagesOutput{
-		Host:           rt.Setting("host"),
-		Project:        rt.Setting("project"),
-		PullSecretName: rt.Setting("pullSecretName"),
+		Host:           rt.AdminHost("harbor"),
+		Project:        project,
+		PullSecretName: pullSecret,
 		Login:          "user admin, password HARBOR_ADMIN_PASSWORD",
 	}
 	rt.Out.Images = out
@@ -60,20 +76,12 @@ func (Provider) Resolve(ctx context.Context, rt *stack.Runtime) error {
 	return err
 }
 
-func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	return []stack.Step{
-		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
-		{Action: "ensure", Target: "project " + rt.Setting("project"), Detail: "private"},
-		{Action: "ensure", Target: "robot " + robotName, Detail: "push/pull credential for CI and environments"},
-	}
-}
-
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	password, err := rt.Secret("adminPassword")
 	if err != nil {
 		return err
 	}
-	host := rt.Setting("host")
+	host := rt.Out.Images.Host
 	values, err := stack.Render(tmpl, map[string]any{
 		"Host":        host,
 		"Password":    password,
@@ -82,30 +90,31 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err != nil {
 		return err
 	}
-	rt.Logf("Applying Harbor %s at https://%s", rt.Setting("chartVersion"), host)
-	if err := stack.Retry(ctx, rt.Console, "harbor helm release", 3, 20*time.Second, func() error {
-		return rt.Kube.HelmUpgrade(ctx, stack.Chart{
-			Release: release, Namespace: namespace, Repo: chartRepo, Name: "harbor",
-			Version: rt.Setting("chartVersion"), Values: values, Overrides: rt.Values(),
-			Timeout: 20 * time.Minute,
-		})
+	rt.Logf("Applying Harbor %s at https://%s", chartVersion, host)
+	if err := rt.Kube.HelmUpgrade(ctx, stack.Chart{
+		Release: release, Namespace: namespace, Repo: chartRepo, Name: "harbor",
+		Version: chartVersion, Values: values, Overrides: rt.Values(),
+		Timeout: 20 * time.Minute,
 	}); err != nil {
 		return err
 	}
 
+	// Docker on the node and in CI refuses untrusted registry certificates,
+	// so Harbor is ready once it is healthy behind a trusted one.
 	api := &client{base: "https://" + host + "/api/v2.0", user: "admin", password: password, http: rt.ServiceClient()}
-	if err := stack.Retry(ctx, rt.Console, "harbor healthy", 40, 15*time.Second, func() error {
-		return api.healthy(ctx)
+	if err := stack.WaitFor(ctx, rt, "Harbor healthy behind a trusted certificate", 15*time.Minute, func(ctx context.Context) (bool, string) {
+		if err := api.healthy(ctx); err != nil {
+			return false, err.Error()
+		}
+		if check := rt.CheckHTTPS(ctx, host, "/api/v2.0/ping"); check.State != stack.OK {
+			return false, check.Detail
+		}
+		return true, ""
 	}); err != nil {
 		return err
 	}
-	rt.Logf("Harbor is healthy")
-	// Docker on the node and in CI refuses untrusted registry certificates.
-	if err := stack.WaitForCertificate(ctx, rt, host, "/api/v2.0/ping", 5*time.Minute); err != nil {
-		return err
-	}
+	rt.Logf("Harbor is healthy at https://%s", host)
 
-	project := rt.Setting("project")
 	if err := api.ensureProject(ctx, project); err != nil {
 		return err
 	}
@@ -114,7 +123,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	out := rt.Out.Images
 	if out.PushUsername != "" {
 		robotAPI := &client{base: api.base, user: out.PushUsername, password: out.PushPassword, http: api.http}
-		valid, err := checkRobot(ctx, rt.Console, robotAPI, project)
+		valid, err := checkRobot(ctx, rt, robotAPI)
 		if err != nil {
 			return err
 		}
@@ -138,7 +147,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 }
 
 func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
-	host := rt.Setting("host")
+	host := rt.Out.Images.Host
 	checks := []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
@@ -154,7 +163,7 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		checks = append(checks, stack.Check{Name: "robot", State: stack.Fail, Detail: "no CI robot credential stored"})
 	} else {
 		robotAPI := &client{base: api.base, user: rt.Out.Images.PushUsername, password: rt.Out.Images.PushPassword, http: api.http}
-		switch valid, err := robotAPI.robotAccess(ctx, rt.Setting("project")); {
+		switch valid, err := robotAPI.robotAccess(ctx, project); {
 		case err != nil:
 			checks = append(checks, stack.Check{Name: "robot", State: stack.Unknown, Detail: err.Error()})
 		case valid:
@@ -262,14 +271,16 @@ func (c *client) robotAccess(ctx context.Context, project string) (bool, error) 
 	return false, fmt.Errorf("checking the robot credential: HTTP %d", code)
 }
 
-// checkRobot retries robotAccess until Harbor gives a definite answer, so
-// the robot is only recreated when Harbor actually rejects it.
-func checkRobot(ctx context.Context, console *stack.Console, robotAPI *client, project string) (bool, error) {
+// checkRobot waits until Harbor gives a definite answer about the robot
+// credential, so the robot is only recreated when Harbor actually rejects it.
+func checkRobot(ctx context.Context, rt *stack.Runtime, robotAPI *client) (bool, error) {
 	var valid bool
-	err := stack.Retry(ctx, console, "harbor robot credential check", robotCheckAttempts, robotCheckDelay, func() error {
+	err := stack.WaitFor(ctx, rt, "Harbor to check the robot credential", robotCheckTimeout, func(ctx context.Context) (bool, string) {
 		var err error
-		valid, err = robotAPI.robotAccess(ctx, project)
-		return err
+		if valid, err = robotAPI.robotAccess(ctx, project); err != nil {
+			return false, err.Error()
+		}
+		return true, ""
 	})
 	return valid, err
 }
@@ -326,17 +337,4 @@ func (c *client) recreateRobot(ctx context.Context) (string, string, error) {
 		return "", "", fmt.Errorf("create robot: unexpected response")
 	}
 	return created.Name, created.Secret, nil
-}
-
-func (Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
-	_, ok := rt.Kube.Release(ctx, release, namespace)
-	return ok
-}
-
-// Remove uninstalls the release and its namespace, including stored data.
-func (Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
-	if err := rt.Kube.HelmUninstall(ctx, release, namespace); err != nil {
-		return err
-	}
-	return rt.Kube.Delete(ctx, "namespace", namespace)
 }

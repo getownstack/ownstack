@@ -34,28 +34,7 @@ func stageIDs(e *Engine) string {
 
 func TestStageOrder(t *testing.T) {
 	e := newEngine(t, providertest.Manifest)
-	if got := stageIDs(e); got != "compute,dns,ingress,vcs,images,environments,alerts,cicd" {
-		t.Errorf("stages = %s", got)
-	}
-}
-
-func TestMinimalStackStages(t *testing.T) {
-	src := `
-apiVersion: ownstack.io/v1
-kind: Stack
-metadata: {name: tiny}
-spec:
-  domain: example.com
-  environments: [prod]
-  compute: {provider: own-vps, settings: {host: 203.0.113.10}}
-  dns: {provider: manual}
-  ingress: {provider: traefik, settings: {acmeEmail: ops@example.com}}
-`
-	e := newEngine(t, src)
-	if err := e.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if got := stageIDs(e); got != "compute,environments,dns,ingress" {
+	if got := stageIDs(e); got != "compute,dns,ingress,vcs,images,environments,cicd" {
 		t.Errorf("stages = %s", got)
 	}
 }
@@ -82,5 +61,36 @@ func TestMemoryPreflight(t *testing.T) {
 	starter := strings.NewReplacer("provider: harbor", "provider: zot", "provider: jenkins", "provider: gh-actions").Replace(providertest.Manifest)
 	if err := newEngine(t, starter).memoryPreflight(ApplyOptions{MemTotalMiB: 1642}); err != nil {
 		t.Fatalf("Starter stack should fit 1.6 GB: %v", err)
+	}
+}
+
+// plan's server checks use apply's memory rule, and only manifest issues and
+// failed checks would stop apply; missing secrets are asked for.
+func TestPlanProblems(t *testing.T) {
+	memory := func(checks []stack.Check) (stack.Check, bool) {
+		for _, c := range checks {
+			if c.Name == "memory" {
+				return c, true
+			}
+		}
+		return stack.Check{}, false
+	}
+	if c, ok := memory(serverChecks(1642, 4000)); !ok || c.State != stack.Fail {
+		t.Errorf("1.6 GB for 4 GB: %+v", c)
+	}
+	if c, ok := memory(serverChecks(8192, 4000)); !ok || c.State != stack.OK {
+		t.Errorf("8 GB for 4 GB: %+v", c)
+	}
+	if c, ok := memory(serverChecks(0, 4000)); ok {
+		t.Errorf("unknown memory checked: %+v", c)
+	}
+
+	plan := Plan{
+		Issues:  []manifest.Issue{{Path: "spec.domain", Message: "x"}},
+		Server:  []stack.Check{{Name: "root", State: stack.Fail}, {Name: "arch", State: stack.OK}},
+		Missing: []string{"GitHub access token"},
+	}
+	if got := plan.Problems(); got != 2 {
+		t.Errorf("problems = %d, want 2", got)
 	}
 }

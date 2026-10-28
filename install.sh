@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Installs ownstackctl from a pinned GitHub Release after verifying its checksum.
+# Installs ownstackctl from this repository's GitHub releases after verifying
+# its checksum.
 #
 #   curl -fsSL https://raw.githubusercontent.com/getownstack/ownstack/main/install.sh | sudo bash
 #
 # Environment:
-#   OWNSTACKCTL_VERSION      release tag (default below)
-#   OWNSTACKCTL_REPO         owner/repo hosting the releases
+#   OWNSTACKCTL_VERSION      release tag, such as ownstackctl-v0.4.0 (default: the latest release)
 #   OWNSTACKCTL_INSTALL_DIR  where to put the binary (default /usr/local/bin)
 set -euo pipefail
 
-version="${OWNSTACKCTL_VERSION:-ownstackctl-v0.3.2}"
-repo="${OWNSTACKCTL_REPO:-getownstack/ownstack}"
+version="${OWNSTACKCTL_VERSION:-latest}"
 install_dir="${OWNSTACKCTL_INSTALL_DIR:-/usr/local/bin}"
 
 case "$(uname -s)-$(uname -m)" in
@@ -20,14 +19,20 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 asset="ownstackctl-linux-$arch"
-base="https://github.com/$repo/releases/download/$version"
+if [ "$version" = latest ]; then
+  base="https://github.com/getownstack/ownstack/releases/latest/download"
+else
+  base="https://github.com/getownstack/ownstack/releases/download/$version"
+fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $asset ($version)"
-curl -fsSL --proto '=https' --retry 3 --retry-connrefused "$base/$asset" -o "$tmp/$asset"
-curl -fsSL --proto '=https' --retry 3 --retry-connrefused "$base/checksums-linux-$arch.txt" -o "$tmp/checksums.txt"
-(cd "$tmp" && sha256sum -c checksums.txt --ignore-missing --quiet)
+for file in "$asset" checksums.txt; do
+  curl -fsSL --proto '=https' --retry 3 --retry-connrefused "$base/$file" -o "$tmp/$file"
+done
+# checksums.txt lists every binary of the release; verify the one downloaded.
+(cd "$tmp" && grep "  $asset\$" checksums.txt | sha256sum -c --quiet -)
 
 mkdir -p "$install_dir"
 install -m 0755 "$tmp/$asset" "$install_dir/ownstackctl"

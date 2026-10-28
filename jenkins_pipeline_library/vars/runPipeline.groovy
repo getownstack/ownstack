@@ -23,9 +23,8 @@ def call(Object applicationIds) {
     // (deployEnvironment). Pull requests and other branches are build-only
     // checks, so a manual build never replaces a release from unreviewed code.
     def environment = deployEnvironment()
+    def production = deployEnvironment.production()
     boolean deployable = environment != ''
-    def mode = deployable ? '' : ' (build only)'
-    def target = deployable ? environment : 'none (build only)'
 
     pipeline {
         agent {
@@ -41,24 +40,9 @@ def call(Object applicationIds) {
             stage('Build') {
                 steps {
                     script {
-                        notify(
-                                'warning',
-                                """
-                                    :rocket: Pipeline Started${mode}!
-                                    Job: ${env.JOB_NAME}
-                                    Build: ${env.BUILD_NUMBER}
-                                    Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
-                                    Branch: ${env.GIT_BRANCH ?: 'N/A'}
-                                    Application IDs: ${ids.join(', ')}
-                                    Environment: ${target}
-                                    Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
-                                """.stripIndent()
-                        )
-
-                        def branches = ids.collectEntries { id ->
-                            [ ("Build: ${id}") : { dockerBuild(id) } ]
-                        }
-                        parallel branches
+                        echo(deployable ? "${env.BRANCH_NAME} deploys to ${environment}" : "${env.BRANCH_NAME} deploys to no environment (build only)")
+                        imageTag()
+                        parallel(ids.collectEntries { id -> [("Build: ${id}"): { dockerBuild(id) }] })
                     }
                 }
             }
@@ -66,20 +50,7 @@ def call(Object applicationIds) {
                 when { expression { deployable } }
                 steps {
                     script {
-                        def branches = ids.collectEntries { id ->
-                            [ ("Push: ${id}") : { dockerPush(id) } ]
-                        }
-                        parallel branches
-                    }
-                }
-            }
-            stage('Before Deploy') {
-                when { expression { deployable } }
-                steps {
-                    script {
-                        ids.each { id ->
-                            beforeDeployment(id)
-                        }
+                        parallel(ids.collectEntries { id -> [("Push: ${id}"): { dockerPush(id) }] })
                     }
                 }
             }
@@ -87,49 +58,17 @@ def call(Object applicationIds) {
                 when { expression { deployable } }
                 steps {
                     script {
-                        ids.each { id ->
-                            echo "Deploying ${id}"
-                            helmDeploy(id)
-                        }
-                        // To deploy in parallel instead, replace the above with:
-                        // def branches = ids.collectEntries { id -> [ ("Deploy: ${id}") : { helmDeploy(id) } ] }
-                        // parallel branches
+                        // common_helm_library comes from the Ownstack repository at
+                        // the ref this library was loaded from (a release tag or a
+                        // branch); ownstackctl sets both in Jenkins global env.
+                        sh 'rm -rf .ownstack && git clone --quiet --depth 1 --branch "$OWNSTACK_LIBRARY_REF" "$OWNSTACK_LIBRARY_REPO" .ownstack'
+                        ids.each { id -> helmDeploy(id, environment, production) }
                     }
                 }
             }
         }
         post {
             always { cleanWs() }
-            success {
-                notify(
-                        'good',
-                        """
-                                :white_check_mark: Pipeline Succeeded${mode}!
-                                Job: ${env.JOB_NAME}
-                                Build: ${env.BUILD_NUMBER}
-                                Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
-                                Branch: ${env.GIT_BRANCH ?: 'N/A'}
-                                Application IDs: ${ids.join(', ')}
-                                Environment: ${target}
-                                Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
-                            """.stripIndent()
-                )
-            }
-            failure {
-                notify(
-                        'danger',
-                        """
-                                :x: Pipeline Failed${mode}!
-                                Job: ${env.JOB_NAME}
-                                Build: ${env.BUILD_NUMBER}
-                                Commit: ${env.GIT_COMMIT?.take(8) ?: 'N/A'}
-                                Branch: ${env.GIT_BRANCH ?: 'N/A'}
-                                Application IDs: ${ids.join(', ')}
-                                Environment: ${target}
-                                Build URL: ${env.JENKINS_URL}blue/organizations/jenkins/${java.net.URLEncoder.encode(env.JOB_NAME, 'UTF-8')}/detail/${env.GIT_BRANCH ?: 'main'}/${env.BUILD_NUMBER}/pipeline/
-                            """.stripIndent()
-                )
-            }
         }
     }
 }

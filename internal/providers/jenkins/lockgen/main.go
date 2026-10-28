@@ -8,9 +8,9 @@
 //	go run ./internal/providers/jenkins/lockgen -chart 5.9.72  # a specific chart
 //	go run ./internal/providers/jenkins/lockgen -latest-chart  # the newest 5.x/6.x chart
 //
-// It writes internal/providers/jenkins/plugins.lock, sets JenkinsChartVersion
-// in internal/catalog/data.go to the lock's chart, and regenerates the Jenkins
-// provider's golden Helm values. It refuses a set where a plugin needs a newer
+// It writes internal/providers/jenkins/plugins.lock, sets ChartVersion in
+// internal/providers/jenkins/chart.go to the lock's chart, and regenerates
+// the Jenkins provider's golden Helm values. It refuses a set where a plugin needs a newer
 // core or a newer dependency than the update center offers, and, unless
 // -allow-warnings, one where a published security warning matches a locked
 // version or the core.
@@ -46,9 +46,9 @@ import (
 const (
 	module = "github.com/getownstack/ownstack"
 
-	inputPath  = "internal/providers/jenkins/plugins.in"
-	lockPath   = "internal/providers/jenkins/plugins.lock"
-	dataGoPath = "internal/catalog/data.go"
+	inputPath   = "internal/providers/jenkins/plugins.in"
+	lockPath    = "internal/providers/jenkins/plugins.lock"
+	chartGoPath = "internal/providers/jenkins/chart.go"
 
 	exitFailed     = 1
 	exitUsage      = 2
@@ -227,8 +227,8 @@ func lock(ctx context.Context, cfg config) error {
 		return errAdvisories
 	}
 
-	// Check data.go before writing anything, so a failure leaves both as they were.
-	catalogData, err := readCatalog(path(dataGoPath))
+	// Check chart.go before writing anything, so a failure leaves both as they were.
+	chartData, err := readChart(path(chartGoPath))
 	if err != nil {
 		return err
 	}
@@ -236,7 +236,7 @@ func lock(ctx context.Context, cfg config) error {
 	if err := writeIfChanged(path(lockPath), next.Format()); err != nil {
 		return err
 	}
-	chartChanged, err := setCatalogChart(path(dataGoPath), catalogData, chart)
+	chartChanged, err := setChart(path(chartGoPath), chartData, chart)
 	if err != nil {
 		return err
 	}
@@ -258,7 +258,7 @@ func lock(ctx context.Context, cfg config) error {
 		fmt.Fprintln(cfg.stdout, "- "+c)
 	}
 	if chartChanged {
-		fmt.Fprintf(cfg.stderr, "The catalog's jenkins chartVersion default is now %s: run scripts/sync-catalog.sh in the portal repo (getownstack/ownstack-portal).\n", chart)
+		fmt.Fprintf(cfg.stderr, "The Jenkins chart is now %s (ChartVersion in %s).\n", chart, chartGoPath)
 	}
 	return nil
 }
@@ -323,28 +323,28 @@ func latestChart(charts map[string]string) (string, error) {
 	return best, nil
 }
 
-// jenkinsChartConst is the JenkinsChartVersion line in data.go.
-var jenkinsChartConst = regexp.MustCompile(`(?m)^(const JenkinsChartVersion = )"([^"]*)"$`)
+// chartConst is the ChartVersion line in chart.go.
+var chartConst = regexp.MustCompile(`(?m)^(const ChartVersion = )"([^"]*)"$`)
 
-// readCatalog reads data.go and checks it has exactly one JenkinsChartVersion line.
-func readCatalog(path string) ([]byte, error) {
+// readChart reads chart.go and checks it has exactly one ChartVersion line.
+func readChart(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if n := len(jenkinsChartConst.FindAllIndex(data, -1)); n != 1 {
-		return nil, fmt.Errorf("%s: want one `const JenkinsChartVersion = \"...\"` line, found %d", path, n)
+	if n := len(chartConst.FindAllIndex(data, -1)); n != 1 {
+		return nil, fmt.Errorf("%s: want one `const ChartVersion = \"...\"` line, found %d", path, n)
 	}
 	return data, nil
 }
 
-// setCatalogChart sets JenkinsChartVersion in data.go (read by readCatalog)
-// and reports whether it changed.
-func setCatalogChart(path string, data []byte, chart string) (bool, error) {
-	if m := jenkinsChartConst.FindSubmatch(data); m != nil && string(m[2]) == chart {
+// setChart sets ChartVersion in chart.go (read by readChart) and reports
+// whether it changed.
+func setChart(path string, data []byte, chart string) (bool, error) {
+	if m := chartConst.FindSubmatch(data); m != nil && string(m[2]) == chart {
 		return false, nil
 	}
-	out := jenkinsChartConst.ReplaceAll(data, []byte(`${1}"`+chart+`"`))
+	out := chartConst.ReplaceAll(data, []byte(`${1}"`+chart+`"`))
 	return true, writeIfChanged(path, out)
 }
 

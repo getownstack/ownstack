@@ -1,89 +1,16 @@
 package catalog
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
-func TestDefaultIsValid(t *testing.T) {
-	if err := Default().Validate(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPatterns(t *testing.T) {
-	provider := func(aspect, id string) Provider {
-		t.Helper()
-		p, ok := Default().Provider(aspect, id)
-		if !ok {
-			t.Fatalf("no provider %s/%s", aspect, id)
-		}
-		return p
-	}
-	param := func(aspect, id, key string) Param {
-		t.Helper()
-		p, ok := provider(aspect, id).Param(key)
-		if !ok {
-			t.Fatalf("no param %s/%s.%s", aspect, id, key)
-		}
-		return p
-	}
-	cases := []struct {
-		param       Param
-		good, wrong []string
-	}{
-		{param("images", "zot", "pullSecretName"),
-			[]string{"registry-credentials", "harbor-robot", "a", "pull.secret-1"},
-			[]string{"", "Harbor", "harbor_robot", "-x", "x-", "a b", "x;rm", strings.Repeat("a", 254)}},
-		{param("images", "registry", "project"),
-			[]string{"product", "apps", "my-org/team", "a__b", "my--app", "a.b_c"},
-			[]string{"", "Apps", "a/", "/a", "a//b", "a_-b", "a___b", "-a", "a b", "a$b"}},
-		{param("images", "zot", "username"),
-			[]string{"ownstack", "me@example.com", "robot$ci", "José"},
-			[]string{"", "a:b", "a b", "a\tb", "a\nb", "a\x7fb"}},
-		{param("compute", "own-vps", "k3sVersion"),
-			[]string{"v1.33.4+k3s1", "1.33.4+k3s1", "v1.33.4", "1.33.4", "v1.33.10+k3s12", "v1.34.0-rc1+k3s1"},
-			[]string{"v1.33", "latest", "v1.33.4+k3s", "v1.33.4-+k3s1", "v1.33.4+k3s1;x", "v1.33.4-rc1;x", "v1.33.4 "}},
-		{param("cicd", "jenkins", "deployBranch"),
-			[]string{"main", "release/1.2", "Feature_x-1"},
-			[]string{"", "-x", "/main", "a b", "main;rm", "a$b", "a&b", "a<b"}},
-		{param("cicd", "jenkins", "extraPlugins"),
-			[]string{"git:5.11.0", "htmlpublisher:429 build-timeout:1.41", "kubernetes:4560.vc25b_83890c34  git:5.12.0", "a.b_c-d:1.0-SNAPSHOT+b"},
-			[]string{"", "git", "git:", ":1", "Git:1", "-git:1", "git:1 ", " git:1", "git:1,slack:2", "git:1;rm", "git:1\nslack:2", "git:1\tslack:2", "git:$(x)", "git:1:2"}},
-		{param("images", "zot", "keepTags"),
-			[]string{"0", "10"},
-			[]string{"-1", "x"}},
-	}
-	for _, tc := range cases {
-		for _, v := range tc.good {
-			if !tc.param.MatchesPattern(v) {
-				t.Errorf("%s: %q should match %s", tc.param.Key, v, tc.param.Pattern)
-			}
-		}
-		for _, v := range tc.wrong {
-			if tc.param.MatchesPattern(v) {
-				t.Errorf("%s: %q should not match %s", tc.param.Key, v, tc.param.Pattern)
-			}
-		}
-	}
+// Whole values only, as Python's re.fullmatch reads it.
+func TestMatchesPattern(t *testing.T) {
 	if !(Param{}).MatchesPattern("anything") {
 		t.Error("a param without a pattern must accept every value")
 	}
-	// Whole values only, as Python's re.fullmatch reads it.
 	alt := Param{Pattern: `^a|b$`}
 	for v, want := range map[string]bool{"a": true, "b": true, "ab": false, "ax": false, "xb": false} {
 		if alt.MatchesPattern(v) != want {
 			t.Errorf("%s matches %q = %v, want %v", alt.Pattern, v, !want, want)
-		}
-	}
-}
-
-func TestPullSecretNameIsSharedAndRequired(t *testing.T) {
-	for id, def := range map[string]string{"harbor": "harbor-robot", "zot": "registry-credentials", "registry": "registry-credentials"} {
-		p, _ := Default().Provider("images", id)
-		param, ok := p.Param("pullSecretName")
-		if !ok || !param.Required || param.Default != def || param.Pattern == "" {
-			t.Errorf("%s pullSecretName = %+v", id, param)
 		}
 	}
 }
@@ -108,7 +35,7 @@ func TestCheckPatternRejectsUnsharedSyntax(t *testing.T) {
 func TestValidateChecksParams(t *testing.T) {
 	base := func(p Param) *Catalog {
 		return &Catalog{
-			Aspects:   []Aspect{{ID: "a"}},
+			Aspects:   []Aspect{{ID: "a", Default: "p"}},
 			Providers: []Provider{{ID: "p", Aspect: "a", Params: []Param{p}}},
 		}
 	}
@@ -127,33 +54,5 @@ func TestValidateChecksParams(t *testing.T) {
 	ok := Param{Key: "k", Kind: KindString, Default: "{domain}", Pattern: `^a$`, PatternHelp: "must be a"}
 	if err := base(ok).Validate(); err != nil {
 		t.Errorf("templated defaults are not pattern-checked: %v", err)
-	}
-}
-
-func TestCICDBranchSettings(t *testing.T) {
-	for _, id := range []string{"gh-actions", "jenkins"} {
-		p, ok := Default().Provider("cicd", id)
-		if !ok {
-			t.Fatalf("no cicd provider %s", id)
-		}
-		env, ok := p.Param(ParamEnvironment)
-		if !ok || env.Kind != KindEnvironment || env.Default != "prod" || !env.Required {
-			t.Errorf("%s environment = %+v", id, env)
-		}
-		branches, ok := p.Param(ParamBranches)
-		if !ok || branches.Kind != KindString || !branches.Advanced || branches.Required || branches.Default != "" || branches.Pattern != "" {
-			t.Errorf("%s branches = %+v", id, branches)
-		}
-		if !strings.Contains(branches.Help, "develop=dev release/*=qa") || !strings.Contains(branches.Help, "<branch>=<environment>") {
-			t.Errorf("%s branches help does not explain the format: %q", id, branches.Help)
-		}
-	}
-	jenkins, _ := Default().Provider("cicd", "jenkins")
-	if deploy, ok := jenkins.Param(ParamDeployBranch); !ok || deploy.Default != DefaultBranch {
-		t.Errorf("jenkins deployBranch = %+v", deploy)
-	}
-	ghActions, _ := Default().Provider("cicd", "gh-actions")
-	if _, ok := ghActions.Param(ParamDeployBranch); ok {
-		t.Error("gh-actions deploys main; the manifest reads a deployBranch param as the default branch")
 	}
 }

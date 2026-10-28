@@ -47,11 +47,10 @@ type Store struct {
 	Save   bool
 	// Generate allows generating secrets marked generatable. Plan and status
 	// turn it off so they never invent values.
-	Generate  bool
-	Overrides map[string]string // env-name keyed values that win over the process environment
-	Getenv    func(string) string
-	In        io.Reader
-	Out       io.Writer
+	Generate bool
+	Getenv   func(string) string
+	In       io.Reader
+	Out      io.Writer
 
 	mu       sync.Mutex
 	file     map[string]string
@@ -117,9 +116,7 @@ func (s *Store) Get(req Request) (string, error) {
 		}
 		value = strings.TrimRight(string(data), "\r\n")
 	case "env":
-		if v := s.Overrides[name]; v != "" {
-			value, persist = v, true
-		} else if v := s.Getenv(name); v != "" {
+		if v := s.Getenv(name); v != "" {
 			value, persist = v, true
 		} else if v := s.fileValue(name); v != "" {
 			value = v

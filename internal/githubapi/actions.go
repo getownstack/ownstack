@@ -115,23 +115,6 @@ func (c *Client) SetVariable(ctx context.Context, owner, repo, name, value strin
 	return err
 }
 
-// DeleteSecret removes an Actions secret; a missing one is not an error.
-func (c *Client) DeleteSecret(ctx context.Context, owner, repo, name string) error {
-	return ignoreNotFound(c.Do(ctx, http.MethodDelete, "/repos/"+owner+"/"+repo+"/actions/secrets/"+name, nil, nil))
-}
-
-// DeleteVariable removes an Actions variable; a missing one is not an error.
-func (c *Client) DeleteVariable(ctx context.Context, owner, repo, name string) error {
-	return ignoreNotFound(c.Do(ctx, http.MethodDelete, "/repos/"+owner+"/"+repo+"/actions/variables/"+name, nil, nil))
-}
-
-func ignoreNotFound(err error) error {
-	if errors.Is(err, ErrNotFound) {
-		return nil
-	}
-	return err
-}
-
 // Run is the latest run of a workflow.
 type Run struct {
 	Status     string `json:"status"`

@@ -165,8 +165,8 @@ log "ok: jenkins-plugin-cli resolves exactly the $count locked plugins on Jenkin
 
 if [ "$boot" = true ]; then
   # Shaped like the provider's JCasC (values.yaml.tmpl) plus the chart's
-  # default security realm. Credentials are referenced, not created, as in
-  # Ownstack, where they come from Kubernetes secrets.
+  # default security realm. Credentials come from Kubernetes secrets in
+  # Ownstack, so none are created here.
   cat >"$work/casc.yaml" <<'EOF'
 jenkins:
   systemMessage: "ownstack verify-jenkins"
@@ -183,12 +183,12 @@ jenkins:
   globalNodeProperties:
     - envVars:
         env:
-          - key: "OWNSTACK_DEPLOY_BRANCH"
-            value: "main"
-          - key: "OWNSTACK_NAMESPACE"
-            value: "prod"
-          - key: "OWNSTACK_BRANCHES"
-            value: "main=prod develop=dev"
+          - key: "OWNSTACK_DOMAIN"
+            value: "example.com"
+          - key: "OWNSTACK_REGISTRY"
+            value: "registry.admin.example.com/apps"
+          - key: "OWNSTACK_ENVIRONMENTS"
+            value: "prod=main dev=develop qa=release/*"
           - key: "OWNSTACK_LIBRARY_REPO"
             value: "https://github.com/getownstack/ownstack.git"
           - key: "OWNSTACK_LIBRARY_REF"
@@ -220,11 +220,6 @@ unclassified:
                 traits:
                   - "gitBranchDiscovery"
                   - "gitTagDiscovery"
-  slackNotifier:
-    botUser: true
-    teamDomain: ""
-    tokenCredentialId: "slack-token"
-    room: "#builds"
 security:
   gitHostKeyVerificationConfiguration:
     sshHostKeyVerificationStrategy: acceptFirstConnectionStrategy
@@ -309,7 +304,7 @@ EOF
 
   # What the provider creates before its Helm release: the namespace, the
   # cluster-admin binding, and the credentials (fake values) that the
-  # Kubernetes credentials provider loads and JCasC refers to.
+  # Kubernetes credentials provider loads for the pipelines.
   kubectl --context "$context" apply -f - >/dev/null <<'EOF'
 apiVersion: v1
 kind: Namespace
@@ -336,18 +331,10 @@ stringData: {username: verify, password: not-a-secret}
 apiVersion: v1
 kind: Secret
 metadata:
-  name: harbor-robot
+  name: registry
   namespace: jenkins
   labels: {jenkins.io/credentials-type: usernamePassword}
 stringData: {username: verify, password: not-a-secret}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: slack-token
-  namespace: jenkins
-  labels: {jenkins.io/credentials-type: secretText}
-stringData: {text: not-a-secret}
 EOF
 
   log "installing chart jenkins $chart into $context with $(basename "$values") (helm install --wait --timeout 15m)"

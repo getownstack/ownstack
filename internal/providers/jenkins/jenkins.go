@@ -19,9 +19,37 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Jenkins plugin pins: space-separated <name>:<version> pairs.
+const pluginsPattern = `^[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+( +[a-z0-9][a-z0-9_.-]*:[A-Za-z0-9_.+-]+)*$`
+
+// Spec is the jenkins provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "jenkins", Aspect: "cicd", Name: "Jenkins", Mono: "JK", Hosting: catalog.SelfHosted,
+	Summary:   "Jenkins with Kubernetes pod agents and the shared Ownstack pipeline library.",
+	Resources: catalog.Resources{MemoryMiB: 1500, DiskGiB: 10},
+	Params: []catalog.Param{
+		{Key: "host", Label: "Host", Kind: catalog.KindHostname, Default: "jenkins.{adminDomain}"},
+		{Key: "adminPassword", Label: "Admin password", Kind: catalog.KindSecret, Required: true, Generate: true, Env: "JENKINS_ADMIN_PASSWORD",
+			Help: "Generated on the server when not provided."},
+		{Key: "orgFolder", Label: "Organization folder", Kind: catalog.KindString, Default: "Repositories", Advanced: true},
+		{Key: "repoFilter", Label: "Repository filter", Kind: catalog.KindString, Default: "*", Advanced: true,
+			Help: "Space-separated wildcards, such as app-* api-*. Matching repos with a Jenkinsfile get a pipeline."},
+		{Key: "jenkinsfilePath", Label: "Jenkinsfile path", Kind: catalog.KindString, Default: "infrastructure/Jenkinsfile", Advanced: true},
+		{Key: "libraryRef", Label: "Ownstack library ref", Kind: catalog.KindString, Advanced: true,
+			Help: "Branch, or ownstackctl-vX.Y.Z release tag, of getownstack/ownstack that Jenkins loads the pipeline and Helm libraries from. " +
+				"Empty: the tag of the ownstackctl release running on the server, or main for development builds."},
+		{Key: "chartVersion", Label: "Chart version", Kind: catalog.KindString, Default: ChartVersion, Advanced: true,
+			Help: "jenkins/jenkins Helm chart. Each ownstackctl release locks Jenkins and every plugin for its default chart; with another chart the locked plugins may not start."},
+		{Key: "extraPlugins", Label: "Extra plugins", Kind: catalog.KindString, Advanced: true, Placeholder: "build-timeout:1.41 ansicolor:542.v03d235fee02d",
+			Help:    "Plugins to add to the locked set, as space-separated name:version pairs; versions are required so installs stay reproducible. A locked plugin listed here gets this version instead. Dependencies missing from the locked set are installed at the oldest version the plugin accepts, so list them too.",
+			Pattern: pluginsPattern, PatternHelp: "must be space-separated name:version pairs, such as build-timeout:1.41"},
+	},
+}
 
 const (
 	namespace = "jenkins"
@@ -31,13 +59,8 @@ const (
 	// Credential IDs referenced by the shared pipeline library.
 	vcsCredentialID      = "github-pat"
 	registryCredentialID = "harbor-robot"
-	alertsCredentialID   = "slack-token"
 
-	// The shared library's defaults when Jenkins global env does not set
-	// OWNSTACK_DEPLOY_BRANCH or OWNSTACK_NAMESPACE.
-	defaultDeployBranch = "main"
-	defaultNamespace    = "prod"
-	defaultGitHubAPI    = "https://api.github.com"
+	defaultGitHubAPI = "https://api.github.com"
 )
 
 //go:embed values.yaml.tmpl
@@ -108,74 +131,6 @@ func chartMismatch(rt *stack.Runtime) string {
 		return fmt.Sprintf("plugins are locked for chart %s / Jenkins %s; a different chart may not start", pluginLock.Chart, pluginLock.Jenkins)
 	}
 	return ""
-}
-
-// pluginSummary describes the Jenkins version and plugin set, for plan.
-func pluginSummary(rt *stack.Runtime) string {
-	summary := fmt.Sprintf("Jenkins %s, %d locked plugins", pluginLock.Jenkins, len(pluginLock.Plugins))
-	if extra, err := extraPlugins(rt); err == nil && len(extra) > 0 {
-		var overrides []string
-		for _, e := range extra {
-			if v, ok := pluginLock.Version(e.Name); ok && v != e.Version {
-				overrides = append(overrides, fmt.Sprintf("%s %s → %s", e.Name, v, e.Version))
-			}
-		}
-		summary += fmt.Sprintf(" (+%d extra", len(extra))
-		if len(overrides) > 0 {
-			summary += "; " + strings.Join(overrides, ", ")
-		}
-		summary += ")"
-	}
-	if warning := chartMismatch(rt); warning != "" {
-		summary += "; warning: " + warning
-	}
-	return summary
-}
-
-func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	var steps []stack.Step
-	if !rt.Exec.Has("docker") {
-		steps = append(steps, stack.Step{Action: "install", Target: "docker", Detail: "agent pods build images through the host Docker socket"})
-	}
-	steps = append(steps,
-		stack.Step{Action: "ensure", Target: "credentials", Detail: credentialSummary(rt)},
-		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
-		stack.Step{Action: "ensure", Target: "plugins", Detail: pluginSummary(rt)},
-		stack.Step{Action: "configure", Target: "pipeline libraries", Detail: libraryDetail(rt)},
-		folderStep(ctx, rt),
-	)
-	return steps
-}
-
-// folderStep plans the organization folder, and says what changes when an
-// existing folder's managed fields differ from the manifest.
-func folderStep(ctx context.Context, rt *stack.Runtime) stack.Step {
-	folder := rt.Setting("orgFolder")
-	step := stack.Step{Action: "ensure", Target: "organization folder " + folder,
-		Detail: fmt.Sprintf("discovers %s/%s with %s; %s",
-			rt.Out.VCS.Owner, rt.Setting("repoFilter"), rt.Setting("jenkinsfilePath"), deploySummary(branchMappings(rt)))}
-	password, err := rt.Secret("adminPassword")
-	if err != nil {
-		return step
-	}
-	desired, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
-	if err != nil {
-		return step
-	}
-	api, err := newClient(rt, password)
-	if err != nil {
-		return step
-	}
-	current, exists, err := api.get(ctx, "/job/"+url.PathEscape(folder)+"/config.xml")
-	if err != nil || !exists {
-		return step
-	}
-	changes, ok, err := folderChanges(current, desired)
-	if err != nil || !ok || len(changes) == 0 {
-		return step
-	}
-	return stack.Step{Action: "update", Target: "organization folder " + folder,
-		Detail: strings.Join(changes, ", ") + "; Jenkins then deletes the jobs and build history of repos that no longer match"}
 }
 
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -318,41 +273,18 @@ func convergeFolder(ctx context.Context, rt *stack.Runtime, api *client, folder,
 	return nil
 }
 
-// deployBranch is the branch Jenkins builds automatically and deploys from.
-func deployBranch(rt *stack.Runtime) string {
-	if b := rt.Setting("deployBranch"); b != "" {
-		return b
-	}
-	return defaultDeployBranch
-}
-
-// deployNamespace is the environment the deploy branch deploys into: the
-// production environment.
-func deployNamespace(rt *stack.Runtime) string {
-	if ns := rt.Setting("environment"); ns != "" {
-		return ns
-	}
-	return defaultNamespace
-}
-
 // branchMapping maps a branch, a name or a glob where '*' matches any run of
 // characters including '/', to the environment it deploys into.
 type branchMapping struct{ Branch, Environment string }
 
-// branchMappings is the effective mapping: the deploy branch to the
-// production environment, then the branches setting's <branch>=<environment>
-// pairs in order. The first match wins, so a pair whose branch is already
-// mapped is dropped; malformed pairs (which validation rejects) are skipped.
+// branchMappings are the environments' branches in order, the first match
+// winning: the production environment's first when it has one.
 func branchMappings(rt *stack.Runtime) []branchMapping {
-	mappings := []branchMapping{{deployBranch(rt), deployNamespace(rt)}}
-	seen := map[string]bool{mappings[0].Branch: true}
-	for _, pair := range strings.Fields(rt.Setting("branches")) {
-		branch, environment, ok := strings.Cut(pair, "=")
-		if !ok || branch == "" || environment == "" || strings.Contains(environment, "=") || seen[branch] {
-			continue
+	var mappings []branchMapping
+	for _, env := range rt.Environments() {
+		if env.Branch != "" {
+			mappings = append(mappings, branchMapping{env.Branch, env.Name})
 		}
-		seen[branch] = true
-		mappings = append(mappings, branchMapping{branch, environment})
 	}
 	return mappings
 }
@@ -379,26 +311,13 @@ func globRegexp(glob string) string {
 }
 
 // triggerBranches is the organization folder's NoTrigger regular expression:
-// every mapped branch, so each one builds and deploys on push. With only the
-// deploy branch it is the quoted deploy branch, as before branch mappings.
+// every mapped branch, so each one builds and deploys on push.
 func triggerBranches(mappings []branchMapping) string {
 	alternatives := make([]string, len(mappings))
 	for i, m := range mappings {
 		alternatives[i] = globRegexp(m.Branch)
 	}
 	return strings.Join(alternatives, "|")
-}
-
-// deploySummary describes which branches deploy where, for plan.
-func deploySummary(mappings []branchMapping) string {
-	if len(mappings) == 1 {
-		return fmt.Sprintf("builds %s automatically and deploys it to %s", mappings[0].Branch, mappings[0].Environment)
-	}
-	pairs := make([]string, len(mappings))
-	for i, m := range mappings {
-		pairs[i] = m.Branch + " to " + m.Environment
-	}
-	return "builds and deploys automatically " + strings.Join(pairs, ", ")
 }
 
 func orgFolderData(rt *stack.Runtime) map[string]string {
@@ -482,8 +401,7 @@ func folderChanges(current, desired string) (changes []string, ok bool, err erro
 	return changes, true, nil
 }
 
-// libraryDetail says where pipelines take the Ownstack libraries from, for
-// plan and apply.
+// libraryDetail says where pipelines take the Ownstack libraries from.
 func libraryDetail(rt *stack.Runtime) string {
 	return fmt.Sprintf("jenkins_pipeline_library and common_helm_library from %s@%s", stack.LibraryRepo, rt.LibraryRef())
 }
@@ -508,34 +426,27 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 		{"OWNSTACK_DOMAIN", rt.Domain()},
 		// Libraries without branch mappings deploy only this branch, into
 		// this namespace.
-		{"OWNSTACK_DEPLOY_BRANCH", deployBranch(rt)},
-		{"OWNSTACK_NAMESPACE", deployNamespace(rt)},
+		{"OWNSTACK_DEPLOY_BRANCH", rt.Production().Branch},
+		{"OWNSTACK_NAMESPACE", rt.Production().Name},
 		// Newer libraries deploy each mapped branch into its environment
 		// and tell the Helm library which environment is production.
 		{"OWNSTACK_BRANCHES", branchesEnv(branchMappings(rt))},
-		{"OWNSTACK_PRODUCTION_ENVIRONMENT", deployNamespace(rt)},
-	}
-	var slack *stack.AlertsOutput
-	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
-		slack = a
-		env = append(env, envVar{"OWNSTACK_SLACK_CHANNEL", a.Channel})
+		{"OWNSTACK_PRODUCTION_ENVIRONMENT", rt.Production().Name},
 	}
 	return map[string]any{
-		"Host":               rt.Setting("host"),
-		"ImageTag":           pluginLock.ImageTag(),
-		"Plugins":            installPlugins(rt),
-		"Password":           password,
-		"Annotations":        rt.Out.Ingress.Annotations,
-		"GlobalEnv":          env,
-		"LibraryRepoURL":     stack.LibraryRepoURL,
-		"LibraryRef":         ref,
-		"Slack":              slack,
-		"AlertsCredentialID": alertsCredentialID,
+		"Host":           rt.Setting("host"),
+		"ImageTag":       pluginLock.ImageTag(),
+		"Plugins":        installPlugins(rt),
+		"Password":       password,
+		"Annotations":    rt.Out.Ingress.Annotations,
+		"GlobalEnv":      env,
+		"LibraryRepoURL": stack.LibraryRepoURL,
+		"LibraryRef":     ref,
 	}
 }
 
-// applyCredentials turns the VCS, registry, and alerts contract outputs into
-// Jenkins credentials through the kubernetes-credentials-provider plugin.
+// applyCredentials turns the VCS and registry contract outputs into Jenkins
+// credentials through the kubernetes-credentials-provider plugin.
 func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
 	userPass := map[string]string{"jenkins.io/credentials-type": "usernamePassword"}
 	images := rt.Out.Images
@@ -543,26 +454,18 @@ func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
 		return fmt.Errorf("the registry did not provide a push credential; apply the images aspect first")
 	}
 	creds := []struct {
-		name   string
-		data   map[string]string
-		labels map[string]string
+		name string
+		data map[string]string
 	}{
-		{vcsCredentialID, map[string]string{"username": rt.Out.VCS.Username, "password": rt.Out.VCS.Token}, userPass},
-		{registryCredentialID, map[string]string{"username": shellEscapeDollar(images.PushUsername), "password": shellEscapeDollar(images.PushPassword)}, userPass},
-	}
-	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
-		creds = append(creds, struct {
-			name   string
-			data   map[string]string
-			labels map[string]string
-		}{alertsCredentialID, map[string]string{"text": a.Token}, map[string]string{"jenkins.io/credentials-type": "secretText"}})
+		{vcsCredentialID, map[string]string{"username": rt.Out.VCS.Username, "password": rt.Out.VCS.Token}},
+		{registryCredentialID, map[string]string{"username": shellEscapeDollar(images.PushUsername), "password": shellEscapeDollar(images.PushPassword)}},
 	}
 	for _, c := range creds {
-		if err := rt.Kube.ApplySecret(ctx, namespace, c.name, "", c.data, c.labels); err != nil {
+		if err := rt.Kube.ApplySecret(ctx, namespace, c.name, "", c.data, userPass); err != nil {
 			return fmt.Errorf("credential %s: %w", c.name, err)
 		}
 	}
-	rt.Logf("Jenkins credentials ready: %s", credentialSummary(rt))
+	rt.Logf("Jenkins credentials ready: %s, %s", vcsCredentialID, registryCredentialID)
 	return nil
 }
 
@@ -570,14 +473,6 @@ func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
 // plugin's container() steps, which run commands through a shell: Harbor's
 // robot$name username would otherwise reach docker login as "robot".
 func shellEscapeDollar(s string) string { return strings.ReplaceAll(s, "$", `\$`) }
-
-func credentialSummary(rt *stack.Runtime) string {
-	ids := []string{vcsCredentialID, registryCredentialID}
-	if a := rt.Out.Alerts; a != nil && a.Kind == "slack" {
-		ids = append(ids, alertsCredentialID)
-	}
-	return strings.Join(ids, ", ")
-}
 
 func clusterAdminBinding() map[string]any {
 	return map[string]any{
@@ -725,20 +620,4 @@ func firstLine(s string) string {
 		s = s[:200]
 	}
 	return s
-}
-
-func (Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
-	_, ok := rt.Kube.Release(ctx, release, namespace)
-	return ok
-}
-
-// Remove uninstalls the release and its namespace, including stored data.
-func (Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
-	if err := rt.Kube.HelmUninstall(ctx, release, namespace); err != nil {
-		return err
-	}
-	if err := rt.Kube.Delete(ctx, "clusterrolebinding", "jenkins-cluster-admin"); err != nil {
-		return err
-	}
-	return rt.Kube.Delete(ctx, "namespace", namespace)
 }

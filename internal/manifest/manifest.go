@@ -8,7 +8,6 @@ package manifest
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net"
 	"net/mail"
@@ -32,7 +31,8 @@ const (
 	DefaultAdminSubdomain = "admin"
 )
 
-var DefaultEnvironments = []string{"dev", "qa", "prod"}
+// DefaultEnvironments apply when spec.environments is empty.
+var DefaultEnvironments = []string{"prod=main", "dev=develop", "qa=release/*"}
 
 // Environments become namespaces that CI deploy credentials manage, so they
 // must not be Kubernetes' own namespaces or those of platform services.
@@ -55,10 +55,6 @@ func ReservedEnvironment(name string) bool {
 	return false
 }
 
-// ErrNotV1 is returned for files that are not ownstack.io/v1 manifests, such
-// as the design metadata written by early versions of the Ownstack designer.
-var ErrNotV1 = errors.New("not an ownstack.io/v1 manifest")
-
 type Manifest struct {
 	APIVersion string   `yaml:"apiVersion"`
 	Kind       string   `yaml:"kind"`
@@ -74,9 +70,10 @@ type Spec struct {
 	Domain string `yaml:"domain"`
 	// AdminSubdomain places platform services under <svc>.<adminSubdomain>.<domain>.
 	// nil means the default; an empty string places them directly under the domain.
-	AdminSubdomain *string               `yaml:"adminSubdomain,omitempty"`
-	Environments   []string              `yaml:"environments,omitempty"`
-	Components     map[string]*Component `yaml:",inline"`
+	AdminSubdomain *string `yaml:"adminSubdomain,omitempty"`
+	// Environments are <name>[=<branch glob>] items; see Manifest.Environments.
+	Environments []string              `yaml:"environments,omitempty"`
+	Components   map[string]*Component `yaml:",inline"`
 }
 
 type Component struct {
@@ -88,15 +85,6 @@ type Component struct {
 }
 
 func Parse(data []byte) (*Manifest, error) {
-	var probe struct {
-		APIVersion string `yaml:"apiVersion"`
-	}
-	if err := yaml.Unmarshal(data, &probe); err != nil {
-		return nil, fmt.Errorf("parse manifest: %w", err)
-	}
-	if probe.APIVersion != APIVersion {
-		return nil, ErrNotV1
-	}
 	var m Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
@@ -135,7 +123,25 @@ func (m *Manifest) AdminDomain() string {
 	return m.Spec.Domain
 }
 
-func (m *Manifest) Environments() []string {
+// Environment is one deploy environment: its name, which is also its
+// namespace, and the branch glob that deploys into it (empty when no branch
+// does). In a glob, * matches any characters, / included.
+type Environment struct{ Name, Branch string }
+
+// Environments parses spec.environments, whose items are <name> or
+// <name>=<branch glob>. The first is production. A branch deploys into the
+// first environment whose glob matches it.
+func (m *Manifest) Environments() []Environment {
+	items := m.environmentItems()
+	out := make([]Environment, len(items))
+	for i, item := range items {
+		name, branch, _ := strings.Cut(item, "=")
+		out[i] = Environment{Name: name, Branch: branch}
+	}
+	return out
+}
+
+func (m *Manifest) environmentItems() []string {
 	if len(m.Spec.Environments) == 0 {
 		return DefaultEnvironments
 	}
@@ -201,8 +207,7 @@ var (
 	envNameRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
-// Validate checks the manifest against the catalog. Only available providers
-// pass: planned providers are part of the designer, not of an applicable stack.
+// Validate checks the manifest against the catalog.
 func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 	var issues []Issue
 	add := func(path, format string, args ...any) {
@@ -224,18 +229,29 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 	if sub := m.AdminSubdomain(); sub != "" && !nameRe.MatchString(sub) {
 		add("spec.adminSubdomain", "must be a lowercase DNS label or empty")
 	}
-	seenEnv := map[string]bool{}
-	for i, env := range m.Environments() {
+	seenEnv, seenBranch := map[string]bool{}, map[string]bool{}
+	for i, item := range m.environmentItems() {
 		path := fmt.Sprintf("spec.environments[%d]", i)
-		if !nameRe.MatchString(env) {
-			add(path, "must be a lowercase DNS label")
-		} else if ReservedEnvironment(env) {
+		env, branch, mapped := strings.Cut(item, "=")
+		switch {
+		case !nameRe.MatchString(env):
+			add(path, "%q must be <name> or <name>=<branch>, with a lowercase DNS label as the name", item)
+		case ReservedEnvironment(env):
 			add(path, "%q is reserved for Kubernetes or the Ownstack platform; choose another name", env)
-		}
-		if seenEnv[env] {
+		case seenEnv[env]:
 			add(path, "duplicate environment %q", env)
 		}
 		seenEnv[env] = true
+		if !mapped {
+			continue
+		}
+		switch {
+		case !branchRe.MatchString(branch):
+			add(path, "branch %q must be a branch name or a glob of letters, digits, '.', '_', '-', '/' and '*'", branch)
+		case seenBranch[branch]:
+			add(path, "branch %q already deploys into an earlier environment", branch)
+		}
+		seenBranch[branch] = true
 	}
 
 	for _, aspect := range sortedKeys(m.Spec.Components) {
@@ -258,16 +274,6 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 			add(base+".provider", "unknown %s provider %q", aspect.ID, c.Provider)
 			continue
 		}
-		if !p.Available {
-			add(base+".provider", "%s is planned but not implemented yet", p.Name)
-			continue
-		}
-		for _, req := range p.Requires {
-			if _, ok := m.Component(req); !ok {
-				add(base, "%s needs a %s provider", p.Name, req)
-			}
-		}
-
 		settings := m.Settings(cat, aspect.ID)
 		for _, key := range sortedKeys(c.Settings) {
 			param, ok := p.Param(key)
@@ -299,13 +305,8 @@ func (m *Manifest) Validate(cat *catalog.Catalog) []Issue {
 				}
 				continue
 			}
-			if msg := checkKind(param, value, m.Environments()); msg != "" {
+			if msg := checkKind(param, value); msg != "" {
 				add(path, "%s", msg)
-			}
-			if param.Key == catalog.ParamBranches {
-				for _, msg := range checkBranches(value, defaultBranch(p, settings), m.Environments()) {
-					add(path, "%s", msg)
-				}
 			}
 		}
 	}
@@ -327,7 +328,7 @@ func checkRef(ref string) error {
 	return nil
 }
 
-func checkKind(param catalog.Param, value string, environments []string) string {
+func checkKind(param catalog.Param, value string) string {
 	switch param.Kind {
 	case catalog.KindHostname:
 		if !hostnameRe.MatchString(value) {
@@ -349,14 +350,6 @@ func checkKind(param catalog.Param, value string, environments []string) string 
 		if _, err := strconv.ParseBool(value); err != nil {
 			return "must be true or false"
 		}
-	case catalog.KindEnum:
-		if !slices.Contains(param.Enum, value) {
-			return "must be one of " + strings.Join(param.Enum, ", ")
-		}
-	case catalog.KindEnvironment:
-		if !slices.Contains(environments, value) {
-			return "must be one of spec.environments (" + strings.Join(environments, ", ") + ")"
-		}
 	}
 	if !param.MatchesPattern(value) {
 		return param.PatternHelp
@@ -368,46 +361,6 @@ func checkKind(param catalog.Param, value string, environments []string) string 
 // including '/'. '*' is its only special character: the workflow matches it as
 // a bash case pattern, and Jenkins turns it into '.*' and quotes the rest.
 var branchRe = regexp.MustCompile(`^[A-Za-z0-9*][A-Za-z0-9._/*-]*$`)
-
-// defaultBranch is the branch a cicd provider deploys into its environment
-// setting, the production environment: its deployBranch setting when it has
-// one, else main.
-func defaultBranch(p catalog.Provider, settings map[string]string) string {
-	if _, ok := p.Param(catalog.ParamDeployBranch); ok && settings[catalog.ParamDeployBranch] != "" {
-		return settings[catalog.ParamDeployBranch]
-	}
-	return catalog.DefaultBranch
-}
-
-// checkBranches checks a branches setting: <branch>=<environment> pairs
-// separated by spaces, tabs, or newlines (where bash splits them), each
-// branch listed once and never the default branch, which always maps to the
-// environment setting. It returns one message per problem.
-func checkBranches(value, defaultBranch string, environments []string) []string {
-	var msgs []string
-	seen := map[string]bool{}
-	pairs := strings.FieldsFunc(value, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' })
-	for _, pair := range pairs {
-		branch, env, ok := strings.Cut(pair, "=")
-		if !ok || strings.Contains(env, "=") {
-			msgs = append(msgs, fmt.Sprintf("%q must be one <branch>=<environment> pair, such as develop=dev", pair))
-			continue
-		}
-		switch {
-		case !branchRe.MatchString(branch):
-			msgs = append(msgs, fmt.Sprintf("branch %q must be a branch name or a glob of letters, digits, '.', '_', '-', '/' and '*'", branch))
-		case branch == defaultBranch:
-			msgs = append(msgs, fmt.Sprintf("branch %q always deploys into the production environment (the environment setting); remove it here", branch))
-		case seen[branch]:
-			msgs = append(msgs, fmt.Sprintf("branch %q is listed twice", branch))
-		}
-		seen[branch] = true
-		if !slices.Contains(environments, env) {
-			msgs = append(msgs, fmt.Sprintf("environment %q of %q must be one of spec.environments (%s)", env, pair, strings.Join(environments, ", ")))
-		}
-	}
-	return msgs
-}
 
 // ── Writing ───────────────────────────────────────────────────────────────────
 

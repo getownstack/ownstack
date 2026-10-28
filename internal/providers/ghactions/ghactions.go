@@ -29,12 +29,27 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
+// Spec is the gh-actions provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "gh-actions", Aspect: "cicd", Name: "GitHub Actions", Mono: "GA", Hosting: catalog.External,
+	Summary: "Builds run on GitHub's runners, so the server only runs your apps. Each app repo gets a small ownstack.yml workflow that builds, pushes to your registry, and deploys with a namespace-scoped credential.",
+	Params: []catalog.Param{
+		{Key: "repoFilter", Label: "Repository filter", Kind: catalog.KindString, Default: "*", Advanced: true,
+			Help: "Space-separated wildcards, such as app-* api-*. Matching repos that contain .github/workflows/ownstack.yml get the deploy credential."},
+		{Key: "libraryRef", Label: "Ownstack library ref", Kind: catalog.KindString, Advanced: true,
+			Help: "Branch or tag of getownstack/ownstack the workflow takes the Helm library from. " +
+				"Empty: the tag of the ownstackctl release running on the server, or main for development builds."},
+		{Key: "additionalOwners", Label: "Additional owners", Kind: catalog.KindString, Advanced: true,
+			Help: "Comma-separated GitHub users or organizations whose repos also deploy here. The token must be able to administer them."},
+	},
+}
+
 const (
 	systemNamespace = "ownstack-system"
 	deployer        = "ownstack-deployer"
 	tokenSecret     = "ownstack-deployer-token"
 	// targetsConfigMap records the repos the last apply configured, so status
-	// and removal do not have to scan every repo of every owner.
+	// does not have to scan every repo of every owner.
 	targetsConfigMap = "ownstack-ci-targets"
 	workflowFile     = "ownstack.yml"
 	workflowPath     = ".github/workflows/" + workflowFile
@@ -62,19 +77,6 @@ func workflowMarker(content []byte) int {
 	return n
 }
 
-// The secrets and variables ownstackctl manages in app repos. OWNSTACK_RUNNER
-// is the customer's own and is never touched.
-var (
-	repoSecretNames   = []string{"OWNSTACK_KUBECONFIG", "OWNSTACK_REGISTRY_PASSWORD"}
-	repoVariableNames = []string{"OWNSTACK_REGISTRY", "OWNSTACK_REGISTRY_USERNAME", "OWNSTACK_IMAGE_PROJECT", "OWNSTACK_PULL_SECRET",
-		"OWNSTACK_DOMAIN", "OWNSTACK_NAMESPACE", "OWNSTACK_LIBRARY_REF", "OWNSTACK_PLATFORM",
-		"OWNSTACK_BRANCHES", "OWNSTACK_ENVIRONMENTS", "OWNSTACK_PRODUCTION_ENVIRONMENT"}
-)
-
-// defaultBranch always deploys to the environment setting (the production
-// environment); the branches setting maps other branches.
-const defaultBranch = "main"
-
 type Provider struct {
 	// APIURL overrides the GitHub API in tests.
 	APIURL string
@@ -82,36 +84,8 @@ type Provider struct {
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	rt.Out.CICD = &stack.CICDOutput{URL: "https://github.com/" + rt.Out.VCS.Owner}
-	if _, err := parseRepoFilter(rt.Setting("repoFilter")); err != nil {
-		return err
-	}
-	_, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
+	_, err := parseRepoFilter(rt.Setting("repoFilter"))
 	return err
-}
-
-func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	steps := []stack.Step{
-		{Action: "ensure", Target: "deploy identity", Detail: fmt.Sprintf("service account %s/%s, may only change %s", systemNamespace, deployer, strings.Join(rt.Manifest.Environments(), ", "))},
-		{Action: "configure", Target: "app pipelines", Detail: fmt.Sprintf("Helm library %s@%s, images for %s, deploys %s",
-			stack.LibraryRepo, rt.LibraryRef(), platform(nodeArch(rt)), deploysDetail(rt))},
-	}
-	if rt.Out.VCS.Token == "" {
-		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: "repos with " + workflowPath})
-	}
-	repos, failed, err := p.targetRepos(ctx, rt)
-	if err != nil {
-		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: err.Error()})
-	}
-	for _, r := range repos {
-		steps = append(steps, stack.Step{Action: "configure", Target: r.String(), Detail: "OWNSTACK_* secrets and variables"})
-	}
-	for _, f := range failed {
-		steps = append(steps, stack.Step{Action: "verify", Target: f.String(), Detail: "cannot check for " + workflowPath + ": " + f.err.Error()})
-	}
-	if demo := rt.Out.VCS.DemoRepo; demo != "" {
-		steps = append(steps, stack.Step{Action: "ensure", Target: rt.Out.VCS.Owner + "/" + demo, Detail: "commit " + workflowPath + " (first build deploys the demo)"})
-	}
-	return steps
 }
 
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -148,27 +122,19 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		"OWNSTACK_KUBECONFIG":        kubeconfig,
 		"OWNSTACK_REGISTRY_PASSWORD": rt.Out.Images.PushPassword,
 	}
-	branches, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
-	if err != nil {
-		return err
-	}
-	variables := repoVariables(rt.Out.Images, rt.Domain(), deployTargets{
-		production:   rt.Setting("environment"),
-		branches:     branches,
-		environments: rt.Manifest.Environments(),
-	}, ref, nodeArch(rt))
+	variables := repoVariables(rt.Out.Images, rt.Domain(), rt.Environments(), ref, nodeArch(rt))
 	for _, t := range repos {
 		if err := configureRepo(ctx, gh, t, secrets, variables); err != nil {
 			return fmt.Errorf("%s: %w", t, err)
 		}
 		rt.Logf("GitHub Actions configured for %s", t)
 	}
-	// Recorded as soon as the repos hold the credentials, so status and
-	// removal find them even when committing the demo workflow fails.
+	// Recorded as soon as the repos hold the credentials, so status finds
+	// them even when committing the demo workflow fails.
 	if err := recordTargets(ctx, rt, repos, failed); err != nil {
 		return err
 	}
-	rt.Logf("App pipelines take the Helm library from %s@%s, build images for %s, and deploy %s", stack.LibraryRepo, ref, platform(nodeArch(rt)), deploysDetail(rt))
+	rt.Logf("App pipelines take the Helm library from %s@%s, build images for %s, and deploy %s", stack.LibraryRepo, ref, platform(nodeArch(rt)), deploysDetail(rt.Environments()))
 	if demo {
 		info, err := gh.Repo(ctx, rt.Out.VCS.Owner, demoRepo)
 		if err != nil {
@@ -211,8 +177,12 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 			return append(checks, stack.Check{Name: "pipelines", State: stack.Unknown, Detail: err.Error()})
 		}
 	}
+	branch := rt.Production().Branch
+	if strings.Contains(branch, "*") {
+		branch = ""
+	}
 	for _, t := range repos {
-		checks = append(checks, pipelineCheck(ctx, gh, t))
+		checks = append(checks, pipelineCheck(ctx, gh, t, branch))
 	}
 	for _, f := range failed {
 		checks = append(checks, stack.Check{Name: "pipeline " + f.String(), State: stack.Unknown, Detail: f.err.Error()})
@@ -222,7 +192,7 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 
 // pipelineCheck reports a repo's latest run, and warns when its workflow is
 // older than the one this ownstackctl ships.
-func pipelineCheck(ctx context.Context, gh *githubapi.Client, t target) stack.Check {
+func pipelineCheck(ctx context.Context, gh *githubapi.Client, t target, branch string) stack.Check {
 	name := "pipeline " + t.String()
 	content, err := gh.FileContent(ctx, t.owner, t.name, workflowPath)
 	if errors.Is(err, githubapi.ErrNotFound) {
@@ -231,10 +201,10 @@ func pipelineCheck(ctx context.Context, gh *githubapi.Client, t target) stack.Ch
 	if err != nil {
 		return stack.Check{Name: name, State: stack.Unknown, Detail: err.Error()}
 	}
-	// Runs on the default branch: since ownstack-workflow 3 every push runs the
-	// workflow, and pushes to unmapped branches only resolve, so they would
-	// hide a failed deploy.
-	run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile, catalog.DefaultBranch)
+	// Runs on the production branch: since ownstack-workflow 3 every push runs
+	// the workflow, and pushes to unmapped branches only resolve, so they would
+	// hide a failed deploy. A glob cannot be filtered on: then any run counts.
+	run, err := gh.LatestRun(ctx, t.owner, t.name, workflowFile, branch)
 	var check stack.Check
 	switch {
 	case err != nil:
@@ -392,24 +362,16 @@ func platform(arch string) string {
 // whose * matches any characters, / included) to an environment.
 type branchMapping struct{ pattern, environment string }
 
-// branchMap is the effective mapping, first match wins: the default branch to
-// the production environment, then the branches setting's
-// space-separated <branch>=<environment> pairs in order. The manifest
-// validator checks the pairs against spec.environments; this only rejects
-// what the workflow could not read.
-func branchMap(production, setting string) ([]branchMapping, error) {
-	out := []branchMapping{{defaultBranch, production}}
-	for _, pair := range strings.Fields(setting) {
-		pattern, env, ok := strings.Cut(pair, "=")
-		if !ok || pattern == "" || env == "" || strings.Contains(env, "=") {
-			return nil, fmt.Errorf("branches: %q is not <branch>=<environment>", pair)
+// branchMap is the mapping the workflow reads, first match wins: every
+// environment that has a branch, in order.
+func branchMap(environments []stack.Environment) []branchMapping {
+	var out []branchMapping
+	for _, env := range environments {
+		if env.Branch != "" {
+			out = append(out, branchMapping{env.Branch, env.Name})
 		}
-		if pattern == defaultBranch {
-			return nil, fmt.Errorf("branches: %s always deploys to the environment setting (%s); do not list it", defaultBranch, production)
-		}
-		out = append(out, branchMapping{pattern, env})
 	}
-	return out, nil
+	return out
 }
 
 // formatBranches is OWNSTACK_BRANCHES: the mapping as space-separated pairs,
@@ -422,11 +384,11 @@ func formatBranches(mapping []branchMapping) string {
 	return strings.Join(pairs, " ")
 }
 
-// deploysDetail says where pushes deploy, for plan.
-func deploysDetail(rt *stack.Runtime) string {
-	mapping, err := branchMap(rt.Setting("environment"), rt.Setting("branches"))
-	if err != nil {
-		return "nowhere: " + err.Error()
+// deploysDetail says where pushes deploy.
+func deploysDetail(environments []stack.Environment) string {
+	mapping := branchMap(environments)
+	if len(mapping) == 0 {
+		return "nothing on push"
 	}
 	parts := make([]string, len(mapping))
 	for i, m := range mapping {
@@ -435,18 +397,15 @@ func deploysDetail(rt *stack.Runtime) string {
 	return strings.Join(parts, ", ")
 }
 
-// deployTargets are where app repos deploy: the production environment (the
-// environment setting, where the default branch goes), the branch mapping,
-// and every environment a manual run may pick.
-type deployTargets struct {
-	production   string
-	branches     []branchMapping
-	environments []string
-}
-
 // repoVariables are the Actions variables the workflow reads; the registry
-// password and the deploy kubeconfig are secrets instead.
-func repoVariables(images *stack.ImagesOutput, domain string, deploy deployTargets, libraryRef, arch string) map[string]string {
+// password and the deploy kubeconfig are secrets instead. environments[0]
+// is production.
+func repoVariables(images *stack.ImagesOutput, domain string, environments []stack.Environment, libraryRef, arch string) map[string]string {
+	names := make([]string, len(environments))
+	for i, env := range environments {
+		names[i] = env.Name
+	}
+	production := environments[0].Name
 	variables := map[string]string{
 		"OWNSTACK_REGISTRY":          images.Host,
 		"OWNSTACK_REGISTRY_USERNAME": images.PushUsername,
@@ -454,10 +413,10 @@ func repoVariables(images *stack.ImagesOutput, domain string, deploy deployTarge
 		"OWNSTACK_PULL_SECRET":       images.PullSecretName,
 		"OWNSTACK_DOMAIN":            domain,
 		// Workflows before ownstack-workflow 3 deploy main here.
-		"OWNSTACK_NAMESPACE":              deploy.production,
-		"OWNSTACK_PRODUCTION_ENVIRONMENT": deploy.production,
-		"OWNSTACK_BRANCHES":               formatBranches(deploy.branches),
-		"OWNSTACK_ENVIRONMENTS":           strings.Join(deploy.environments, " "),
+		"OWNSTACK_NAMESPACE":              production,
+		"OWNSTACK_PRODUCTION_ENVIRONMENT": production,
+		"OWNSTACK_BRANCHES":               formatBranches(branchMap(environments)),
+		"OWNSTACK_ENVIRONMENTS":           strings.Join(names, " "),
 		"OWNSTACK_LIBRARY_REF":            libraryRef,
 	}
 	// Without it the workflow builds linux/amd64.
@@ -526,7 +485,7 @@ func targetsObject(targets []target) map[string]any {
 	}
 }
 
-// recordTargets saves the configured repos for status and removal. Repos
+// recordTargets saves the configured repos for status. Repos
 // that could not be checked this time stay recorded; repos that dropped out
 // are reported, because they still hold the deploy credential.
 func recordTargets(ctx context.Context, rt *stack.Runtime, configured []target, failed []repoError) error {
@@ -599,10 +558,10 @@ func (p Provider) ensureDeployer(ctx context.Context, rt *stack.Runtime) (string
 		},
 		deployerRole(),
 	}
-	for _, env := range rt.Manifest.Environments() {
+	for _, env := range rt.Environments() {
 		objects = append(objects, map[string]any{
 			"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
-			"metadata": map[string]any{"name": deployer, "namespace": env},
+			"metadata": map[string]any{"name": deployer, "namespace": env.Name},
 			"roleRef":  map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": deployer},
 			"subjects": []map[string]any{{"kind": "ServiceAccount", "name": deployer, "namespace": systemNamespace}},
 		})
@@ -624,7 +583,7 @@ func (p Provider) ensureDeployer(ctx context.Context, rt *stack.Runtime) (string
 		return "", err
 	}
 	rt.Console.Redact(token)
-	return buildKubeconfig(rt.Out.Compute.APIServer, rt.Out.Compute.CACert, token, rt.Setting("environment"))
+	return buildKubeconfig(rt.Out.Compute.APIServer, rt.Out.Compute.CACert, token, rt.Production().Name)
 }
 
 func buildKubeconfig(server, ca, token, namespace string) (string, error) {
@@ -670,7 +629,7 @@ func (p Provider) verifyKubeconfig(ctx context.Context, rt *stack.Runtime, kubec
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(ca)
 	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
-	ns := rt.Setting("environment")
+	ns := rt.Production().Name
 	return stack.Retry(ctx, rt.Console, "deploy credential", 12, 5*time.Second, func() error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, config.Clusters[0].Cluster.Server+"/api/v1/namespaces/"+ns+"/pods?limit=1", nil)
 		if err != nil {
@@ -703,68 +662,4 @@ func short(sha string) string {
 		return sha[:7]
 	}
 	return sha
-}
-
-func (p Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
-	_, ok := rt.Kube.SecretValue(ctx, systemNamespace, tokenSecret, "token")
-	return ok
-}
-
-// Remove deletes the deploy identity and, when the GitHub token is available,
-// the OWNSTACK_* secrets and variables of the repos the last apply
-// configured. Repos keep their workflow but can no longer deploy. GitHub
-// failures are warnings: they never stop the cluster cleanup.
-func (p Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
-	// The record lives in ownstack-system, so read it before deleting that.
-	if repos, ok := recordedTargets(ctx, rt); ok {
-		p.removeRepoSettings(ctx, rt, repos)
-	} else {
-		rt.Logf("warning: no record of the configured app repos; they keep their OWNSTACK_* secrets and variables until you delete them in each repo's settings")
-	}
-	for _, env := range rt.Manifest.Environments() {
-		if err := rt.Kube.Delete(ctx, "rolebinding", deployer, "-n", env); err != nil {
-			return err
-		}
-	}
-	if err := rt.Kube.Delete(ctx, "clusterrole", deployer); err != nil {
-		return err
-	}
-	return rt.Kube.Delete(ctx, "namespace", systemNamespace)
-}
-
-// removeRepoSettings deletes the secrets and variables ownstackctl set in
-// app repos, so a removed pipeline leaves no working registry credential
-// behind.
-func (p Provider) removeRepoSettings(ctx context.Context, rt *stack.Runtime, repos []target) {
-	if len(repos) == 0 {
-		return
-	}
-	if rt.Out.VCS == nil || rt.Out.VCS.Kind != "github" || rt.Out.VCS.Token == "" {
-		names := make([]string, len(repos))
-		for i, t := range repos {
-			names[i] = t.String()
-		}
-		rt.Logf("warning: no GitHub token available, so %s keep their OWNSTACK_* secrets and variables; delete them in each repo's settings", strings.Join(names, ", "))
-		return
-	}
-	gh := p.client(rt)
-	for _, t := range repos {
-		var failed []string
-		var lastErr error
-		for _, name := range repoSecretNames {
-			if err := gh.DeleteSecret(ctx, t.owner, t.name, name); err != nil {
-				failed, lastErr = append(failed, name), err
-			}
-		}
-		for _, name := range repoVariableNames {
-			if err := gh.DeleteVariable(ctx, t.owner, t.name, name); err != nil {
-				failed, lastErr = append(failed, name), err
-			}
-		}
-		if lastErr != nil {
-			rt.Logf("warning: %s: could not delete %s (%v); delete them in the repo's settings", t, strings.Join(failed, ", "), lastErr)
-			continue
-		}
-		rt.Logf("Removed the OWNSTACK_* secrets and variables from %s", t)
-	}
 }

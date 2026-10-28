@@ -99,7 +99,7 @@ func newFake(t *testing.T, records ...record) (*fakeCloudflare, Provider, *stack
 	}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	return fake, Provider{BaseURL: srv.URL}, rt.For("dns")
 }
 
@@ -240,21 +240,6 @@ func TestApplyRefusesBeforeChangingAnything(t *testing.T) {
 	}
 }
 
-func TestPlanFromRecords(t *testing.T) {
-	fake, p, rt := newFake(t,
-		record{ID: "apex", Type: "A", Name: "example.com", Content: "203.0.113.10", Comment: recordComment},
-		record{ID: "cname", Type: "CNAME", Name: "*.example.com", Content: "elsewhere.net"},
-	)
-	steps := p.Plan(context.Background(), rt)
-	if len(steps) != 2 || steps[0].Action != "verify" || steps[1].Action != "replace" ||
-		!strings.Contains(steps[1].Detail, "CNAME elsewhere.net") || !strings.Contains(steps[1].Detail, "replaceRecords") {
-		t.Errorf("steps = %+v", steps)
-	}
-	if w := fake.writes(); len(w) != 0 {
-		t.Errorf("plan changed records: %v", w)
-	}
-}
-
 func TestPlanRecordsIsOrderIndependent(t *testing.T) {
 	recs := []record{
 		{ID: "b", Type: "A", Name: "example.com", Content: "198.51.100.2"},
@@ -298,7 +283,7 @@ func TestOwnedComment(t *testing.T) {
 }
 
 func TestResolveUsesSecret(t *testing.T) {
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	rt.Out.DNS = nil
 	if err := (Provider{}).Resolve(context.Background(), rt.For("dns")); err != nil {
 		t.Fatal(err)

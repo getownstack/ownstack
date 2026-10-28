@@ -74,8 +74,8 @@ func newRepo(t *testing.T, plugins string) *fixtureRepo {
 	t.Helper()
 	root := t.TempDir()
 	for path, content := range map[string]string{
-		inputPath:  plugins,
-		dataGoPath: "package catalog\n\nconst JenkinsChartVersion = \"5.8.79\"\n",
+		inputPath:   plugins,
+		chartGoPath: "package jenkins\n\nconst ChartVersion = \"5.8.79\"\n",
 	} {
 		full := filepath.Join(root, filepath.FromSlash(path))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -139,21 +139,21 @@ func TestGenerateLock(t *testing.T) {
 	if got := repo.read(lockPath); got != want {
 		t.Errorf("plugins.lock:\n%s", got)
 	}
-	if got := repo.read(dataGoPath); !strings.Contains(got, `const JenkinsChartVersion = "5.9.72"`) {
-		t.Errorf("data.go:\n%s", got)
+	if got := repo.read(chartGoPath); !strings.Contains(got, `const ChartVersion = "5.9.72"`) {
+		t.Errorf("chart.go:\n%s", got)
 	}
 	for _, line := range []string{"Jenkins 2.580.1 (chart 5.9.72, image jenkins/jenkins:2.580.1-jdk21): 3 locked plugins", "- chart (none) → 5.9.72", "- added app 4560.vc25b_83890c34"} {
 		if !strings.Contains(stdout, line) {
 			t.Errorf("stdout lacks %q:\n%s", line, stdout)
 		}
 	}
-	if !strings.Contains(stderr, "run scripts/sync-catalog.sh") {
-		t.Errorf("stderr does not mention the catalog sync:\n%s", stderr)
+	if !strings.Contains(stderr, "The Jenkins chart is now 5.9.72") {
+		t.Errorf("stderr does not mention the chart change:\n%s", stderr)
 	}
 
 	// Rerunning resolves the locked chart again; nothing changes.
 	code, stdout, stderr = repo.run()
-	if code != 0 || !strings.Contains(stdout, "plugins.lock is up to date") || strings.Contains(stderr, "sync-catalog") || repo.read(lockPath) != want {
+	if code != 0 || !strings.Contains(stdout, "plugins.lock is up to date") || strings.Contains(stderr, "chart is now") || repo.read(lockPath) != want {
 		t.Errorf("rerun: %d\n%s\n%s", code, stdout, stderr)
 	}
 
@@ -162,8 +162,8 @@ func TestGenerateLock(t *testing.T) {
 	if code != 0 || !strings.Contains(stdout, "- chart 5.9.72 → 6.1.0") || !strings.Contains(stdout, "- Jenkins 2.580.1 → 2.590.1") {
 		t.Errorf("latest chart: %d\n%s\n%s", code, stdout, stderr)
 	}
-	if got := repo.read(dataGoPath); !strings.Contains(got, `const JenkinsChartVersion = "6.1.0"`) {
-		t.Errorf("data.go:\n%s", got)
+	if got := repo.read(chartGoPath); !strings.Contains(got, `const ChartVersion = "6.1.0"`) {
+		t.Errorf("chart.go:\n%s", got)
 	}
 	locked := repo.read(lockPath)
 
@@ -173,8 +173,8 @@ func TestGenerateLock(t *testing.T) {
 		!strings.Contains(stderr, "note: the update center for Jenkins 2.516.1 is the one for 2.516.3") {
 		t.Errorf("old core: %d\n%s", code, stderr)
 	}
-	if repo.read(lockPath) != locked || !strings.Contains(repo.read(dataGoPath), `"6.1.0"`) {
-		t.Error("a failed run changed the lock or the catalog")
+	if repo.read(lockPath) != locked || !strings.Contains(repo.read(chartGoPath), `"6.1.0"`) {
+		t.Error("a failed run changed the lock or the chart")
 	}
 
 	for chart, msg := range map[string]string{
@@ -193,7 +193,7 @@ func TestGenerateRefusesSecurityWarnings(t *testing.T) {
 	if code != exitAdvisories || !strings.Contains(stderr, "security warning: vulnerable 1.36: SECURITY-1 Stored XSS vulnerability") {
 		t.Fatalf("exit %d:\n%s", code, stderr)
 	}
-	if repo.read(lockPath) != "" || strings.Contains(repo.read(dataGoPath), "5.9.72") {
+	if repo.read(lockPath) != "" || strings.Contains(repo.read(chartGoPath), "5.9.72") {
 		t.Error("a refused lock was written")
 	}
 	code, stdout, stderr := repo.run("-chart=5.9.72", "-allow-warnings")
@@ -213,19 +213,19 @@ func TestGenerateRejectsBadInput(t *testing.T) {
 	}
 }
 
-func TestCatalogNeedsOneConst(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "data.go")
-	for _, content := range []string{"package catalog\n", "const JenkinsChartVersion = \"1\"\nconst JenkinsChartVersion = \"2\"\n"} {
+func TestChartNeedsOneConst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chart.go")
+	for _, content := range []string{"package jenkins\n", "const ChartVersion = \"1\"\nconst ChartVersion = \"2\"\n"} {
 		os.WriteFile(path, []byte(content), 0o644)
-		if _, err := readCatalog(path); err == nil {
+		if _, err := readChart(path); err == nil {
 			t.Errorf("accepted %q", content)
 		}
 	}
-	// lockgen checks the catalog before it writes the lock.
+	// lockgen checks chart.go before it writes the lock.
 	repo := newRepo(t, "app\n")
-	os.WriteFile(filepath.Join(repo.root, filepath.FromSlash(dataGoPath)), []byte("package catalog\n"), 0o644)
-	if code, _, stderr := repo.run("-chart=5.9.72"); code != exitFailed || !strings.Contains(stderr, "JenkinsChartVersion") || repo.read(lockPath) != "" {
-		t.Errorf("catalog without the const: %d %s", code, stderr)
+	os.WriteFile(filepath.Join(repo.root, filepath.FromSlash(chartGoPath)), []byte("package jenkins\n"), 0o644)
+	if code, _, stderr := repo.run("-chart=5.9.72"); code != exitFailed || !strings.Contains(stderr, "ChartVersion") || repo.read(lockPath) != "" {
+		t.Errorf("chart.go without the const: %d %s", code, stderr)
 	}
 }
 

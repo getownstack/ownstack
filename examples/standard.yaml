@@ -6,6 +6,7 @@ metadata:
   name: acme-platform
 spec:
   domain: example.com
+  # environments: [prod=main, dev=develop, qa=release/*]   # the default: <name>[=<branch>], the first is production
   compute:
     provider: own-vps
     settings:
@@ -24,5 +25,3 @@ spec:
     provider: harbor            # HARBOR_ADMIN_PASSWORD is generated when unset
   cicd:
     provider: jenkins           # JENKINS_ADMIN_PASSWORD is generated when unset
-    # settings:
-    #   branches: develop=dev release/*=qa   # main deploys to prod; these branches to dev and qa

@@ -1,10 +1,9 @@
+// Builds infrastructure/<id>/Dockerfile from the repository root with the
+// host's Docker Engine, as <OWNSTACK_REGISTRY>/<id>:<imageTag>.
 def call(String applicationId) {
-    def values = values()
-    def image_name_with_tag = "${values.imageRepositoryProject}/${applicationId}:${imageTag()}"
-
-    container('docker') {
-        echo "Building ${image_name_with_tag}"
-        // Build local image (without registry prefix), consistent with previous behavior
-        docker.build(image_name_with_tag, "-f infrastructure/${applicationId}/Dockerfile .")
+    withEnv(["APP=${applicationId}", "IMAGE=${env.OWNSTACK_REGISTRY}/${applicationId}:${imageTag()}"]) {
+        container('docker') {
+            sh 'docker build -f "infrastructure/$APP/Dockerfile" -t "$IMAGE" .'
+        }
     }
 }

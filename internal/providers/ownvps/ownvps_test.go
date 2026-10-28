@@ -176,7 +176,7 @@ func TestParseMeminfo(t *testing.T) {
 }
 
 func TestK3sInstallEnv(t *testing.T) {
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	rt = rt.For("compute")
 	if got := k3sInstallEnv(rt); got != "INSTALL_K3S_CHANNEL='stable'" {
 		t.Errorf("default = %s", got)

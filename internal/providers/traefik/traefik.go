@@ -1,5 +1,5 @@
 // Package traefik implements the ingress contract with Traefik and Let's
-// Encrypt, using whichever ACME challenge the DNS contract offers.
+// Encrypt, validating certificates with DNS-01 through the DNS contract.
 package traefik
 
 import (
@@ -9,8 +9,24 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Spec is the traefik provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "traefik", Aspect: "ingress", Name: "Traefik", Mono: "TR", Hosting: catalog.SelfHosted,
+	Summary:   "Traefik ingress with Let's Encrypt certificates and a dashboard.",
+	Resources: catalog.Resources{MemoryMiB: 128, DiskGiB: 1},
+	Params: []catalog.Param{
+		{Key: "acmeEmail", Label: "ACME email", Kind: catalog.KindEmail, Required: true, Placeholder: "ops@example.com",
+			Help: "Let's Encrypt account email for expiry notices."},
+		{Key: "dashboardHost", Label: "Dashboard host", Kind: catalog.KindHostname, Default: "traefik.{adminDomain}"},
+		{Key: "acmeStaging", Label: "Use Let's Encrypt staging", Kind: catalog.KindBool, Default: "false", Advanced: true,
+			Help: "Issue untrusted staging certificates. Useful for test runs that would hit rate limits."},
+		{Key: "chartVersion", Label: "Chart version", Kind: catalog.KindString, Default: "36.3.0", Advanced: true},
+	},
+}
 
 const (
 	namespace      = "traefik"
@@ -43,39 +59,24 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	return nil
 }
 
-func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	challenge := "TLS-ALPN on the node"
-	if rt.Out.DNS.Challenge == stack.ChallengeDNS {
-		challenge = "DNS-01 via " + rt.Out.DNS.ACMEProvider
-	}
-	return []stack.Step{
-		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
-		{Action: "configure", Target: "certificates", Detail: "Let's Encrypt, " + challenge},
-		{Action: "verify", Target: "https://" + rt.Setting("dashboardHost"), Detail: "dashboard serves an issued certificate"},
-	}
-}
-
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err := rt.Kube.EnsureNamespace(ctx, namespace); err != nil {
 		return err
 	}
-	var envNames []string
-	if rt.Out.DNS.Challenge == stack.ChallengeDNS {
-		if err := rt.Kube.ApplySecret(ctx, namespace, dnsSecretName, "", rt.Out.DNS.ACMEEnv, nil); err != nil {
-			return err
-		}
-		for name := range rt.Out.DNS.ACMEEnv {
-			envNames = append(envNames, name)
-		}
-		sort.Strings(envNames)
+	if err := rt.Kube.ApplySecret(ctx, namespace, dnsSecretName, "", rt.Out.DNS.ACMEEnv, nil); err != nil {
+		return err
 	}
+	var envNames []string
+	for name := range rt.Out.DNS.ACMEEnv {
+		envNames = append(envNames, name)
+	}
+	sort.Strings(envNames)
 
 	values, err := stack.Render(tmpl, map[string]any{
 		"DashboardHost": rt.Setting("dashboardHost"),
 		"Email":         rt.Setting("acmeEmail"),
 		"Staging":       rt.SettingBool("acmeStaging"),
 		"StagingURL":    stagingACMEURL,
-		"Challenge":     rt.Out.DNS.Challenge,
 		"DNSProvider":   rt.Out.DNS.ACMEProvider,
 		"EnvNames":      envNames,
 		"SecretName":    dnsSecretName,

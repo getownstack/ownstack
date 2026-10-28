@@ -1,6 +1,7 @@
 package ghactions
 
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,32 +25,17 @@ type workflowStep struct {
 	Run  string            `yaml:"run"`
 }
 
-type workflowJob struct {
-	Needs       string            `yaml:"needs"`
-	If          string            `yaml:"if"`
-	RunsOn      string            `yaml:"runs-on"`
-	Outputs     map[string]string `yaml:"outputs"`
-	Concurrency struct {
-		Group            string `yaml:"group"`
-		CancelInProgress bool   `yaml:"cancel-in-progress"`
-	} `yaml:"concurrency"`
-	Steps []workflowStep `yaml:"steps"`
-}
-
 type workflowDoc struct {
 	On struct {
 		Push struct {
 			Branches []string `yaml:"branches"`
 		} `yaml:"push"`
-		WorkflowDispatch struct {
-			Inputs map[string]struct {
-				Required bool   `yaml:"required"`
-				Default  string `yaml:"default"`
-			} `yaml:"inputs"`
-		} `yaml:"workflow_dispatch"`
 	} `yaml:"on"`
-	Concurrency any                    `yaml:"concurrency"`
-	Jobs        map[string]workflowJob `yaml:"jobs"`
+	Concurrency any `yaml:"concurrency"`
+	Jobs        map[string]struct {
+		RunsOn string         `yaml:"runs-on"`
+		Steps  []workflowStep `yaml:"steps"`
+	} `yaml:"jobs"`
 }
 
 func parseWorkflow(t *testing.T) workflowDoc {
@@ -66,41 +52,20 @@ func workflowSteps(t *testing.T) []workflowStep {
 	return parseWorkflow(t).Jobs["deploy"].Steps
 }
 
-// jobScript is the shell of a job's first run step.
-func jobScript(t *testing.T, job string) string {
+// stepRun is the shell of the step with the given id or name.
+func stepRun(t *testing.T, name string) string {
 	t.Helper()
-	for _, step := range parseWorkflow(t).Jobs[job].Steps {
-		if step.Run != "" {
+	for _, step := range workflowSteps(t) {
+		if step.ID == name || step.Name == name {
 			return step.Run
 		}
 	}
-	t.Fatalf("job %s has no run step", job)
+	t.Fatalf("no step %s", name)
 	return ""
 }
 
-// runScript is the shell of the build and deploy step.
-func runScript(t *testing.T) string {
-	t.Helper()
-	return jobScript(t, "deploy")
-}
-
-// scriptBlock returns the script's lines from the first one (trimmed) that
-// starts with start through the next one that is exactly end (top level).
-func scriptBlock(t *testing.T, script, start, end string) string {
-	t.Helper()
-	var block []string
-	for _, line := range strings.Split(script, "\n") {
-		if len(block) == 0 && !strings.HasPrefix(strings.TrimSpace(line), start) {
-			continue
-		}
-		block = append(block, line)
-		if len(block) > 1 && line == end {
-			return strings.Join(block, "\n")
-		}
-	}
-	t.Fatalf("no block from %q to %q", start, end)
-	return ""
-}
+func resolveScript(t *testing.T) string { return stepRun(t, "resolve") }
+func deployScript(t *testing.T) string  { return stepRun(t, "Build, push, and deploy") }
 
 func needUnix(t *testing.T) {
 	t.Helper()
@@ -109,95 +74,88 @@ func needUnix(t *testing.T) {
 	}
 }
 
-func TestWorkflowScriptParses(t *testing.T) {
-	for _, job := range []string{"resolve", "deploy"} {
-		path := filepath.Join(t.TempDir(), job+".sh")
-		os.WriteFile(path, []byte(jobScript(t, job)), 0o600)
+func TestWorkflowScriptsParse(t *testing.T) {
+	for _, step := range workflowSteps(t) {
+		if step.Run == "" {
+			continue
+		}
+		path := filepath.Join(t.TempDir(), "step.sh")
+		os.WriteFile(path, []byte(step.Run), 0o600)
 		if out, err := exec.Command("bash", "-n", path).CombinedOutput(); err != nil {
-			t.Fatalf("%s: bash -n: %v\n%s", job, err, out)
+			t.Fatalf("%s: bash -n: %v\n%s", step.Name, err, out)
 		}
 	}
 }
 
-// Pushes to any branch start the workflow; resolve decides whether it
-// deploys. Manual runs may pick an environment and an image tag to promote.
-func TestWorkflowTriggers(t *testing.T) {
+// One job: pushes to any branch and manual runs (no inputs: redeploy the
+// branch) start it, one run per branch at a time. The first step resolves
+// the environment, and every later step runs only when there is one.
+func TestWorkflowShape(t *testing.T) {
 	wf := parseWorkflow(t)
 	if got := wf.On.Push.Branches; len(got) != 1 || got[0] != "**" {
 		t.Errorf("push branches = %v, want [**]", got)
 	}
-	inputs := wf.On.WorkflowDispatch.Inputs
-	for _, name := range []string{"environment", "tag"} {
-		in, ok := inputs[name]
-		if !ok || in.Required || in.Default != "" {
-			t.Errorf("workflow_dispatch input %s = %+v (present %v), want optional and empty", name, in, ok)
+	var on struct {
+		On map[string]any `yaml:"on"`
+	}
+	if err := yaml.Unmarshal([]byte(Workflow), &on); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := on.On["workflow_dispatch"]; !ok || d != nil {
+		t.Errorf("workflow_dispatch = %v (present %v), want present without inputs", d, ok)
+	}
+	if wf.Concurrency != "ownstack-${{ github.ref_name }}" {
+		t.Errorf("concurrency = %v", wf.Concurrency)
+	}
+	if len(wf.Jobs) != 1 {
+		t.Errorf("jobs = %v, want deploy only", wf.Jobs)
+	}
+	steps := workflowSteps(t)
+	if len(steps) == 0 || steps[0].ID != "resolve" || steps[0].Uses != "" || steps[0].If != "" {
+		t.Fatalf("the first step is not resolve: %+v", steps)
+	}
+	for name := range steps[0].Env {
+		if strings.Contains(steps[0].Env[name], "secrets.") {
+			t.Errorf("resolve reads a secret: %s", name)
 		}
 	}
-	if len(inputs) != 2 {
-		t.Errorf("inputs = %v", inputs)
-	}
-	if wf.Concurrency != nil {
-		t.Errorf("workflow-level concurrency %v would serialize unrelated branches; deploy is grouped per environment", wf.Concurrency)
-	}
-}
-
-// The deploy job runs only for a resolved environment, one at a time per
-// environment, and deploys into it.
-func TestWorkflowDeployJob(t *testing.T) {
-	wf := parseWorkflow(t)
-	resolve, deploy := wf.Jobs["resolve"], wf.Jobs["deploy"]
-	if resolve.RunsOn != "ubuntu-latest" {
-		t.Errorf("resolve runs on %q", resolve.RunsOn)
-	}
-	// resolve holds no credentials and checks nothing out.
-	for _, step := range resolve.Steps {
-		if step.Uses != "" {
-			t.Errorf("resolve uses %s", step.Uses)
+	for _, step := range steps[1:] {
+		if !strings.HasPrefix(step.If, "${{ steps.resolve.outputs.environment != ''") {
+			t.Errorf("step %q runs without an environment (if %q)", step.Name+step.Uses, step.If)
 		}
-		for name, value := range step.Env {
-			if strings.Contains(value, "secrets.") {
-				t.Errorf("resolve reads a secret: %s=%s", name, value)
-			}
-		}
+	}
+	for _, step := range steps {
 		if strings.Contains(step.Run, "${{") {
-			t.Error("resolve interpolates expressions into its script; pass them through env")
+			t.Errorf("step %q interpolates expressions into its script; pass them through env", step.Name)
 		}
 	}
-	if resolve.Outputs["environment"] == "" || resolve.Outputs["production"] == "" {
-		t.Errorf("resolve outputs = %v", resolve.Outputs)
+	// The repo carries one variable and one secret ownstackctl sets, and the
+	// customer's optional runner label.
+	reads := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(vars|secrets)\.[A-Z_]+`).FindAllString(Workflow, -1) {
+		reads[m] = true
 	}
-	if deploy.Needs != "resolve" || !strings.Contains(deploy.If, "needs.resolve.outputs.environment != ''") {
-		t.Errorf("deploy needs %q if %q", deploy.Needs, deploy.If)
+	want := map[string]bool{"vars.OWNSTACK": true, "vars.OWNSTACK_RUNNER": true, "secrets.OWNSTACK_KUBECONFIG": true}
+	if len(reads) != len(want) {
+		t.Errorf("the workflow reads %v, want %v", reads, want)
 	}
-	if !strings.Contains(deploy.Concurrency.Group, "${{ needs.resolve.outputs.environment }}") || deploy.Concurrency.CancelInProgress {
-		t.Errorf("deploy concurrency = %+v", deploy.Concurrency)
-	}
-	var env map[string]string
-	for _, step := range deploy.Steps {
-		if step.Run != "" {
-			env = step.Env
-			if strings.Contains(step.Run, "${{") {
-				t.Error("deploy interpolates expressions into its script; pass them through env")
-			}
+	for name := range want {
+		if !reads[name] {
+			t.Errorf("the workflow does not read %s", name)
 		}
 	}
-	for name, want := range map[string]string{
-		"NAMESPACE":              "${{ needs.resolve.outputs.environment }}",
-		"PRODUCTION_ENVIRONMENT": "${{ needs.resolve.outputs.production }}",
-		"PROMOTE_TAG":            "${{ inputs.tag }}",
-	} {
-		if env[name] != want {
-			t.Errorf("deploy env %s = %q, want %q", name, env[name], want)
+	for _, gone := range []string{"before-deployment", "imagePullSecret", "docker login", "inputs."} {
+		if strings.Contains(Workflow, gone) {
+			t.Errorf("the workflow still contains %q", gone)
 		}
 	}
-	script := runScript(t)
-	if !strings.Contains(script, `--set-string environment="$NAMESPACE" --set-string productionEnvironment="$PRODUCTION_ENVIRONMENT"`) {
-		t.Error("helm does not get environment and productionEnvironment")
+	if !strings.Contains(Workflow, "\n# ownstack-workflow: 5\n") {
+		t.Error("the workflow is not marked ownstack-workflow 5")
 	}
 }
 
-// The deploy job takes common_helm_library from the Ownstack repository at
-// the ref ownstackctl sets (OWNSTACK_LIBRARY_REF), main without it.
+// The job takes common_helm_library from the Ownstack repository at the
+// library ref in OWNSTACK.
 func TestWorkflowFetchesTheLibraryAtTheLibraryRef(t *testing.T) {
 	var library *workflowStep
 	steps := workflowSteps(t)
@@ -207,33 +165,35 @@ func TestWorkflowFetchesTheLibraryAtTheLibraryRef(t *testing.T) {
 		}
 	}
 	if library == nil {
-		t.Fatal("the deploy job does not fetch the Helm library into .ownstack")
-	}
-	if library.Uses != "actions/checkout@v5" {
-		t.Errorf("library step uses %s", library.Uses)
+		t.Fatal("the job does not fetch the Helm library into .ownstack")
 	}
 	for key, want := range map[string]string{
 		"repository":      stack.LibraryRepo,
-		"ref":             "${{ vars.OWNSTACK_LIBRARY_REF || 'main' }}",
+		"ref":             "${{ steps.resolve.outputs.libraryRef }}",
 		"sparse-checkout": "common_helm_library",
 	} {
 		if library.With[key] != want {
 			t.Errorf("library step %s = %q, want %q", key, library.With[key], want)
 		}
 	}
+	if library.Uses != "actions/checkout@v5" {
+		t.Errorf("library step uses %s", library.Uses)
+	}
 }
 
-// resolveRun runs the resolve job's script and returns its outputs.
-func resolveRun(t *testing.T, env map[string]string) (outputs map[string]string, log string, err error) {
+const ownstackVar = `{"domain":"example.com","registry":"registry.admin.example.com/apps","platform":"linux/arm64",` +
+	`"environments":["prod=main","dev=develop","qa=release/*"],"libraryRef":"ownstackctl-v0.4.0"}`
+
+// resolveRun runs the resolve step for a branch and returns its outputs.
+func resolveRun(t *testing.T, ownstack, branch string) (outputs map[string]string, log string, err error) {
 	t.Helper()
 	needUnix(t)
-	dir := t.TempDir()
-	output := filepath.Join(dir, "output")
-	cmd := exec.Command("bash", "-c", jobScript(t, "resolve"))
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GITHUB_OUTPUT=" + output, "GITHUB_EVENT_NAME=push"}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not on PATH")
 	}
+	output := filepath.Join(t.TempDir(), "output")
+	cmd := exec.Command("bash", "-c", resolveScript(t))
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GITHUB_OUTPUT=" + output, "GITHUB_REF_NAME=" + branch, "OWNSTACK=" + ownstack}
 	out, err := cmd.CombinedOutput()
 	outputs = map[string]string{}
 	data, _ := os.ReadFile(output)
@@ -245,127 +205,74 @@ func resolveRun(t *testing.T, env map[string]string) (outputs map[string]string,
 	return outputs, string(out), err
 }
 
-// The environment comes from OWNSTACK_BRANCHES, first match wins, with *
-// matching across /. A manual run may name any of the stack's environments.
-// Repos whose stack was not applied since environments existed keep
-// deploying main to OWNSTACK_NAMESPACE.
+func withEnvironments(items string) string {
+	return strings.Replace(ownstackVar, `["prod=main","dev=develop","qa=release/*"]`, items, 1)
+}
+
+// The environment is the first item whose glob matches the branch, with *
+// matching across /; the first item is production. Unmapped branches
+// resolve to no environment, so nothing else runs.
 func TestWorkflowResolve(t *testing.T) {
-	const branches = "main=prod develop=dev release/*=qa"
-	stack := map[string]string{"BRANCHES": branches, "ENVIRONMENTS": "dev qa prod", "PRODUCTION": "prod", "NAMESPACE": "prod"}
-	with := func(extra ...string) map[string]string {
-		env := map[string]string{}
-		for k, v := range stack {
-			env[k] = v
-		}
-		for i := 0; i+1 < len(extra); i += 2 {
-			if extra[i+1] == "<unset>" {
-				delete(env, extra[i])
-				continue
-			}
-			env[extra[i]] = extra[i+1]
-		}
-		return env
-	}
 	for name, tc := range map[string]struct {
-		env         map[string]string
-		environment string
-		production  string
+		ownstack, branch, environment, production string
 	}{
-		"main":                     {with("GITHUB_REF_NAME", "main"), "prod", "prod"},
-		"develop":                  {with("GITHUB_REF_NAME", "develop"), "dev", "prod"},
-		"release glob":             {with("GITHUB_REF_NAME", "release/1.2"), "qa", "prod"},
-		"glob spans slashes":       {with("GITHUB_REF_NAME", "release/1.2/rc"), "qa", "prod"},
-		"glob is anchored":         {with("GITHUB_REF_NAME", "pre-release/1.2"), "", "prod"},
-		"unmapped":                 {with("GITHUB_REF_NAME", "feature/login"), "", "prod"},
-		"name is not a prefix":     {with("GITHUB_REF_NAME", "main-old"), "", "prod"},
-		"first match wins":         {with("GITHUB_REF_NAME", "release/1.2", "BRANCHES", "main=prod release/*=qa release/1.*=dev"), "qa", "prod"},
-		"malformed pair skipped":   {with("GITHUB_REF_NAME", "develop", "BRANCHES", "main=prod develop"), "", "prod"},
-		"production named qa":      {with("GITHUB_REF_NAME", "main", "BRANCHES", "main=qa", "PRODUCTION", "qa", "NAMESPACE", "qa"), "qa", "qa"},
-		"not applied since":        {with("GITHUB_REF_NAME", "main", "BRANCHES", "<unset>", "ENVIRONMENTS", "<unset>", "PRODUCTION", "<unset>", "NAMESPACE", "staging"), "staging", "staging"},
-		"not applied, other":       {with("GITHUB_REF_NAME", "develop", "BRANCHES", "<unset>", "ENVIRONMENTS", "<unset>", "PRODUCTION", "<unset>"), "", "prod"},
-		"nothing set":              {map[string]string{"GITHUB_REF_NAME": "main"}, "prod", "prod"},
-		"dispatch picks qa":        {with("GITHUB_REF_NAME", "feature/login", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "qa"), "qa", "prod"},
-		"dispatch input wins":      {with("GITHUB_REF_NAME", "main", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "dev"), "dev", "prod"},
-		"dispatch by branch":       {with("GITHUB_REF_NAME", "develop", "GITHUB_EVENT_NAME", "workflow_dispatch"), "dev", "prod"},
-		"dispatch, not applied":    {with("GITHUB_REF_NAME", "x", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "prod", "ENVIRONMENTS", "<unset>"), "prod", "prod"},
-		"production falls back":    {with("GITHUB_REF_NAME", "develop", "PRODUCTION", "<unset>", "NAMESPACE", "live"), "dev", "live"},
-		"production variable wins": {with("GITHUB_REF_NAME", "develop", "PRODUCTION", "qa"), "dev", "qa"},
+		"main":                  {ownstackVar, "main", "prod", "prod"},
+		"develop":               {ownstackVar, "develop", "dev", "prod"},
+		"release glob":          {ownstackVar, "release/1.2", "qa", "prod"},
+		"glob spans slashes":    {ownstackVar, "release/1.2/rc", "qa", "prod"},
+		"glob is anchored":      {ownstackVar, "pre-release/1.2", "", "prod"},
+		"unmapped":              {ownstackVar, "feature/login", "", "prod"},
+		"name is not a prefix":  {ownstackVar, "main-old", "", "prod"},
+		"first match wins":      {withEnvironments(`["prod=main","qa=release/*","dev=release/1.*"]`), "release/1.2", "qa", "prod"},
+		"no glob":               {withEnvironments(`["prod=main","staging","dev=develop"]`), "develop", "dev", "prod"},
+		"name is not a glob":    {withEnvironments(`["prod=main","staging","dev=develop"]`), "staging", "", "prod"},
+		"production named live": {withEnvironments(`["live=trunk","dev=main"]`), "main", "dev", "live"},
+		"catch-all":             {withEnvironments(`["prod=main","preview=*"]`), "feature/x", "preview", "prod"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			out, log, err := resolveRun(t, tc.env)
+			out, log, err := resolveRun(t, tc.ownstack, tc.branch)
 			if err != nil {
 				t.Fatalf("%v\n%s", err, log)
 			}
-			if out["environment"] != tc.environment || out["production"] != tc.production {
+			if _, ok := out["environment"]; !ok || out["environment"] != tc.environment || out["production"] != tc.production {
 				t.Errorf("outputs = %v, want environment %q production %q\n%s", out, tc.environment, tc.production, log)
 			}
-			if _, ok := out["environment"]; !ok {
-				t.Error("no environment output")
-			}
 		})
 	}
 
-	for name, tc := range map[string]struct {
-		env  map[string]string
-		want string
-	}{
-		"unknown environment": {with("GITHUB_REF_NAME", "main", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "staging"), "must be one of: dev qa prod"},
-		// Only the production environment is known until the stack is reapplied.
-		"not applied since": {with("GITHUB_REF_NAME", "main", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "dev", "ENVIRONMENTS", "<unset>", "BRANCHES", "<unset>"), "must be one of: prod"},
-		"injected input":    {with("GITHUB_REF_NAME", "main", "GITHUB_EVENT_NAME", "workflow_dispatch", "REQUESTED", "prod\n::warning::pwned"), "must be one of"},
-		"unmapped dispatch": {with("GITHUB_REF_NAME", "feature/login", "GITHUB_EVENT_NAME", "workflow_dispatch"), "Choose one with the environment input"},
-		"bad mapping":       {with("GITHUB_REF_NAME", "develop", "BRANCHES", "main=prod develop=Dev_1"), "invalid environment"},
-		"bad production":    {with("GITHUB_REF_NAME", "main", "PRODUCTION", "prod;x"), "OWNSTACK_PRODUCTION_ENVIRONMENT"},
+	out, log, err := resolveRun(t, ownstackVar, "main")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, log)
+	}
+	for key, want := range map[string]string{
+		"domain": "example.com", "registry": "registry.admin.example.com/apps", "platform": "linux/arm64", "libraryRef": "ownstackctl-v0.4.0",
 	} {
+		if out[key] != want {
+			t.Errorf("output %s = %q, want %q", key, out[key], want)
+		}
+	}
+	out, _, _ = resolveRun(t, strings.Replace(ownstackVar, `"platform":"linux/arm64",`, "", 1), "main")
+	if out["platform"] != "linux/amd64" {
+		t.Errorf("platform without one in OWNSTACK = %q, want linux/amd64", out["platform"])
+	}
+
+	for name, ownstack := range map[string]string{"unset": "", "not JSON": "prod=main"} {
 		t.Run(name, func(t *testing.T) {
-			out, log, err := resolveRun(t, tc.env)
-			if err == nil || !strings.Contains(log, "::error::") || !strings.Contains(log, tc.want) {
-				t.Errorf("err = %v, log:\n%s\nwant an error containing %q", err, log, tc.want)
+			out, log, err := resolveRun(t, ownstack, "main")
+			if err == nil || out["environment"] != "" {
+				t.Errorf("err = %v, outputs %v\n%s", err, out, log)
 			}
-			if strings.Contains(log, "pwned") {
-				t.Error("the environment input was echoed")
-			}
-			if out["environment"] != "" {
-				t.Errorf("outputs = %v", out)
+			if ownstack == "" && !strings.Contains(log, "::error::The OWNSTACK variable is not set") {
+				t.Errorf("log:\n%s", log)
 			}
 		})
-	}
-}
-
-// The image tag logic runs for real: branch names with slashes and other
-// characters must become a valid tag, and a promotion takes the tag input
-// only when it is a valid tag.
-func TestWorkflowImageTag(t *testing.T) {
-	needUnix(t)
-	block := scriptBlock(t, runScript(t), "ref=", "fi")
-	for _, tc := range []struct{ promote, want string }{
-		{"", "feature-new-ui--0123456"},
-		{"main-89abcde", "main-89abcde"},
-		{"v1.2.3_rc", "v1.2.3_rc"},
-		{"main-1; rm -rf /", ""},
-		{"-x", ""},
-		{"a/b", ""},
-	} {
-		cmd := exec.Command("bash", "-c", "set -euo pipefail\n"+block+"\necho \"$tag\"")
-		cmd.Env = append(os.Environ(), "GITHUB_REF_NAME=feature/new ui!", "GITHUB_SHA=0123456789abcdef", "PROMOTE_TAG="+tc.promote)
-		out, err := cmd.CombinedOutput()
-		got := strings.TrimSpace(string(out))
-		if tc.want == "" {
-			if err == nil || !strings.Contains(got, "::error::The tag input") {
-				t.Errorf("tag input %q accepted: %s", tc.promote, got)
-			}
-			continue
-		}
-		if err != nil || got != tc.want {
-			t.Errorf("tag input %q: tag = %q (%v), want %q", tc.promote, got, err, tc.want)
-		}
 	}
 }
 
 // hostRule is the workflow's Python for the deploy summary's host.
 func hostRule(t *testing.T) string {
 	t.Helper()
-	m := regexp.MustCompile(`(?s)\nhost_rule='\n(.*?)\n'\n`).FindStringSubmatch(runScript(t))
+	m := regexp.MustCompile(`(?s)\nhost_rule='\n(.*?)\n'\n`).FindStringSubmatch(deployScript(t))
 	if m == nil {
 		t.Fatal("host_rule not found")
 	}
@@ -403,59 +310,13 @@ func TestWorkflowHostRule(t *testing.T) {
 	}
 }
 
-// Hooks get the same environment as with Jenkins: the hook runs for real
-// and prints what it received.
-func TestWorkflowHookEnvironment(t *testing.T) {
-	needUnix(t)
-	var block []string
-	in := false
-	for _, line := range strings.Split(runScript(t), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "APPLICATION_ID=") {
-			in = true
-		}
-		if in {
-			block = append(block, trimmed)
-			if strings.Contains(trimmed, "before-deployment.sh") {
-				break
-			}
-		}
-	}
-	if len(block) == 0 {
-		t.Fatal("hook invocation not found")
-	}
-	dir := t.TempDir()
-	hook := "env | grep -E '^(APPLICATION_ID|RELEASE_NAME|NAMESPACE|IMAGE|IMAGE_REGISTRY|IMAGE_REPOSITORY_PROJECT|IMAGE_TAG|IMAGE_PULL_SECRET|OWNSTACK_DOMAIN|OWNSTACK_ENVIRONMENT)=' | sort\n"
-	if err := os.WriteFile(filepath.Join(dir, "before-deployment.sh"), []byte(hook), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command("bash", "-c", strings.Join(block, "\n"))
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"), "dir=" + dir, "app=shop", "image=registry.example.com/apps/shop:develop-0123456",
-		"NAMESPACE=dev", "REGISTRY=registry.example.com", "PROJECT=apps", "tag=develop-0123456",
-		"PULL_SECRET=registry-credentials", "DOMAIN=example.com",
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	want := strings.Join([]string{
-		"APPLICATION_ID=shop", "IMAGE=registry.example.com/apps/shop:develop-0123456", "IMAGE_PULL_SECRET=registry-credentials",
-		"IMAGE_REGISTRY=registry.example.com", "IMAGE_REPOSITORY_PROJECT=apps", "IMAGE_TAG=develop-0123456",
-		"NAMESPACE=dev", "OWNSTACK_DOMAIN=example.com", "OWNSTACK_ENVIRONMENT=dev", "RELEASE_NAME=shop",
-	}, "\n")
-	if got := strings.TrimSpace(string(out)); got != want {
-		t.Errorf("hook environment:\n%s\nwant:\n%s", got, want)
-	}
-}
-
 // Images are built for the server's platform. Emulation is set up by a
 // pinned action only when the runner's architecture differs, and the build
 // stays a plain docker build and push (no buildx --push, which would push an
 // index with attestations).
 func TestWorkflowBuildsForTheServerPlatform(t *testing.T) {
-	script := runScript(t)
-	if !strings.Contains(script, `docker build --platform "${PLATFORM:-linux/amd64}" `) || !strings.Contains(script, `docker push "$image"`) {
+	script := deployScript(t)
+	if !strings.Contains(script, `docker build --platform "$PLATFORM" `) || !strings.Contains(script, `docker push "$image"`) {
 		t.Error("build does not target the server's platform")
 	}
 	if strings.Contains(Workflow, "buildx") || strings.Contains(Workflow, "--push") {
@@ -464,7 +325,7 @@ func TestWorkflowBuildsForTheServerPlatform(t *testing.T) {
 	var qemu *workflowStep
 	steps := workflowSteps(t)
 	for i, step := range steps {
-		if step.Env["PLATFORM"] != "" && step.Env["PLATFORM"] != "${{ vars.OWNSTACK_PLATFORM }}" {
+		if step.Env["PLATFORM"] != "" && step.Env["PLATFORM"] != "${{ steps.resolve.outputs.platform }}" {
 			t.Errorf("PLATFORM = %q", step.Env["PLATFORM"])
 		}
 		if strings.HasPrefix(step.Uses, "docker/setup-qemu-action@") {
@@ -482,61 +343,66 @@ func TestWorkflowBuildsForTheServerPlatform(t *testing.T) {
 	if image := qemu.With["image"]; image == "" || strings.HasSuffix(image, ":latest") {
 		t.Errorf("binfmt image not pinned: %q", image)
 	}
-	if !strings.Contains(qemu.If, "vars.OWNSTACK_PLATFORM || 'linux/amd64'") || !strings.Contains(qemu.If, "runner.arch") {
+	if !strings.Contains(qemu.If, "steps.resolve.outputs.platform != (runner.arch == 'ARM64' && 'linux/arm64' || 'linux/amd64')") {
 		t.Errorf("QEMU condition = %q", qemu.If)
-	}
-	// A promotion builds nothing, so it needs no emulation.
-	if !strings.HasPrefix(qemu.If, "${{ !inputs.tag && ") {
-		t.Errorf("QEMU condition = %q, want it skipped for promotions", qemu.If)
 	}
 }
 
-// deployStubs puts docker and helm stubs on PATH that log their calls to
-// $STUB/calls. docker manifest inspect fails for images listed in
-// $STUB/missing; helm get values prints $STUB/values.json.
+// Stubs on PATH log their calls to $STUB/calls. docker manifest inspect
+// succeeds for images listed in $STUB/existing, and docker push records the
+// Docker config it pushes with; kubectl prints a dockerconfigjson; helm get
+// values prints $STUB/values.json. Each records the KUBECONFIG it sees.
 const (
-	dockerStub = `#!/bin/sh
+	workflowDockerStub = `#!/bin/sh
 echo "docker $*" >> "$STUB/calls"
 case "$1 $2" in
-  "login "*) cat > /dev/null ;;
-  "manifest inspect") if [ -f "$STUB/missing" ] && grep -qxF "$3" "$STUB/missing"; then exit 1; fi ;;
+  "manifest inspect") [ -f "$STUB/existing" ] && grep -qxF "$3" "$STUB/existing" || exit 1 ;;
+  "push "*) cat "$DOCKER_CONFIG/config.json" > "$STUB/pushed-with" ;;
 esac
 `
-	helmStub = `#!/bin/sh
+	workflowKubectlStub = `#!/bin/sh
+echo "kubectl $*" >> "$STUB/calls"
+cat "$KUBECONFIG" > "$STUB/kubeconfig"
+cat "$STUB/dockerconfigjson.b64"
+`
+	workflowHelmStub = `#!/bin/sh
 echo "helm $*" >> "$STUB/calls"
 if [ "$1" = get ]; then cat "$STUB/values.json"; fi
 `
+	dockerConfig = `{"auths":{"registry.admin.example.com":{"auth":"Y2k6czNjcmV0LXB3"}}}`
 )
 
 type deployRun struct {
-	calls   []string
-	summary string
-	hook    string
-	log     string
-	err     error
+	calls                           []string
+	summary, pushedWith, kubeconfig string
+	log                             string
+	err                             error
 }
 
-// runDeploy runs the deploy step's script in a repo with the apps web (with
-// a hook) and api, plus docs, which has no Dockerfile.
-func runDeploy(t *testing.T, library string, env map[string]string, missing []string) deployRun {
+// runDeploy runs the deploy step in a repo with the apps web (with a
+// before-deployment.sh, which must not run) and api, plus docs, which has no
+// Dockerfile, as the resolve step's outputs for develop would.
+func runDeploy(t *testing.T, env map[string]string, existing []string) deployRun {
 	t.Helper()
 	needUnix(t)
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not on PATH")
 	}
-	stub, repo, home := t.TempDir(), t.TempDir(), t.TempDir()
+	stub, repo, temp := t.TempDir(), t.TempDir(), t.TempDir()
 	files := map[string]string{
-		filepath.Join(stub, "docker"):                                               dockerStub,
-		filepath.Join(stub, "helm"):                                                 helmStub,
-		filepath.Join(stub, "values.json"):                                          `{"id":"web","domain":"example.com","environment":"dev","productionEnvironment":"prod"}`,
-		filepath.Join(stub, "missing"):                                              strings.Join(missing, "\n") + "\n",
-		filepath.Join(repo, "infrastructure/web/Dockerfile"):                        "FROM scratch\n",
-		filepath.Join(repo, "infrastructure/web/helm/Chart.yaml"):                   "apiVersion: v2\nname: web\nversion: 0.1.0\n",
-		filepath.Join(repo, "infrastructure/web/before-deployment.sh"):              "echo \"$NAMESPACE $OWNSTACK_ENVIRONMENT $IMAGE_TAG\" > \"$STUB/hook\"\n",
-		filepath.Join(repo, "infrastructure/api/Dockerfile"):                        "FROM scratch\n",
-		filepath.Join(repo, "infrastructure/api/helm/Chart.yaml"):                   "apiVersion: v2\nname: api\nversion: 0.1.0\n",
-		filepath.Join(repo, "infrastructure/docs/README.md"):                        "no Dockerfile\n",
-		filepath.Join(repo, ".ownstack/common_helm_library/templates/_helpers.tpl"): library,
+		filepath.Join(stub, "docker"):                                   workflowDockerStub,
+		filepath.Join(stub, "kubectl"):                                  workflowKubectlStub,
+		filepath.Join(stub, "helm"):                                     workflowHelmStub,
+		filepath.Join(stub, "dockerconfigjson.b64"):                     base64.StdEncoding.EncodeToString([]byte(dockerConfig)),
+		filepath.Join(stub, "values.json"):                              `{"id":"web","domain":"example.com","environment":"dev","productionEnvironment":"prod"}`,
+		filepath.Join(stub, "existing"):                                 strings.Join(existing, "\n") + "\n",
+		filepath.Join(repo, "infrastructure/web/Dockerfile"):            "FROM scratch\n",
+		filepath.Join(repo, "infrastructure/web/helm/Chart.yaml"):       "apiVersion: v2\nname: web\nversion: 0.1.0\n",
+		filepath.Join(repo, "infrastructure/web/before-deployment.sh"):  "echo ran > \"$STUB/hook\"\n",
+		filepath.Join(repo, "infrastructure/api/Dockerfile"):            "FROM scratch\n",
+		filepath.Join(repo, "infrastructure/api/helm/Chart.yaml"):       "apiVersion: v2\nname: api\nversion: 0.1.0\n",
+		filepath.Join(repo, "infrastructure/docs/README.md"):            "no Dockerfile\n",
+		filepath.Join(repo, ".ownstack/common_helm_library/Chart.yaml"): "apiVersion: v2\nname: common-helm-library\nversion: 0.1.0\ntype: library\n",
 	}
 	for path, content := range files {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -547,13 +413,13 @@ func runDeploy(t *testing.T, library string, env map[string]string, missing []st
 		}
 	}
 	summary := filepath.Join(stub, "summary")
-	cmd := exec.Command("bash", "-c", runScript(t))
+	cmd := exec.Command("bash", "-c", deployScript(t))
 	cmd.Dir = repo
 	cmd.Env = []string{
-		"PATH=" + stub + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + home, "STUB=" + stub,
-		"GITHUB_STEP_SUMMARY=" + summary, "GITHUB_REF_NAME=develop", "GITHUB_SHA=0123456789abcdef",
-		"KUBECONFIG_DATA=kubeconfig", "REGISTRY=registry.example.com", "REGISTRY_USERNAME=ci", "REGISTRY_PASSWORD=s3cret-pw",
-		"PROJECT=apps", "DOMAIN=example.com", "PULL_SECRET=registry-credentials", "PLATFORM=linux/arm64",
+		"PATH=" + stub + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + t.TempDir(), "STUB=" + stub,
+		"RUNNER_TEMP=" + temp, "GITHUB_STEP_SUMMARY=" + summary, "GITHUB_SHA=0123456789abcdef0123",
+		"KUBECONFIG_DATA=kubeconfig-data", "ENVIRONMENT=dev", "PRODUCTION=prod", "DOMAIN=example.com",
+		"REGISTRY=registry.admin.example.com/apps", "PLATFORM=linux/arm64",
 	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
@@ -563,23 +429,24 @@ func runDeploy(t *testing.T, library string, env map[string]string, missing []st
 	if data, _ := os.ReadFile(filepath.Join(stub, "calls")); len(data) > 0 {
 		run.calls = strings.Split(strings.TrimSpace(string(data)), "\n")
 	}
-	data, _ := os.ReadFile(summary)
-	run.summary = string(data)
-	data, _ = os.ReadFile(filepath.Join(stub, "hook"))
-	run.hook = strings.TrimSpace(string(data))
-	if strings.Contains(run.log+strings.Join(run.calls, "\n")+run.summary, "s3cret-pw") {
-		t.Error("the registry password reached the log or a command line")
+	read := func(name string) string {
+		data, _ := os.ReadFile(filepath.Join(stub, name))
+		return string(data)
+	}
+	run.summary, run.pushedWith, run.kubeconfig = read("summary"), read("pushed-with"), read("kubeconfig")
+	if read("hook") != "" {
+		t.Error("before-deployment.sh ran")
+	}
+	if strings.Contains(run.log+strings.Join(run.calls, "\n")+run.summary, "Y2k6czNjcmV0LXB3") {
+		t.Error("the registry credential reached the log or a command line")
+	}
+	// The credentials stay in the runner's temporary directory, private.
+	for _, name := range []string{"kubeconfig", "docker/config.json"} {
+		if info, err := os.Stat(filepath.Join(temp, name)); err == nil && info.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %v, want 0600", name, info.Mode().Perm())
+		}
 	}
 	return run
-}
-
-func liveLibrary(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile("../../../common_helm_library/templates/_helpers.tpl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
 }
 
 func callsWith(calls []string, prefix string) []string {
@@ -592,83 +459,78 @@ func callsWith(calls []string, prefix string) []string {
 	return out
 }
 
-// A push builds and deploys every app into the resolved environment, telling
-// Helm and the hooks which environment it is.
+// A new commit builds every app once, tagged with the commit, logged in to
+// the registry with the environment's registry-credentials secret, and
+// deploys each into the environment, telling Helm which environment it is.
 func TestWorkflowDeploysBuild(t *testing.T) {
-	run := runDeploy(t, liveLibrary(t), map[string]string{"NAMESPACE": "dev", "PRODUCTION_ENVIRONMENT": "prod"}, nil)
+	run := runDeploy(t, nil, nil)
 	if run.err != nil {
 		t.Fatalf("%v\n%s", run.err, run.log)
 	}
+	if got := callsWith(run.calls, "kubectl"); len(got) != 1 || got[0] != `kubectl -n dev get secret registry-credentials -o jsonpath={.data.\.dockerconfigjson}` {
+		t.Errorf("kubectl calls = %v", got)
+	}
+	if run.kubeconfig != "kubeconfig-data" {
+		t.Errorf("kubectl used kubeconfig %q", run.kubeconfig)
+	}
+	if run.pushedWith != dockerConfig {
+		t.Errorf("docker pushed with config %q, want the cluster's dockerconfigjson", run.pushedWith)
+	}
+	inspects := callsWith(run.calls, "docker manifest inspect")
+	if len(inspects) != 2 || inspects[0] != "docker manifest inspect registry.admin.example.com/apps/api:0123456789ab" {
+		t.Errorf("manifest checks = %v", inspects)
+	}
 	builds := callsWith(run.calls, "docker build")
-	if len(builds) != 2 || !strings.Contains(builds[0], "--platform linux/arm64") || !strings.Contains(builds[0], "registry.example.com/apps/api:develop-0123456") {
+	if len(builds) != 2 || builds[0] != "docker build --platform linux/arm64 -f infrastructure/api/Dockerfile -t registry.admin.example.com/apps/api:0123456789ab ." {
 		t.Errorf("builds = %v", builds)
 	}
-	if pushes := callsWith(run.calls, "docker push"); len(pushes) != 2 {
+	if pushes := callsWith(run.calls, "docker push"); len(pushes) != 2 || pushes[1] != "docker push registry.admin.example.com/apps/web:0123456789ab" {
 		t.Errorf("pushes = %v", pushes)
 	}
-	if inspects := callsWith(run.calls, "docker manifest"); len(inspects) != 0 {
-		t.Errorf("a build checked for existing images: %v", inspects)
+	if logins := callsWith(run.calls, "docker login"); len(logins) != 0 {
+		t.Errorf("docker login = %v", logins)
 	}
 	upgrades := callsWith(run.calls, "helm upgrade")
 	if len(upgrades) != 2 {
 		t.Fatalf("helm upgrades = %v", upgrades)
 	}
-	for _, want := range []string{"--namespace dev", "--set-string environment=dev --set-string productionEnvironment=prod", "--set image=registry.example.com/apps/web:develop-0123456", "--set domain=example.com"} {
-		if !strings.Contains(upgrades[1], want) {
-			t.Errorf("helm upgrade %q lacks %q", upgrades[1], want)
-		}
+	want := "helm upgrade --install web infrastructure/web/helm --namespace dev" +
+		" --set image=registry.admin.example.com/apps/web:0123456789ab --set id=web --set domain=example.com" +
+		" --set-string environment=dev --set-string productionEnvironment=prod --wait --timeout 5m"
+	if upgrades[1] != want {
+		t.Errorf("helm upgrade:\n%s\nwant:\n%s", upgrades[1], want)
 	}
-	if run.hook != "dev dev develop-0123456" {
-		t.Errorf("hook got %q", run.hook)
-	}
-	if !strings.Contains(run.summary, "Deployed web (develop-0123456) to dev: https://web-dev.example.com") {
+	if !strings.Contains(run.summary, "Deployed web (0123456789ab) to dev: https://web-dev.example.com") {
 		t.Errorf("summary:\n%s", run.summary)
 	}
 }
 
-// A promotion deploys an existing tag everywhere without building, after
-// checking every app's image exists.
-func TestWorkflowPromotes(t *testing.T) {
-	env := map[string]string{"NAMESPACE": "prod", "PRODUCTION_ENVIRONMENT": "prod", "PROMOTE_TAG": "release-1.2-89abcde"}
-	run := runDeploy(t, liveLibrary(t), env, nil)
+// An image that is already in the registry (a rerun, or a commit another
+// branch built) is deployed without building or pushing it again.
+func TestWorkflowSkipsExistingImages(t *testing.T) {
+	run := runDeploy(t, nil, []string{"registry.admin.example.com/apps/api:0123456789ab", "registry.admin.example.com/apps/web:0123456789ab"})
 	if run.err != nil {
 		t.Fatalf("%v\n%s", run.err, run.log)
 	}
-	if b := callsWith(run.calls, "docker build"); len(b) != 0 || len(callsWith(run.calls, "docker push")) != 0 {
-		t.Errorf("a promotion built or pushed: %v", run.calls)
+	if b, p := callsWith(run.calls, "docker build"), callsWith(run.calls, "docker push"); len(b)+len(p) != 0 {
+		t.Errorf("built or pushed an existing image: %v %v", b, p)
 	}
-	inspects := callsWith(run.calls, "docker manifest inspect")
-	if len(inspects) != 2 || inspects[0] != "docker manifest inspect registry.example.com/apps/api:release-1.2-89abcde" {
-		t.Errorf("manifest checks = %v", inspects)
+	if !strings.Contains(run.log, "registry.admin.example.com/apps/web:0123456789ab exists, skipping the build.") {
+		t.Errorf("log:\n%s", run.log)
 	}
-	upgrades := callsWith(run.calls, "helm upgrade")
-	if len(upgrades) != 2 || !strings.Contains(upgrades[1], "--set image=registry.example.com/apps/web:release-1.2-89abcde") || !strings.Contains(upgrades[1], "--namespace prod") {
+	if upgrades := callsWith(run.calls, "helm upgrade"); len(upgrades) != 2 {
 		t.Errorf("helm upgrades = %v", upgrades)
 	}
-	if run.hook != "prod prod release-1.2-89abcde" {
-		t.Errorf("hook got %q", run.hook)
-	}
 
-	// One missing image stops the promotion before anything is deployed.
-	run = runDeploy(t, liveLibrary(t), env, []string{"registry.example.com/apps/web:release-1.2-89abcde"})
-	if run.err == nil || !strings.Contains(run.log, "::error::registry.example.com/apps/web:release-1.2-89abcde is not in the registry") {
-		t.Errorf("err = %v\n%s", run.err, run.log)
-	}
-	if u := callsWith(run.calls, "helm"); len(u) != 0 || run.hook != "" {
-		t.Errorf("deployed despite a missing image: %v", run.calls)
+	run = runDeploy(t, nil, []string{"registry.admin.example.com/apps/api:0123456789ab"})
+	if b := callsWith(run.calls, "docker build"); run.err != nil || len(b) != 1 || !strings.Contains(b[0], "apps/web:") {
+		t.Errorf("builds = %v (%v)\n%s", b, run.err, run.log)
 	}
 }
 
-// A library from before environments would publish another environment at
-// the production host; production deploys still work with it.
-func TestWorkflowRefusesOldLibraryOutsideProduction(t *testing.T) {
-	old := "{{- define \"public-url-application\" -}}\n{{- end -}}\n"
-	run := runDeploy(t, old, map[string]string{"NAMESPACE": "dev", "PRODUCTION_ENVIRONMENT": "prod"}, nil)
-	if run.err == nil || !strings.Contains(run.log, "predates environments") || len(run.calls) != 0 {
+func TestWorkflowNeedsTheKubeconfig(t *testing.T) {
+	run := runDeploy(t, map[string]string{"KUBECONFIG_DATA": ""}, nil)
+	if run.err == nil || !strings.Contains(run.log, "::error::OWNSTACK_KUBECONFIG is not set") || len(run.calls) != 0 {
 		t.Errorf("err = %v, calls %v\n%s", run.err, run.calls, run.log)
-	}
-	run = runDeploy(t, old, map[string]string{"NAMESPACE": "prod", "PRODUCTION_ENVIRONMENT": "prod"}, nil)
-	if run.err != nil || len(callsWith(run.calls, "helm upgrade")) != 2 {
-		t.Errorf("production deploy with the old library: %v\n%s", run.err, run.log)
 	}
 }

@@ -1,4 +1,4 @@
-// Package engine plans, applies, and inspects a stack by running each
+// Package engine checks, applies, and inspects a stack by running each
 // aspect's provider in catalog order and passing contract outputs forward.
 package engine
 
@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
+	"runtime"
 	"strings"
 	"time"
 
@@ -119,15 +119,8 @@ func (e *Engine) resolve(ctx context.Context) []resolveIssue {
 // ── Apply ────────────────────────────────────────────────────────────────────
 
 type ApplyOptions struct {
-	// Only limits apply to these stages: aspects in the manifest, or the
-	// environments stage. Selecting images also runs the environments stage,
-	// which hands the registry credential to every environment.
-	Only []string
 	// AllowLowMemory skips the memory preflight.
 	AllowLowMemory bool
-	// Prune removes providers that are installed but no longer in the
-	// manifest, including their data.
-	Prune bool
 	// SkipVerify skips the final health check.
 	SkipVerify bool
 	// MemTotalMiB overrides the detected server memory (tests).
@@ -139,16 +132,17 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 	if err := e.Validate(); err != nil {
 		return err
 	}
-	if err := e.checkOnly(opts.Only); err != nil {
-		return err
-	}
-	only := expandOnly(opts.Only)
 
 	start := time.Now()
+	stages := e.stages()
+	ids := make([]string, len(stages))
+	for i, s := range stages {
+		ids[i] = s.id
+	}
 	console.Event("run_started", map[string]string{
 		"stack":  e.Manifest.Metadata.Name,
 		"domain": e.Manifest.Spec.Domain,
-		"stages": strings.Join(e.stageIDs(opts), ","),
+		"stages": strings.Join(ids, ","),
 	})
 	defer func() {
 		fields := map[string]string{"duration": time.Since(start).Round(time.Second).String()}
@@ -164,43 +158,19 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 		return err
 	}
 
-	var applied []stage
-	var credentialChanged bool
-	for _, stage := range e.stages() {
-		if !selected(only, stage.id) {
-			continue
-		}
-		credentialBefore := e.pushCredential()
-		if stage.id == EnvironmentsStage && e.pullSecretsStale(ctx) {
-			credentialChanged = true
-		}
+	for _, stage := range stages {
 		console.Event("stage_started", map[string]string{"id": stage.id, "title": stage.title, "provider": stage.provider})
 		stageStart := time.Now()
 		if err := stage.apply(ctx); err != nil {
 			console.Event("stage_failed", map[string]string{"id": stage.id, "error": err.Error()})
-			if opts.Prune {
-				console.Printf("--prune: nothing was removed because apply failed")
-			}
 			return fmt.Errorf("%s: %w", stage.title, err)
 		}
 		console.Event("stage_completed", map[string]string{"id": stage.id, "duration": time.Since(stageStart).Round(time.Second).String()})
-		applied = append(applied, stage)
-		if e.pushCredential() != credentialBefore {
-			credentialChanged = true
-		}
-	}
-	if credentialChanged {
-		e.warnCredentialConsumers(only)
-	}
-	// Prune only once the new stack runs, so replacing a provider (Harbor by
-	// Zot) never leaves the node without one when the new one fails.
-	if err := e.pruneOrphans(ctx, only, opts.Prune); err != nil {
-		return err
 	}
 	if opts.SkipVerify {
 		return nil
 	}
-	return e.verify(ctx, applied)
+	return e.verify(ctx, stages)
 }
 
 // prepare runs what apply and up need before changing anything: the memory
@@ -218,75 +188,6 @@ func (e *Engine) prepare(ctx context.Context, opts ApplyOptions) error {
 		return fmt.Errorf("save secrets: %w", err)
 	}
 	return nil
-}
-
-// checkOnly rejects --only ids that would apply nothing.
-func (e *Engine) checkOnly(only []string) error {
-	for _, id := range only {
-		if id == EnvironmentsStage {
-			continue
-		}
-		if _, ok := e.Catalog.Aspect(id); !ok {
-			return fmt.Errorf("--only: unknown aspect %q", id)
-		}
-		if _, ok := e.Manifest.Component(id); !ok {
-			return fmt.Errorf("--only: %s is not in ownstack.yaml", id)
-		}
-	}
-	return nil
-}
-
-// expandOnly adds the stages a selection implies: the environments stage
-// holds the registry's pull credential, so applying images refreshes it too.
-func expandOnly(only []string) []string {
-	if len(only) == 0 || !selected(only, "images") || selected(only, EnvironmentsStage) {
-		return only
-	}
-	return append(append([]string(nil), only...), EnvironmentsStage)
-}
-
-// pushCredential identifies the registry credential for change detection.
-// It is only compared, never printed.
-func (e *Engine) pushCredential() [2]string {
-	if images := e.RT.Out.Images; images != nil {
-		return [2]string{images.PushUsername, images.PushPassword}
-	}
-	return [2]string{}
-}
-
-// pullSecretsStale reports whether an existing environment pull secret holds
-// a different credential than the registry now provides (a rotated robot or
-// a changed password).
-func (e *Engine) pullSecretsStale(ctx context.Context) bool {
-	images := e.RT.Out.Images
-	if images == nil || images.PushUsername == "" {
-		return false
-	}
-	for _, env := range e.Manifest.Environments() {
-		raw, ok := e.RT.Kube.SecretValue(ctx, env, images.PullSecretName, ".dockerconfigjson")
-		if ok && stack.PullSecretMismatch(raw, images.PullSecretServer(), images.PushUsername, images.PushPassword) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// warnCredentialConsumers names the stages that still hold the old registry
-// credential because this run did not apply them.
-func (e *Engine) warnCredentialConsumers(only []string) {
-	var stale []string
-	for _, s := range e.stages() {
-		if selected(only, s.id) {
-			continue
-		}
-		aspect, _ := e.Catalog.Aspect(s.id)
-		if s.id == EnvironmentsStage || slices.Contains(aspect.Consumes, "images") {
-			stale = append(stale, s.id)
-		}
-	}
-	if len(stale) > 0 {
-		e.RT.Console.Printf("warning: registry credential changed; run `ownstackctl apply --only %s` so they use the new one", strings.Join(stale, ","))
-	}
 }
 
 // VerifyTimeout bounds the final health check; verifyInterval is how often
@@ -333,8 +234,8 @@ func (e *Engine) verify(ctx context.Context, applied []stage) error {
 }
 
 // MemoryFits reports whether a stack that needs about need MiB fits a server
-// with total MiB. The catalog estimates are generous, so 80% is enough. The
-// apply preflight and doctor share this rule.
+// with total MiB. The catalog estimates are generous, so 80% is enough. Apply
+// and plan share this rule.
 func MemoryFits(total, need int) bool {
 	return float64(total) >= float64(need)*0.8
 }
@@ -380,129 +281,36 @@ func memTotalMiB() int {
 	return kib / 1024
 }
 
-type orphan struct {
-	aspect catalog.Aspect
-	spec   catalog.Provider
-	impl   stack.Removable
-}
-
-func (o orphan) title() string { return o.aspect.Name + " · " + o.spec.Name }
-
-// orphans are installed providers that the manifest no longer selects.
-func (e *Engine) orphans(ctx context.Context) []orphan {
-	if !e.RT.Kube.Reachable(ctx) {
-		return nil
-	}
-	var out []orphan
-	for _, p := range e.Catalog.Providers {
-		if c, ok := e.Manifest.Component(p.Aspect); ok && c.Provider == p.ID {
-			continue
-		}
-		impl, ok := e.lookup(p.Aspect, p.ID)
-		if !ok {
-			continue
-		}
-		removable, ok := impl.(stack.Removable)
-		if !ok || !removable.Installed(ctx, e.RT.For(p.Aspect)) {
-			continue
-		}
-		aspect, _ := e.Catalog.Aspect(p.Aspect)
-		out = append(out, orphan{aspect: aspect, spec: p, impl: removable})
-	}
-	return out
-}
-
-// pruneOrphans removes the selected aspects' orphans with prune, and only
-// warns about them otherwise.
-func (e *Engine) pruneOrphans(ctx context.Context, only []string, prune bool) error {
-	var orphans []orphan
-	for _, o := range e.orphans(ctx) {
-		if selected(only, o.aspect.ID) {
-			orphans = append(orphans, o)
-		}
-	}
-	if prune {
-		return e.prune(ctx, orphans)
-	}
-	for _, o := range orphans {
-		e.RT.Console.Printf("warning: %s is installed but no longer in ownstack.yaml; rerun with --prune to remove it and its data", o.title())
-	}
-	return nil
-}
-
-func (e *Engine) prune(ctx context.Context, orphans []orphan) error {
-	console := e.RT.Console
-	for _, o := range orphans {
-		id := "prune-" + o.spec.ID
-		console.Event("stage_started", map[string]string{"id": id, "title": "Remove " + o.title(), "provider": o.spec.ID})
-		start := time.Now()
-		if err := o.impl.Remove(ctx, e.RT.For(o.aspect.ID)); err != nil {
-			console.Event("stage_failed", map[string]string{"id": id, "error": err.Error()})
-			return fmt.Errorf("remove %s: %w", o.title(), err)
-		}
-		console.Event("stage_completed", map[string]string{"id": id, "duration": time.Since(start).Round(time.Second).String()})
-	}
-	return nil
-}
-
 type stage struct {
 	id, title, provider string
 	apply               func(context.Context) error
-	plan                func(context.Context) []stack.Step
 	status              func(context.Context) []stack.Check
 }
 
-// stages lists providers in catalog order with the environments stage after
-// the registry (or after compute when there is no registry).
+// stages lists providers in catalog order with the environments stage right
+// after the registry, which hands it the pull credential.
 func (e *Engine) stages() []stage {
 	var out []stage
-	units := e.units()
-	envAfter := "compute"
-	for _, u := range units {
-		if u.aspect.ID == "images" {
-			envAfter = "images"
-		}
-	}
-	for _, u := range units {
+	for _, u := range e.units() {
 		u := u
 		out = append(out, stage{
 			id: u.aspect.ID, title: u.title(), provider: u.spec.ID,
 			apply:  func(ctx context.Context) error { return u.impl.Apply(ctx, u.rt) },
-			plan:   func(ctx context.Context) []stack.Step { return u.impl.Plan(ctx, u.rt) },
 			status: func(ctx context.Context) []stack.Check { return u.impl.Status(ctx, u.rt) },
 		})
-		if u.aspect.ID == envAfter {
+		if u.aspect.ID == "images" {
 			env := environments{rt: e.RT}
+			var names []string
+			for _, environment := range e.RT.Environments() {
+				names = append(names, environment.Name)
+			}
 			out = append(out, stage{
-				id: EnvironmentsStage, title: "Environments · " + strings.Join(e.Manifest.Environments(), ", "), provider: "ownstack",
-				apply: env.apply, plan: env.plan, status: env.status,
+				id: EnvironmentsStage, title: "Environments · " + strings.Join(names, ", "), provider: "ownstack",
+				apply: env.apply, status: env.status,
 			})
 		}
 	}
 	return out
-}
-
-func (e *Engine) stageIDs(opts ApplyOptions) []string {
-	only := expandOnly(opts.Only)
-	var ids []string
-	for _, s := range e.stages() {
-		if selected(only, s.id) {
-			ids = append(ids, s.id)
-		}
-	}
-	return ids
-}
-
-func selected(only []string, id string) bool {
-	if len(only) == 0 {
-		return true
-	}
-	for _, o := range only {
-		if o == id {
-			return true
-		}
-	}
-	return false
 }
 
 func resolveError(issues []resolveIssue) error {
@@ -529,10 +337,14 @@ func resolveError(issues []resolveIssue) error {
 
 // ── Plan ─────────────────────────────────────────────────────────────────────
 
+// Plan is apply's preflight: whether the manifest is valid, whether this
+// server can take the stack, which secrets apply would ask for or generate,
+// and the stages it would run. It changes nothing.
 type Plan struct {
 	Stack     string            `json:"stack"`
 	Valid     bool              `json:"valid"`
 	Issues    []manifest.Issue  `json:"issues,omitempty"`
+	Server    []stack.Check     `json:"server"`
 	Missing   []string          `json:"missingSecrets,omitempty"`
 	Generated []string          `json:"generatedSecrets,omitempty"`
 	Resources catalog.Resources `json:"resources"`
@@ -542,16 +354,33 @@ type Plan struct {
 }
 
 type StagePlan struct {
-	ID       string       `json:"id"`
-	Title    string       `json:"title"`
-	Provider string       `json:"provider"`
-	Steps    []stack.Step `json:"steps"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Provider string `json:"provider"`
+}
+
+// Problems counts what would stop apply: manifest issues and failed server
+// checks. Missing secrets are not problems; apply asks for them.
+func (p Plan) Problems() int {
+	n := len(p.Issues)
+	for _, c := range p.Server {
+		if c.State == stack.Fail {
+			n++
+		}
+	}
+	return n
 }
 
 func (e *Engine) Plan(ctx context.Context) Plan {
 	plan := Plan{Stack: e.Manifest.Metadata.Name}
 	plan.Issues = e.Manifest.Validate(e.Catalog)
 	plan.Valid = len(plan.Issues) == 0
+	for _, u := range e.units() {
+		plan.Resources.MemoryMiB += u.spec.Resources.MemoryMiB
+		plan.Resources.DiskGiB += u.spec.Resources.DiskGiB
+	}
+	plan.MemTotalMiB = memTotalMiB()
+	plan.Server = serverChecks(plan.MemTotalMiB, plan.Resources.MemoryMiB)
 	if !plan.Valid {
 		return plan
 	}
@@ -565,19 +394,43 @@ func (e *Engine) Plan(ctx context.Context) Plan {
 			plan.Issues = append(plan.Issues, manifest.Issue{Path: "spec." + issue.aspect, Message: err.Error()})
 		}
 	}
-	for _, u := range e.units() {
-		plan.Resources.MemoryMiB += u.spec.Resources.MemoryMiB
-		plan.Resources.DiskGiB += u.spec.Resources.DiskGiB
-	}
 	for _, s := range e.stages() {
-		plan.Stages = append(plan.Stages, StagePlan{ID: s.id, Title: s.title, Provider: s.provider, Steps: s.plan(ctx)})
+		plan.Stages = append(plan.Stages, StagePlan{ID: s.id, Title: s.title, Provider: s.provider})
 	}
-	for _, o := range e.orphans(ctx) {
-		plan.Stages = append(plan.Stages, StagePlan{ID: "prune-" + o.spec.ID, Title: "Remove " + o.title(), Provider: o.spec.ID,
-			Steps: []stack.Step{{Action: "remove", Target: o.spec.Name, Detail: "no longer in ownstack.yaml; apply --prune deletes it and its data"}}})
-	}
-	plan.MemTotalMiB = memTotalMiB()
 	return plan
+}
+
+// serverChecks are apply's prerequisites on this server. memTotal is 0 when
+// unknown.
+func serverChecks(memTotal, need int) []stack.Check {
+	check := func(ok bool, name, detail string) stack.Check {
+		state := stack.OK
+		if !ok {
+			state = stack.Fail
+		}
+		return stack.Check{Name: name, State: state, Detail: detail}
+	}
+	osName := "unknown"
+	if data, err := os.ReadFile("/etc/os-release"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if v, ok := strings.CutPrefix(line, "PRETTY_NAME="); ok {
+				osName = strings.Trim(v, `"`)
+			}
+		}
+	}
+	checks := []stack.Check{
+		check(os.Geteuid() == 0, "root", "apply installs system packages and must run as root"),
+		check(strings.Contains(osName, "Ubuntu"), "os", osName+" (Ubuntu expected)"),
+		check(runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64", "arch", runtime.GOARCH),
+	}
+	for _, tool := range []string{"bash", "curl"} {
+		checks = append(checks, check((&stack.Exec{}).Has(tool), tool, "required"))
+	}
+	if memTotal > 0 {
+		checks = append(checks, check(MemoryFits(memTotal, need), "memory",
+			fmt.Sprintf("%d MiB on this server, the stack needs about %d MiB", memTotal, need)))
+	}
+	return checks
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────

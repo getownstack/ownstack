@@ -77,21 +77,12 @@ func TestReposPaginatesUserAndOrgs(t *testing.T) {
 	}
 }
 
-func TestFileContentAndDeletes(t *testing.T) {
-	var deleted []string
+func TestFileContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/app/contents/a.yml":
 			encoded := base64.StdEncoding.EncodeToString([]byte("name: ownstack\n"))
 			json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": encoded[:8] + "\n" + encoded[8:]})
-		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/GONE"):
-			http.NotFound(w, r)
-		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/DENIED"):
-			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"message":"Resource not accessible"}`))
-		case r.Method == http.MethodDelete:
-			deleted = append(deleted, r.URL.Path)
-			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -105,21 +96,5 @@ func TestFileContentAndDeletes(t *testing.T) {
 	}
 	if _, err := c.FileContent(ctx, "acme", "app", "missing.yml"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing file: %v", err)
-	}
-	if err := c.DeleteSecret(ctx, "acme", "app", "OWNSTACK_KUBECONFIG"); err != nil {
-		t.Error(err)
-	}
-	if err := c.DeleteVariable(ctx, "acme", "app", "OWNSTACK_DOMAIN"); err != nil {
-		t.Error(err)
-	}
-	if err := c.DeleteSecret(ctx, "acme", "app", "GONE"); err != nil {
-		t.Errorf("a missing secret is already deleted: %v", err)
-	}
-	if err := c.DeleteVariable(ctx, "acme", "app", "DENIED"); err == nil || !strings.Contains(err.Error(), "403") {
-		t.Errorf("refusal: %v", err)
-	}
-	want := []string{"/repos/acme/app/actions/secrets/OWNSTACK_KUBECONFIG", "/repos/acme/app/actions/variables/OWNSTACK_DOMAIN"}
-	if strings.Join(deleted, " ") != strings.Join(want, " ") {
-		t.Errorf("deleted %v", deleted)
 	}
 }

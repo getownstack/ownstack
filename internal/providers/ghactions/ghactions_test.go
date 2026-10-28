@@ -25,7 +25,7 @@ import (
 // is indented YAML under the cicd component.
 func ghRuntime(t *testing.T, settings string) (*stack.Runtime, *bytes.Buffer) {
 	t.Helper()
-	rt, out := providertest.Runtime(t)
+	rt, out := providertest.Runtime(t, Spec)
 	src := strings.Replace(providertest.Manifest, "    provider: jenkins\n", "    provider: gh-actions\n"+settings, 1)
 	m, err := manifest.Parse([]byte(src))
 	if err != nil {
@@ -45,7 +45,6 @@ case "$*" in
   "apply -f -") cat > "$STUB/applied.json" ;;
   "get configmap ownstack-ci-targets -n ownstack-system -o json") [ -f "$STUB/configmap.json" ] && cat "$STUB/configmap.json" || exit 1 ;;
   "get secret ownstack-deployer-token -n ownstack-system -o json") echo '{"data":{"token":"dG9rZW4="}}' ;;
-  "delete "*) ;;
   *) exit 1 ;;
 esac
 `
@@ -70,18 +69,13 @@ func stubKubectl(t *testing.T, recorded *string) string {
 	return dir
 }
 
-func kubectlCalls(t *testing.T, dir string) []string {
-	data, _ := os.ReadFile(filepath.Join(dir, "calls"))
-	return strings.Split(strings.TrimSpace(string(data)), "\n")
-}
-
 // fakeGitHub serves the endpoints the provider uses and records requests.
 type fakeGitHub struct {
 	mu       sync.Mutex
 	requests []string
 	repos    map[string][]string // owner -> repos
 	files    map[string]string   // owner/repo -> workflow content
-	denied   map[string]bool     // owner/repo whose contents or deletes answer 403
+	denied   map[string]bool     // owner/repo whose contents answer 403
 }
 
 func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
@@ -124,8 +118,6 @@ func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
 				conclusion = "success"
 			}
 			json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]string{{"status": "completed", "conclusion": conclusion, "head_sha": "0123456789"}}})
-		case r.Method == http.MethodDelete:
-			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -161,14 +153,12 @@ func TestApplyRefusesWithoutPushCredential(t *testing.T) {
 	}
 }
 
+// defaultEnvironments are spec.environments' defaults.
+var defaultEnvironments = []stack.Environment{{Name: "prod", Branch: "main"}, {Name: "dev", Branch: "develop"}, {Name: "qa", Branch: "release/*"}}
+
 func TestRepoVariables(t *testing.T) {
 	images := &stack.ImagesOutput{Host: "registry.admin.example.com", Project: "apps", PushUsername: "ownstack", PushPassword: "pw", PullSecretName: "registry-credentials"}
-	branches, err := branchMap("prod", "develop=dev release/*=qa")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deploy := deployTargets{production: "prod", branches: branches, environments: []string{"dev", "qa", "prod"}}
-	vars := repoVariables(images, "example.com", deploy, "ownstackctl-v0.3.0", "arm64")
+	vars := repoVariables(images, "example.com", defaultEnvironments, "ownstackctl-v0.3.0", "arm64")
 	want := map[string]string{
 		"OWNSTACK_REGISTRY":          "registry.admin.example.com",
 		"OWNSTACK_REGISTRY_USERNAME": "ownstack",
@@ -179,7 +169,7 @@ func TestRepoVariables(t *testing.T) {
 		"OWNSTACK_NAMESPACE":              "prod",
 		"OWNSTACK_PRODUCTION_ENVIRONMENT": "prod",
 		"OWNSTACK_BRANCHES":               "main=prod develop=dev release/*=qa",
-		"OWNSTACK_ENVIRONMENTS":           "dev qa prod",
+		"OWNSTACK_ENVIRONMENTS":           "prod dev qa",
 		"OWNSTACK_LIBRARY_REF":            "ownstackctl-v0.3.0",
 		"OWNSTACK_PLATFORM":               "linux/arm64",
 	}
@@ -197,75 +187,47 @@ func TestRepoVariables(t *testing.T) {
 		}
 	}
 	// Without a known architecture the workflow keeps its linux/amd64 default.
-	if _, ok := repoVariables(images, "example.com", deploy, "main", "")["OWNSTACK_PLATFORM"]; ok {
+	if _, ok := repoVariables(images, "example.com", defaultEnvironments, "main", "")["OWNSTACK_PLATFORM"]; ok {
 		t.Error("OWNSTACK_PLATFORM set without an architecture")
 	}
 }
 
-// Everything the workflow reads is managed by ownstackctl (and removed by
-// Remove), except OWNSTACK_RUNNER, which belongs to the customer.
+// Everything the workflow reads is set by ownstackctl, except
+// OWNSTACK_RUNNER, which belongs to the customer.
 func TestWorkflowReadsManagedSettings(t *testing.T) {
-	set := repoVariables(&stack.ImagesOutput{}, "", deployTargets{}, "", "amd64")
+	set := repoVariables(&stack.ImagesOutput{}, "", defaultEnvironments, "", "amd64")
 	for _, m := range regexp.MustCompile(`vars\.(OWNSTACK_[A-Z_]+)`).FindAllStringSubmatch(Workflow, -1) {
-		name := m[1]
-		if name == "OWNSTACK_RUNNER" {
-			if slices.Contains(repoVariableNames, name) {
-				t.Error("OWNSTACK_RUNNER is the customer's; ownstackctl must not manage it")
-			}
-			continue
-		}
-		if _, ok := set[name]; !ok || !slices.Contains(repoVariableNames, name) {
-			t.Errorf("workflow reads %s, which ownstackctl does not manage", name)
-		}
-	}
-	for name := range set {
-		if !slices.Contains(repoVariableNames, name) {
-			t.Errorf("%s is set but Remove would not delete it", name)
+		_, ok := set[m[1]]
+		if m[1] == "OWNSTACK_RUNNER" && ok {
+			t.Error("OWNSTACK_RUNNER is the customer's; ownstackctl must not manage it")
+		} else if m[1] != "OWNSTACK_RUNNER" && !ok {
+			t.Errorf("workflow reads %s, which ownstackctl does not set", m[1])
 		}
 	}
 	for _, m := range regexp.MustCompile(`secrets\.(OWNSTACK_[A-Z_]+)`).FindAllStringSubmatch(Workflow, -1) {
-		if !slices.Contains(repoSecretNames, m[1]) {
-			t.Errorf("workflow reads secret %s, which ownstackctl does not manage", m[1])
+		if m[1] != "OWNSTACK_KUBECONFIG" && m[1] != "OWNSTACK_REGISTRY_PASSWORD" {
+			t.Errorf("workflow reads secret %s, which ownstackctl does not set", m[1])
 		}
 	}
 }
 
-// The default branch deploys to the environment setting, first; the
-// branches setting adds pairs in order.
+// Every environment with a branch deploys, in order; the first match wins.
 func TestBranchMap(t *testing.T) {
-	for setting, want := range map[string]string{
-		"":                                 "main=prod",
-		"  develop=dev   release/*=qa  ":   "main=prod develop=dev release/*=qa",
-		"release/*=qa hotfix/*=prod":       "main=prod release/*=qa hotfix/*=prod",
-		"feature/*/preview=dev develop=qa": "main=prod feature/*/preview=dev develop=qa",
+	for _, tc := range []struct {
+		environments []stack.Environment
+		branches     string
+		deploys      string
+	}{
+		{defaultEnvironments, "main=prod develop=dev release/*=qa", "main to prod, develop to dev, release/* to qa"},
+		{[]stack.Environment{{Name: "prod", Branch: "trunk"}, {Name: "staging"}, {Name: "dev", Branch: "*"}}, "trunk=prod *=dev", "trunk to prod, * to dev"},
+		{[]stack.Environment{{Name: "prod"}}, "", "nothing on push"},
 	} {
-		m, err := branchMap("prod", setting)
-		if err != nil {
-			t.Errorf("%q: %v", setting, err)
-			continue
+		if got := formatBranches(branchMap(tc.environments)); got != tc.branches {
+			t.Errorf("%v: OWNSTACK_BRANCHES = %q, want %q", tc.environments, got, tc.branches)
 		}
-		if got := formatBranches(m); got != want {
-			t.Errorf("%q: OWNSTACK_BRANCHES = %q, want %q", setting, got, want)
+		if got := deploysDetail(tc.environments); got != tc.deploys {
+			t.Errorf("%v: deploys %q, want %q", tc.environments, got, tc.deploys)
 		}
-	}
-	for _, bad := range []string{"develop", "develop=", "=dev", "develop=dev=qa", "main=dev", "develop=dev main=qa"} {
-		if _, err := branchMap("prod", bad); err == nil {
-			t.Errorf("branches %q accepted", bad)
-		}
-	}
-
-	rt, _ := ghRuntime(t, "    settings:\n      environment: qa\n      branches: \"develop=dev release/*=prod\"\n")
-	rt.Out.VCS = vcs("")
-	if got := deploysDetail(rt); got != "main to qa, develop to dev, release/* to prod" {
-		t.Errorf("deploys %q", got)
-	}
-	if err := (Provider{}).Resolve(context.Background(), rt); err != nil {
-		t.Errorf("Resolve: %v", err)
-	}
-	rt, _ = ghRuntime(t, "    settings:\n      branches: \"main=dev\"\n")
-	rt.Out.VCS = vcs("")
-	if err := (Provider{}).Resolve(context.Background(), rt); err == nil || !strings.Contains(err.Error(), "branches") {
-		t.Errorf("Resolve accepted main in branches: %v", err)
 	}
 }
 
@@ -443,61 +405,13 @@ func TestRecordTargets(t *testing.T) {
 	if cm.Kind != "ConfigMap" || cm.Metadata.Name != targetsConfigMap || cm.Metadata.Namespace != systemNamespace {
 		t.Errorf("applied %s", data)
 	}
-	// A repo that could not be checked stays recorded, so removal still finds it.
+	// A repo that could not be checked stays recorded, so status still checks it.
 	if got := cm.Data["targets"]; got != "acme/app\nacme/flaky\nacme/new" {
 		t.Errorf("targets = %q", got)
 	}
 	log := out.String()
 	if !strings.Contains(log, "acme/old no longer has") || strings.Contains(log, "acme/flaky no longer") {
 		t.Errorf("log:\n%s", log)
-	}
-}
-
-// Remove deletes the recorded repos' secrets and variables before the
-// namespace holding the record, and a GitHub refusal never blocks the
-// cluster cleanup.
-func TestRemoveCleansRecordedRepos(t *testing.T) {
-	recorded := "acme/app\nacme/locked\n"
-	dir := stubKubectl(t, &recorded)
-	gh := &fakeGitHub{denied: map[string]bool{"acme/locked": true}}
-	srv := gh.serve(t)
-	rt, out := ghRuntime(t, "")
-	rt.Out.VCS = vcs(srv.URL)
-
-	if err := (Provider{}).Remove(context.Background(), rt); err != nil {
-		t.Fatal(err)
-	}
-	var deleted []string
-	for _, r := range gh.got() {
-		if strings.HasPrefix(r, "DELETE /repos/acme/app/") {
-			deleted = append(deleted, r[strings.LastIndex(r, "/")+1:])
-		}
-	}
-	want := append(slices.Clone(repoSecretNames), repoVariableNames...)
-	if strings.Join(deleted, " ") != strings.Join(want, " ") {
-		t.Errorf("deleted %v, want %v", deleted, want)
-	}
-	if !strings.Contains(out.String(), "warning: acme/locked: could not delete") {
-		t.Errorf("log:\n%s", out.String())
-	}
-	calls := kubectlCalls(t, dir)
-	if !strings.HasPrefix(calls[0], "get configmap ") || !strings.Contains(calls[len(calls)-1], "namespace ownstack-system") {
-		t.Errorf("kubectl calls: %v", calls)
-	}
-
-	// Without a token the repos are named and the cluster is still cleaned up.
-	os.Remove(filepath.Join(dir, "calls"))
-	rt.Out.VCS.Token = ""
-	out.Reset()
-	before := len(gh.got())
-	if err := (Provider{}).Remove(context.Background(), rt); err != nil {
-		t.Fatal(err)
-	}
-	if len(gh.got()) != before || !strings.Contains(out.String(), "acme/app, acme/locked keep their OWNSTACK_*") {
-		t.Errorf("log:\n%s", out.String())
-	}
-	if calls := kubectlCalls(t, dir); !strings.Contains(calls[len(calls)-1], "namespace ownstack-system") {
-		t.Errorf("kubectl calls: %v", calls)
 	}
 }
 

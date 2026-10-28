@@ -13,8 +13,37 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Spec is the zot provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "zot", Aspect: "images", Name: "Zot", Mono: "ZT", Hosting: catalog.SelfHosted,
+	Summary:   "A minimal OCI registry in your cluster: one small process, password-protected, on a persistent volume. The light alternative to Harbor.",
+	Resources: catalog.Resources{MemoryMiB: 100, DiskGiB: 10},
+	Params: []catalog.Param{
+		{Key: "host", Label: "Host", Kind: catalog.KindHostname, Default: "registry.{adminDomain}"},
+		{Key: "username", Label: "Username", Kind: catalog.KindString, Default: "ownstack",
+			Pattern: `^[^:\x00-\x20\x7f]+$`, PatternHelp: "must not contain ':', spaces, or control characters"},
+		{Key: "password", Label: "Password", Kind: catalog.KindSecret, Required: true, Generate: true, Env: "ZOT_PASSWORD",
+			Help: "Generated on the server when not provided. Use it to docker login."},
+		// A repository path as OCI registries accept it: lowercase
+		// components joined by '.', '_', '__', dashes, or '/'.
+		{Key: "project", Label: "Image namespace", Kind: catalog.KindString, Default: "apps", Advanced: true,
+			Pattern:     `^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`,
+			PatternHelp: "must be lowercase letters and digits joined by '.', '_', '-' or '/' (registries reject uppercase)"},
+		{Key: "storageGiB", Label: "Storage (GiB)", Kind: catalog.KindInt, Default: "10", Advanced: true},
+		{Key: "keepTags", Label: "Tags to keep", Kind: catalog.KindInt, Default: "0", Advanced: true,
+			Help:    "How many of the most recently pushed tags to keep in each repository; older tags are deleted unless pulled in the last 30 days. 0 keeps everything.",
+			Pattern: `^[0-9]+$`, PatternHelp: "must be 0 or more"},
+		{Key: "pullSecretName", Label: "Pull secret name", Kind: catalog.KindString, Required: true, Default: "registry-credentials", Advanced: true,
+			Help:        "Name of the image pull secret in each environment.",
+			Pattern:     `^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`,
+			PatternHelp: "must be a lowercase Kubernetes name: letters, digits, '-' and '.'"},
+		{Key: "chartVersion", Label: "Chart version", Kind: catalog.KindString, Default: "0.1.128", Advanced: true},
+	},
+}
 
 const (
 	namespace = "zot"
@@ -43,17 +72,6 @@ func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 	}
 	out.PushPassword = password
 	return nil
-}
-
-func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	steps := []stack.Step{
-		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
-		{Action: "ensure", Target: "user " + rt.Setting("username"), Detail: "push and pull for CI and the environments"},
-	}
-	if keep := rt.SettingInt("keepTags"); keep > 0 {
-		steps = append(steps, stack.Step{Action: "ensure", Target: "tag retention", Detail: fmt.Sprintf("keep the %d most recently pushed tags per repository, and tags pulled in the last 30 days", keep)})
-	}
-	return append(steps, stack.Step{Action: "verify", Target: "https://" + rt.Setting("host") + "/v2/", Detail: "authenticated registry API"})
 }
 
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -155,17 +173,4 @@ func checkLogin(ctx context.Context, client *http.Client, host, user, password s
 		return fmt.Errorf("registry returned HTTP %d for %s", res.StatusCode, user)
 	}
 	return nil
-}
-
-func (Provider) Installed(ctx context.Context, rt *stack.Runtime) bool {
-	_, ok := rt.Kube.Release(ctx, release, namespace)
-	return ok
-}
-
-// Remove uninstalls the release and its namespace, including stored data.
-func (Provider) Remove(ctx context.Context, rt *stack.Runtime) error {
-	if err := rt.Kube.HelmUninstall(ctx, release, namespace); err != nil {
-		return err
-	}
-	return rt.Kube.Delete(ctx, "namespace", namespace)
 }

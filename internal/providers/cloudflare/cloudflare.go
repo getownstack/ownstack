@@ -19,9 +19,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/providers/dnscheck"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Spec is the cloudflare provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "cloudflare", Aspect: "dns", Name: "Cloudflare", Mono: "CF", Hosting: catalog.External,
+	Summary: "A records are managed through the Cloudflare API, and certificates use DNS-01 so no ports need to be reachable during issuance.",
+	Params: []catalog.Param{
+		{Key: "apiToken", Label: "API token", Kind: catalog.KindSecret, Required: true, Env: "CLOUDFLARE_API_TOKEN",
+			Help:    "Use the \"Edit zone DNS\" template, limited to this domain's zone.",
+			HelpURL: "https://dash.cloudflare.com/profile/api-tokens"},
+		{Key: "zone", Label: "Zone", Kind: catalog.KindHostname, Advanced: true,
+			Help: "Cloudflare zone name. Detected from the domain when empty."},
+		{Key: "replaceRecords", Label: "Replace existing records", Kind: catalog.KindBool, Default: "false", Advanced: true,
+			Help: "Let ownstackctl replace records for the domain and its wildcard that it did not create. When off, apply stops instead of overwriting them."},
+	},
+}
 
 type Provider struct {
 	// BaseURL overrides the API endpoint in tests.
@@ -29,7 +45,7 @@ type Provider struct {
 }
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
-	out := &stack.DNSOutput{Challenge: stack.ChallengeDNS, ACMEProvider: "cloudflare", ACMEEnv: map[string]string{}}
+	out := &stack.DNSOutput{ACMEProvider: "cloudflare", ACMEEnv: map[string]string{}}
 	rt.Out.DNS = out
 	token, err := rt.Secret("apiToken")
 	if err != nil {
@@ -43,57 +59,9 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 // records ownstackctl did not create.
 const replaceSetting = "spec.dns.settings.replaceRecords"
 
-func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	domain, ip := rt.Manifest.Spec.Domain, rt.Out.Compute.PublicIP
-	// The records themselves tell what apply would change; public DNS shows
-	// Cloudflare's addresses for proxied records. Without a token (plan
-	// before the secrets exist) public DNS is the fallback.
-	if rt.Out.DNS != nil && rt.Out.DNS.ACMEEnv["CF_DNS_API_TOKEN"] != "" {
-		if steps, err := p.planFromRecords(ctx, rt); err == nil {
-			return steps
-		}
-	}
-	if dnscheck.AllMatch(ctx, domain, ip) {
-		return []stack.Step{{Action: "verify", Target: "DNS records", Detail: fmt.Sprintf("%s and *.%s already resolve to %s", domain, domain, ip)}}
-	}
-	return []stack.Step{{Action: "configure", Target: "DNS records", Detail: fmt.Sprintf("A %s and *.%s -> %s (DNS only, not proxied)", domain, domain, ip)}}
-}
-
-// planFromRecords describes what apply does to each name's records.
-func (p Provider) planFromRecords(ctx context.Context, rt *stack.Runtime) ([]stack.Step, error) {
-	api := p.client(rt)
-	domain, ip := rt.Manifest.Spec.Domain, rt.Out.Compute.PublicIP
-	zoneID, err := api.findZone(ctx, rt.Setting("zone"), domain)
-	if err != nil {
-		return nil, err
-	}
-	var steps []stack.Step
-	for _, name := range recordNames(domain) {
-		existing, err := api.records(ctx, zoneID, name)
-		if err != nil {
-			return nil, err
-		}
-		plan := planRecords(existing, ip)
-		target := "A " + name
-		switch {
-		case len(plan.foreign) > 0 && rt.SettingBool("replaceRecords"):
-			steps = append(steps, stack.Step{Action: "replace", Target: target, Detail: fmt.Sprintf("currently %s -> %s", describe(plan.foreign), ip)})
-		case len(plan.foreign) > 0:
-			steps = append(steps, stack.Step{Action: "replace", Target: target, Detail: fmt.Sprintf("currently %s, not created by ownstackctl; apply stops unless %s is true", describe(plan.foreign), replaceSetting)})
-		case plan.unchanged():
-			steps = append(steps, stack.Step{Action: "verify", Target: target, Detail: ip})
-		case plan.keep != nil && plan.keep.Content != ip:
-			steps = append(steps, stack.Step{Action: "configure", Target: target, Detail: fmt.Sprintf("currently %s -> %s (DNS only, not proxied)", plan.keep.Content, ip)})
-		default:
-			steps = append(steps, stack.Step{Action: "configure", Target: target, Detail: ip + " (DNS only, not proxied)"})
-		}
-	}
-	return steps, nil
-}
-
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	api := p.client(rt)
-	domain, ip := rt.Manifest.Spec.Domain, rt.Out.Compute.PublicIP
+	domain, ip := rt.Domain(), rt.Out.Compute.PublicIP
 	replace := rt.SettingBool("replaceRecords")
 
 	var zoneID string

@@ -11,8 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"syscall"
 
 	"github.com/getownstack/ownstack/internal/engine"
@@ -73,8 +71,6 @@ func run(ctx context.Context, args []string) error {
 	case "workflow":
 		fmt.Print(ghactions.Workflow)
 		return nil
-	case "doctor":
-		return cmdDoctor(ctx, rest)
 	case "version":
 		fmt.Println("ownstackctl", version)
 		return nil
@@ -90,13 +86,13 @@ Usage:
   ownstackctl up       [-f ownstack.yaml] [--dir /root/ownstack-cluster]
                        Create or update your cluster repo with the manifest, then apply it.
                        Use this for the first run on a fresh server.
-  ownstackctl apply    [-f ownstack.yaml] [--only aspect,...] [--prune]
+  ownstackctl apply    [-f ownstack.yaml]
                        Converge this server to the manifest, then check it is healthy.
-                       Safe to rerun. --prune removes providers no longer in the manifest.
-  ownstackctl plan     [-f ownstack.yaml] [--json]    Show what apply would do.
+                       Safe to rerun.
+  ownstackctl plan     [-f ownstack.yaml] [--json]    Check before apply: the manifest, this server,
+                                                      its memory, the secrets, and the stages.
   ownstackctl status   [-f ownstack.yaml] [--json]    Check every part of the running stack.
   ownstackctl validate [-f ownstack.yaml] [--json]    Check the manifest against the catalog.
-  ownstackctl doctor   [-f ownstack.yaml]             Check this server's prerequisites.
   ownstackctl catalog                                 Print aspects, providers, and presets as JSON.
   ownstackctl workflow                                Print the GitHub Actions workflow for app repos
                                                       (.github/workflows/ownstack.yml).
@@ -113,7 +109,6 @@ Flags shared by commands that read the manifest:
   --report URL         also send progress to an Ownstack run (token in OWNSTACK_REPORT_TOKEN)
 
 Flags for apply and up:
-  --prune              remove installed providers that are no longer in the manifest
   --allow-low-memory   skip the check that the stack fits this server's memory
   --no-verify          skip the final health check
 `)
@@ -139,39 +134,24 @@ func newFlags(name string, c *common) *flag.FlagSet {
 }
 
 type loaded struct {
-	manifest  *manifest.Manifest
-	raw       []byte
-	legacy    bool
-	overrides map[string]string
+	manifest *manifest.Manifest
+	raw      []byte
 }
 
-// load reads the manifest, falling back to the pre-manifest environment
-// contract used by older Ownstack runners.
+// load reads and parses the manifest.
 func load(path string) (*loaded, error) {
 	data, err := os.ReadFile(path)
-	if err == nil {
-		m, perr := manifest.Parse(data)
-		if perr == nil {
-			return &loaded{manifest: m, raw: data}, nil
-		}
-		if !errors.Is(perr, manifest.ErrNotV1) {
-			return nil, fmt.Errorf("%s: %w", path, perr)
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	if m, secretValues, ok := manifest.FromLegacyEnv(os.Getenv); ok {
-		fmt.Fprintln(os.Stderr, "note: no ownstack.io/v1 manifest found; using the legacy environment variables")
-		raw, err := m.Marshal(providers.Catalog())
-		if err != nil {
-			return nil, err
-		}
-		return &loaded{manifest: m, raw: raw, legacy: true, overrides: secretValues}, nil
-	}
-	if err != nil {
+	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("%s not found; create one in the Ownstack designer or pass -f", path)
 	}
-	return nil, fmt.Errorf("%s is not an ownstack.io/v1 manifest", path)
+	if err != nil {
+		return nil, err
+	}
+	m, err := manifest.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &loaded{manifest: m, raw: data}, nil
 }
 
 type session struct {
@@ -191,7 +171,6 @@ func open(ctx context.Context, c common, out io.Writer) (*session, error) {
 	activeConsole = console
 	store := secrets.NewStore(c.secretsFile)
 	store.Prompt = !c.noPrompt
-	store.Overrides = l.overrides
 	s := &session{engine: engine.New(l.manifest, store, console), console: console, store: store, loaded: l}
 	if c.reportURL != "" {
 		token := os.Getenv("OWNSTACK_REPORT_TOKEN")
@@ -223,14 +202,11 @@ func (s *session) finish(err error) error {
 
 func cmdApply(ctx context.Context, args []string) error {
 	var c common
-	var only string
 	var opts engine.ApplyOptions
 	var hf healthFlags
 	fs := newFlags("apply", &c)
 	applyFlags(fs, &opts)
 	hf.register(fs)
-	fs.StringVar(&only, "only", "", "comma-separated aspects to apply")
-	fs.String("legacy-script", "", "ignored; older cluster repos' setup scripts pass it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -243,24 +219,12 @@ func cmdApply(ctx context.Context, args []string) error {
 		return s.finish(err)
 	}
 	defer unlock()
-	opts.Only = parseOnly(only)
 	err = s.engine.Apply(ctx, opts)
 	if err == nil {
 		printSummary(s)
 		setupHealth(ctx, s, hf, c.reportURL, c.file)
 	}
 	return s.finish(err)
-}
-
-// parseOnly splits --only, ignoring spaces and empty entries.
-func parseOnly(s string) []string {
-	var ids []string
-	for _, id := range strings.Split(s, ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 func cmdUp(ctx context.Context, args []string) error {
@@ -323,26 +287,20 @@ func cmdPlan(ctx context.Context, args []string) error {
 	if c.jsonOut {
 		return printJSON(plan)
 	}
+	marks := map[string]string{stack.OK: "✓", stack.Fail: "✗"}
 	fmt.Printf("Plan for stack %q\n", plan.Stack)
 	for _, issue := range plan.Issues {
 		fmt.Printf("  ✗ %s\n", issue)
 	}
-	if !plan.Valid {
-		return fmt.Errorf("ownstack.yaml is not valid")
+	fmt.Println("\nServer")
+	for _, check := range plan.Server {
+		fmt.Printf("  %s %-8s %s\n", marks[check.State], check.Name, check.Detail)
 	}
-	fmt.Printf("Needs about %.1f GiB memory and %d GiB disk", float64(plan.Resources.MemoryMiB)/1024, plan.Resources.DiskGiB)
-	if plan.MemTotalMiB > 0 {
-		fmt.Printf(" (this server has %.1f GiB)", float64(plan.MemTotalMiB)/1024)
-	}
-	fmt.Print(".\n\n")
-	for _, stage := range plan.Stages {
-		fmt.Printf("%s\n", stage.Title)
-		for _, step := range stage.Steps {
-			fmt.Printf("  %-9s %s", step.Action, step.Target)
-			if step.Detail != "" {
-				fmt.Printf("  (%s)", step.Detail)
-			}
-			fmt.Println()
+	fmt.Printf("\nThe stack needs about %.1f GiB memory and %d GiB disk.\n", float64(plan.Resources.MemoryMiB)/1024, plan.Resources.DiskGiB)
+	if len(plan.Stages) > 0 {
+		fmt.Println("\nStages")
+		for _, stage := range plan.Stages {
+			fmt.Printf("  %s\n", stage.Title)
 		}
 	}
 	if len(plan.Missing) > 0 {
@@ -356,6 +314,9 @@ func cmdPlan(ctx context.Context, args []string) error {
 		for _, g := range plan.Generated {
 			fmt.Printf("  %s\n", g)
 		}
+	}
+	if n := plan.Problems(); n > 0 {
+		return fmt.Errorf("%d problem(s) would stop apply", n)
 	}
 	return nil
 }
@@ -372,6 +333,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	c.noPrompt = true
 	s, err := open(ctx, c, os.Stderr)
 	if err != nil {
+		return err
+	}
+	// Parse accepts any YAML, so a file that is not a valid manifest would
+	// otherwise report a stack with no stages as healthy.
+	if err := s.engine.Validate(); err != nil {
 		return err
 	}
 	s.store.Generate, s.store.Save = false, false
@@ -423,60 +389,6 @@ func cmdValidate(args []string) error {
 		fmt.Printf("  ✗ %s\n", issue)
 	}
 	return fmt.Errorf("%d problem(s) in %s", len(issues), c.file)
-}
-
-func cmdDoctor(ctx context.Context, args []string) error {
-	var c common
-	fs := newFlags("doctor", &c)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	problems := 0
-	report := func(ok bool, name, detail string) {
-		mark := "✓"
-		if !ok {
-			mark = "✗"
-			problems++
-		}
-		fmt.Printf("  %s %-14s %s\n", mark, name, detail)
-	}
-	fmt.Println("Server")
-	report(os.Geteuid() == 0, "root", "apply installs system packages and must run as root")
-	osName := "unknown"
-	if data, err := os.ReadFile("/etc/os-release"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "PRETTY_NAME=") {
-				osName = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
-			}
-		}
-	}
-	report(strings.Contains(osName, "Ubuntu"), "os", osName+" (Ubuntu 22.04 or 24.04 expected)")
-	report(runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64", "arch", runtime.GOARCH)
-	for _, tool := range []string{"bash", "curl"} {
-		e := &stack.Exec{}
-		report(e.Has(tool), tool, "required")
-	}
-
-	if l, err := load(c.file); err == nil {
-		fmt.Println("\nManifest")
-		issues := l.manifest.Validate(providers.Catalog())
-		report(len(issues) == 0, "valid", fmt.Sprintf("%d issue(s)", len(issues)))
-		store := secrets.NewStore(c.secretsFile)
-		store.Save, store.Generate = false, false
-		store.Overrides = l.overrides
-		eng := engine.New(l.manifest, store, stack.NewConsole(io.Discard))
-		plan := eng.Plan(ctx)
-		if total, need := plan.MemTotalMiB, plan.Resources.MemoryMiB; total > 0 {
-			report(engine.MemoryFits(total, need), "memory", fmt.Sprintf("%d MiB on this server, stack needs about %d MiB", total, need))
-		}
-		report(len(plan.Missing) == 0, "secrets", fmt.Sprintf("%d secret(s) still to provide", len(plan.Missing)))
-	} else {
-		fmt.Printf("\nManifest\n  - %v\n", err)
-	}
-	if problems > 0 {
-		return fmt.Errorf("%d problem(s) found", problems)
-	}
-	return nil
 }
 
 // printSummary tells the user where their stack is and how to sign in.
@@ -559,7 +471,6 @@ func setupHealth(ctx context.Context, s *session, h healthFlags, reportURL, mani
 }
 
 func applyFlags(fs *flag.FlagSet, opts *engine.ApplyOptions) {
-	fs.BoolVar(&opts.Prune, "prune", false, "remove installed providers no longer in the manifest")
 	fs.BoolVar(&opts.AllowLowMemory, "allow-low-memory", false, "skip the memory preflight")
 	fs.BoolVar(&opts.SkipVerify, "no-verify", false, "skip the final health check")
 }

@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/manifest"
 	"github.com/getownstack/ownstack/internal/providers"
 	"github.com/getownstack/ownstack/internal/providers/providertest"
@@ -23,9 +22,9 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-// The environments stage and orphan detection call kubectl and helm. These
-// stubs answer like an empty, reachable cluster; a pull secret is returned
-// when the test writes one to $OWNSTACK_STUB_DIR/secret.json.
+// The environments stage calls kubectl. These stubs answer like an empty,
+// reachable cluster; a pull secret is returned when the test writes one to
+// $OWNSTACK_STUB_DIR/secret.json.
 const kubectlStub = `#!/bin/sh
 case "$*" in
   "apply -f -") cat >/dev/null ;;
@@ -70,8 +69,6 @@ func (f *fake) Resolve(_ context.Context, rt *stack.Runtime) error {
 	return nil
 }
 
-func (f *fake) Plan(context.Context, *stack.Runtime) []stack.Step { return nil }
-
 func (f *fake) Apply(_ context.Context, rt *stack.Runtime) error {
 	*f.log = append(*f.log, "apply "+f.aspect)
 	if f.apply != nil {
@@ -87,16 +84,6 @@ func (f *fake) Status(context.Context, *stack.Runtime) []stack.Check {
 	return f.checks
 }
 
-// removable is an installed provider the manifest no longer selects.
-type removable struct{ *fake }
-
-func (removable) Installed(context.Context, *stack.Runtime) bool { return true }
-
-func (r removable) Remove(context.Context, *stack.Runtime) error {
-	*r.log = append(*r.log, "remove "+r.aspect)
-	return nil
-}
-
 type bootstrapper struct{ *fake }
 
 func (b bootstrapper) Bootstrap(context.Context, *stack.Runtime, []byte, string) error {
@@ -109,7 +96,6 @@ type harness struct {
 	out    bytes.Buffer
 	log    []string
 	fakes  map[string]*fake
-	extra  map[string]stack.Provider // installed providers outside the manifest
 	stubs  string
 	store  *secrets.Store
 	secret string // secrets file path
@@ -119,7 +105,7 @@ type harness struct {
 // holds the secret environment.
 func newHarness(t *testing.T, src string, env map[string]string) *harness {
 	t.Helper()
-	h := &harness{fakes: map[string]*fake{}, extra: map[string]stack.Provider{}, stubs: stubTools(t)}
+	h := &harness{fakes: map[string]*fake{}, stubs: stubTools(t)}
 	m, err := manifest.Parse([]byte(src))
 	if err != nil {
 		t.Fatal(err)
@@ -136,8 +122,7 @@ func newHarness(t *testing.T, src string, env map[string]string) *harness {
 			}
 			return f, true
 		}
-		p, ok := h.extra[catalog.Key(aspect, id)]
-		return p, ok
+		return nil, false
 	}
 	h.e = NewWith(m, h.store, stack.NewConsole(&h.out), providers.Catalog(), lookup)
 	return h
@@ -202,69 +187,24 @@ func TestApplyLifecycle(t *testing.T) {
 	if err := h.e.Apply(context.Background(), fits); err != nil {
 		t.Fatalf("%v\n%s", err, h.out.String())
 	}
-	if !strings.Contains(h.out.String(), `stages="compute,dns,ingress,vcs,images,environments,alerts,cicd"`) {
+	if !strings.Contains(h.out.String(), `stages="compute,dns,ingress,vcs,images,environments,cicd"`) {
 		t.Errorf("run_started does not list the stages:\n%s", h.out.String())
 	}
-	want := append([]string{"run_started"}, stageEvents("compute", "dns", "ingress", "vcs", "images", "environments", "alerts", "cicd", "verify")...)
+	want := append([]string{"run_started"}, stageEvents("compute", "dns", "ingress", "vcs", "images", "environments", "cicd", "verify")...)
 	want = append(want, "run_completed")
 	if got := h.events(); !slices.Equal(got, want) {
 		t.Errorf("events:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
 
-func TestApplyOnly(t *testing.T) {
-	for _, tc := range []struct {
-		only   []string
-		stages []string
-	}{
-		{[]string{"cicd"}, []string{"cicd"}},
-		// The environments stage holds the registry credential.
-		{[]string{"images"}, []string{"images", "environments"}},
-		{[]string{"environments", "alerts"}, []string{"environments", "alerts"}},
-	} {
-		h := newHarness(t, providertest.Manifest, providertest.Env)
-		opts := fits
-		opts.Only = tc.only
-		if err := h.e.Apply(context.Background(), opts); err != nil {
-			t.Fatal(err)
-		}
-		var applied []string
-		for _, ev := range h.events() {
-			if id, ok := strings.CutPrefix(ev, "stage_completed "); ok && id != "verify" {
-				applied = append(applied, id)
-			}
-		}
-		if !slices.Equal(applied, tc.stages) {
-			t.Errorf("--only %v applied %v, want %v", tc.only, applied, tc.stages)
-		}
-		if !strings.Contains(h.out.String(), `stages="`+strings.Join(tc.stages, ",")+`"`) {
-			t.Errorf("--only %v: run_started does not list %v", tc.only, tc.stages)
-		}
-	}
-}
-
-func TestApplyRejectsOnlyThatAppliesNothing(t *testing.T) {
-	h := newHarness(t, providertest.Manifest, providertest.Env)
-	for only, want := range map[string]string{"metrics": "metrics is not in ownstack.yaml", "registry": `unknown aspect "registry"`} {
-		err := h.e.Apply(context.Background(), ApplyOptions{Only: []string{only}})
-		if err == nil || !strings.Contains(err.Error(), want) {
-			t.Errorf("--only %s: err = %v", only, err)
-		}
-	}
-}
-
-func TestApplyFailureIsRedactedAndPrunesNothing(t *testing.T) {
+func TestApplyFailureIsRedacted(t *testing.T) {
 	env := withoutEnv()
 	env["GITHUB_TOKEN"] = `gh"tok\en99`
 	h := newHarness(t, providertest.Manifest, env)
-	zot := &fake{aspect: "images", log: &h.log}
-	h.extra[catalog.Key("images", "zot")] = removable{zot}
 	h.fake("images").apply = func(*stack.Runtime) error {
 		return fmt.Errorf("push denied for token %s", env["GITHUB_TOKEN"])
 	}
-	opts := fits
-	opts.Prune = true
-	err := h.e.Apply(context.Background(), opts)
+	err := h.e.Apply(context.Background(), fits)
 	if err == nil {
 		t.Fatal("apply succeeded")
 	}
@@ -275,37 +215,6 @@ func TestApplyFailureIsRedactedAndPrunesNothing(t *testing.T) {
 	}
 	if strings.Contains(h.out.String(), "en99") {
 		t.Errorf("secret leaked:\n%s", h.out.String())
-	}
-	if slices.Contains(h.log, "remove images") || !strings.Contains(h.out.String(), "nothing was removed") {
-		t.Errorf("pruned after a failed apply: %v", h.log)
-	}
-}
-
-func TestPruneRunsAfterTheNewStack(t *testing.T) {
-	h := newHarness(t, providertest.Manifest, providertest.Env)
-	h.extra[catalog.Key("images", "zot")] = removable{&fake{aspect: "images", log: &h.log}}
-	opts := fits
-	opts.Prune = true
-	if err := h.e.Apply(context.Background(), opts); err != nil {
-		t.Fatal(err)
-	}
-	events := h.events()
-	if i := slices.Index(events, "stage_started prune-zot"); i < 0 || events[i-1] != "stage_completed cicd" || events[i+2] != "stage_started verify" {
-		t.Errorf("prune is not between the stages and verify:\n%s", strings.Join(events, "\n"))
-	}
-	if h.log[len(h.log)-1] != "remove images" {
-		t.Errorf("log = %v", h.log)
-	}
-
-	// --only limits pruning to the selected aspects.
-	h = newHarness(t, providertest.Manifest, providertest.Env)
-	h.extra[catalog.Key("images", "zot")] = removable{&fake{aspect: "images", log: &h.log}}
-	opts.Only = []string{"cicd"}
-	if err := h.e.Apply(context.Background(), opts); err != nil {
-		t.Fatal(err)
-	}
-	if slices.Contains(h.log, "remove images") {
-		t.Errorf("--only cicd pruned the registry: %v", h.log)
 	}
 }
 
@@ -362,7 +271,7 @@ func (r recovering) Status(context.Context, *stack.Runtime) []stack.Check {
 func TestStatusTakesTheWorstState(t *testing.T) {
 	h := newHarness(t, providertest.Manifest, providertest.Env)
 	h.fake("dns").checks = []stack.Check{{Name: "a", State: stack.OK}, {Name: "b", State: stack.Warn}}
-	h.fake("alerts").checks = []stack.Check{{Name: "c", State: stack.Unknown}}
+	h.fake("vcs").checks = []stack.Check{{Name: "c", State: stack.Unknown}}
 	st := h.e.Status(context.Background())
 	if st.State != stack.Warn {
 		t.Errorf("state = %s", st.State)
@@ -373,7 +282,7 @@ func TestStatusTakesTheWorstState(t *testing.T) {
 	for _, s := range st.Stages {
 		states[s.ID] = s.State
 	}
-	if st.State != stack.Fail || states["dns"] != stack.Warn || states["alerts"] != stack.Unknown || states["compute"] != stack.OK {
+	if st.State != stack.Fail || states["dns"] != stack.Warn || states["vcs"] != stack.Unknown || states["compute"] != stack.OK {
 		t.Errorf("status = %s %v", st.State, states)
 	}
 }
@@ -384,11 +293,11 @@ func TestPlanListsSecretsInCatalogOrder(t *testing.T) {
 		h := newHarness(t, providertest.Manifest, nil)
 		h.store.Generate, h.store.Save = false, false
 		plan := h.e.Plan(context.Background())
-		if len(plan.Missing) != 3 || len(plan.Generated) != 2 {
+		if len(plan.Missing) != 2 || len(plan.Generated) != 2 {
 			t.Fatalf("missing %v, generated %v", plan.Missing, plan.Generated)
 		}
 		got := append(plan.Missing, plan.Generated...)
-		order := []string{"CLOUDFLARE_API_TOKEN", "GITHUB_TOKEN", "SLACK_BOT_TOKEN", "HARBOR_ADMIN_PASSWORD", "JENKINS_ADMIN_PASSWORD"}
+		order := []string{"CLOUDFLARE_API_TOKEN", "GITHUB_TOKEN", "HARBOR_ADMIN_PASSWORD", "JENKINS_ADMIN_PASSWORD"}
 		for j, name := range order {
 			if !strings.Contains(got[j], name) {
 				t.Fatalf("secret %d = %q, want %s", j, got[j], name)
@@ -442,56 +351,13 @@ func registry(user, pass string) func(rt *stack.Runtime) {
 	}
 }
 
-func TestCredentialChangeWarnsUnappliedConsumers(t *testing.T) {
-	const warning = "registry credential changed; run `ownstackctl apply --only cicd`"
-	// The stubbed cluster never takes the new pull secret, so verify is skipped.
-	opts := ApplyOptions{MemTotalMiB: fits.MemTotalMiB, SkipVerify: true}
-	only := func(ids ...string) ApplyOptions { o := opts; o.Only = ids; return o }
-
-	// Harbor recreated its robot during the images stage.
-	h := newHarness(t, providertest.Manifest, providertest.Env)
-	h.fake("images").resolve = registry("robot$ci", "old-robot-pw")
-	h.fake("images").apply = func(rt *stack.Runtime) error {
-		rt.Out.Images.PushPassword = "new-robot-pw"
-		return nil
-	}
-	if err := h.e.Apply(context.Background(), only("images")); err != nil {
-		t.Fatal(err)
-	}
-	if out := h.out.String(); !strings.Contains(out, warning) || strings.Contains(out, "robot-pw") {
-		t.Errorf("output:\n%s", out)
-	}
-
-	// A changed password reached the environments, not yet CI.
-	h = newHarness(t, providertest.Manifest, providertest.Env)
-	h.fake("images").resolve = registry("ci", "new-pw")
-	pullSecret(t, h, "harbor.example.com", "ci", "old-pw")
-	if err := h.e.Apply(context.Background(), only("environments")); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(h.out.String(), warning) {
-		t.Errorf("no warning for a stale pull secret:\n%s", h.out.String())
-	}
-
-	// A full apply updates every consumer: nothing to warn about.
-	h = newHarness(t, providertest.Manifest, providertest.Env)
-	h.fake("images").resolve = registry("ci", "new-pw")
-	pullSecret(t, h, "harbor.example.com", "ci", "old-pw")
-	if err := h.e.Apply(context.Background(), opts); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(h.out.String(), "credential changed") {
-		t.Errorf("warned on a full apply:\n%s", h.out.String())
-	}
-}
-
 func TestEnvironmentsStatusDetectsStalePullSecret(t *testing.T) {
 	h := newHarness(t, providertest.Manifest, providertest.Env)
 	registry("robot$ci", "current-pw")(h.e.RT)
 	env := environments{rt: h.e.RT}
 	pullSecret(t, h, "harbor.example.com", "robot$ci", "rotated-pw")
 	checks := env.status(context.Background())
-	if len(checks) == 0 || checks[0].State != stack.Fail || checks[0].Detail != "stale pull secret (different password); rerun apply --only environments" {
+	if len(checks) == 0 || checks[0].State != stack.Fail || checks[0].Detail != "stale pull secret (different password); rerun apply" {
 		t.Fatalf("checks = %+v", checks)
 	}
 	for _, c := range checks {

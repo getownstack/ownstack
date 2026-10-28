@@ -35,8 +35,6 @@ spec:
       owner: acme
   images:
     provider: harbor
-  alerts:
-    provider: slack
   cicd:
     provider: jenkins
 `
@@ -47,11 +45,12 @@ var Env = map[string]string{
 	"GITHUB_TOKEN":           "gh-token-value",
 	"HARBOR_ADMIN_PASSWORD":  "harbor-admin-pw",
 	"JENKINS_ADMIN_PASSWORD": "jenkins-admin-pw",
-	"SLACK_BOT_TOKEN":        "xoxb-slack-token",
 }
 
 // Runtime returns a runtime for the test manifest and the console buffer.
-func Runtime(t *testing.T) (*stack.Runtime, *bytes.Buffer) {
+// Its catalog holds specs, the providers under test: the full catalog
+// (providers.Catalog) would import the packages that use this one.
+func Runtime(t *testing.T, specs ...catalog.Provider) (*stack.Runtime, *bytes.Buffer) {
 	t.Helper()
 	m, err := manifest.Parse([]byte(Manifest))
 	if err != nil {
@@ -62,12 +61,11 @@ func Runtime(t *testing.T) (*stack.Runtime, *bytes.Buffer) {
 	store := secrets.NewStore(filepath.Join(t.TempDir(), "secrets.env"))
 	store.Getenv = func(k string) string { return Env[k] }
 	store.OnValue(console.Redact)
-	// The real catalog marks availability from the provider registry, which
-	// would import the providers under test; availability is irrelevant here.
 	cat := catalog.Default()
+	cat.Providers = specs
 	rt := stack.NewRuntime(m, cat, store, console)
 	rt.Out.Compute = &stack.ComputeOutput{PublicIP: "203.0.113.10"}
-	rt.Out.DNS = &stack.DNSOutput{Challenge: stack.ChallengeDNS, ACMEProvider: "cloudflare", ACMEEnv: map[string]string{"CF_DNS_API_TOKEN": Env["CLOUDFLARE_API_TOKEN"]}}
+	rt.Out.DNS = &stack.DNSOutput{ACMEProvider: "cloudflare", ACMEEnv: map[string]string{"CF_DNS_API_TOKEN": Env["CLOUDFLARE_API_TOKEN"]}}
 	rt.Out.Ingress = &stack.IngressOutput{EntryPoint: "websecure", CertResolver: "main", Annotations: map[string]string{
 		"traefik.ingress.kubernetes.io/router.entrypoints":      "websecure",
 		"traefik.ingress.kubernetes.io/router.tls.certresolver": "main",

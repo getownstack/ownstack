@@ -8,37 +8,22 @@ on:
 permissions:
   contents: read
 
-# Forks and copies of this repository (including cluster repos generated from
-# it when it was a template) carry these workflows. Every job checks the
-# repository so CI never runs (or bills) in them.
 jobs:
-  go:
-    name: Go vet and test
-    if: github.repository == 'getownstack/ownstack'
+  test:
+    name: Vet, test, and shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       # The common_helm_library render tests need helm; in CI they fail without it.
-      - uses: azure/setup-helm@v4.3.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.22.1
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test ./...
-
-  shell:
-    name: Shell scripts
-    if: github.repository == 'getownstack/ownstack'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Syntax
-        run: for f in install.sh scripts/verify-jenkins.sh; do bash -n "$f"; done
-      - name: ShellCheck
-        run: |
-          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck install.sh scripts/verify-jenkins.sh
+      - run: go vet ./...
+      - run: go test ./...
+      # The runner image ships shellcheck.
+      - run: shellcheck install.sh scripts/*.sh

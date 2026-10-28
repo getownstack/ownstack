@@ -124,44 +124,39 @@ func TestRobotAccess(t *testing.T) {
 
 // A Harbor that keeps failing must make apply fail, never rotate the robot.
 func TestCheckRobotDoesNotRotateOnServerErrors(t *testing.T) {
-	defer func(a int, d time.Duration) { robotCheckAttempts, robotCheckDelay = a, d }(robotCheckAttempts, robotCheckDelay)
-	robotCheckAttempts, robotCheckDelay = 3, 0
+	defer func(d time.Duration) { robotCheckTimeout = d }(robotCheckTimeout)
+	robotCheckTimeout = 0
 
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/projects/product/repositories" {
+		if r.Method != http.MethodGet || r.URL.Path != "/projects/apps/repositories" {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		}
 		calls++
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	c := &client{base: srv.URL, user: "robot$ownstack-ci", password: "s3cret", http: srv.Client()}
-	valid, err := checkRobot(context.Background(), rt.Console, c, "product")
+	valid, err := checkRobot(context.Background(), rt, c)
 	if err == nil || valid {
 		t.Fatalf("valid=%v err=%v, want an error", valid, err)
 	}
-	if calls != 3 {
-		t.Errorf("checked %d times, want 3", calls)
+	if calls != 1 {
+		t.Errorf("checked %d times, want 1", calls)
 	}
 }
 
-func TestResolvePullSecretName(t *testing.T) {
-	rt, _ := providertest.Runtime(t)
+// Every registry follows the same contract: the pull secret is
+// registry-credentials and images go to <host>/apps.
+func TestResolveOutputs(t *testing.T) {
+	rt, _ := providertest.Runtime(t, Spec)
 	rt.Exec.Env = append(rt.Exec.Env, "PATH=") // no kubectl: no stored robot
 	if err := (Provider{}).Resolve(context.Background(), rt.For("images")); err != nil {
 		t.Fatal(err)
 	}
-	// App charts written for earlier Ownstack clusters name harbor-robot.
-	if got := rt.Out.Images.PullSecretName; got != "harbor-robot" {
-		t.Errorf("default pull secret = %q", got)
-	}
-	rt.Manifest.Spec.Components["images"].Settings = map[string]string{"pullSecretName": "registry-credentials"}
-	if err := (Provider{}).Resolve(context.Background(), rt.For("images")); err != nil {
-		t.Fatal(err)
-	}
-	if got := rt.Out.Images.PullSecretName; got != "registry-credentials" {
-		t.Errorf("pull secret = %q", got)
+	out := rt.Out.Images
+	if out.Host != "harbor.admin.example.com" || out.Project != "apps" || out.PullSecretName != "registry-credentials" || out.PushUsername != "" {
+		t.Errorf("images output = %+v", out)
 	}
 }

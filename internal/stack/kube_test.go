@@ -94,21 +94,3 @@ func TestImagePullSecretsPatch(t *testing.T) {
 		t.Error("unreadable service account accepted")
 	}
 }
-
-func TestServerWarnings(t *testing.T) {
-	stderr := `Warning: existing pods in namespace "prod" violate the new PodSecurity enforce level "baseline:latest"
-Warning: web-7d9 (and 2 other pods): hostPath volumes, privileged
-some other line
-`
-	got := serverWarnings(stderr)
-	want := []string{
-		`existing pods in namespace "prod" violate the new PodSecurity enforce level "baseline:latest"`,
-		"web-7d9 (and 2 other pods): hostPath volumes, privileged",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("warnings = %q", got)
-	}
-	if got := serverWarnings(""); len(got) != 0 {
-		t.Errorf("warnings = %q", got)
-	}
-}

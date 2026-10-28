@@ -9,16 +9,13 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-func render(t *testing.T, challenge string, staging bool) map[string]any {
+func render(t *testing.T, staging bool) map[string]any {
 	t.Helper()
 	data := map[string]any{
 		"DashboardHost": "traefik.admin.example.com", "Email": "ops@example.com",
-		"Staging": staging, "StagingURL": stagingACMEURL, "Challenge": challenge,
-		"DNSProvider": "cloudflare", "SecretName": dnsSecretName,
+		"Staging": staging, "StagingURL": stagingACMEURL,
+		"DNSProvider": "cloudflare", "SecretName": dnsSecretName, "EnvNames": []string{"CF_DNS_API_TOKEN"},
 		"EntryPoint": entryPoint, "CertResolver": certResolver,
-	}
-	if challenge == stack.ChallengeDNS {
-		data["EnvNames"] = []string{"CF_DNS_API_TOKEN"}
 	}
 	out, err := stack.Render(tmpl, data)
 	if err != nil {
@@ -36,7 +33,7 @@ func acme(parsed map[string]any) map[string]any {
 }
 
 func TestDNSChallenge(t *testing.T) {
-	parsed := render(t, stack.ChallengeDNS, false)
+	parsed := render(t, false)
 	a := acme(parsed)
 	if a["dnsChallenge"].(map[string]any)["provider"] != "cloudflare" {
 		t.Errorf("acme = %v", a)
@@ -50,16 +47,9 @@ func TestDNSChallenge(t *testing.T) {
 	}
 }
 
-func TestTLSChallengeStaging(t *testing.T) {
-	parsed := render(t, stack.ChallengeTLSALPN, true)
-	a := acme(parsed)
-	if a["tlsChallenge"] != true {
-		t.Errorf("acme = %v", a)
-	}
+func TestStaging(t *testing.T) {
+	a := acme(render(t, true))
 	if !strings.Contains(a["caServer"].(string), "staging") {
 		t.Errorf("caServer = %v", a["caServer"])
-	}
-	if _, ok := parsed["env"]; ok {
-		t.Error("no DNS credentials expected for TLS-ALPN")
 	}
 }

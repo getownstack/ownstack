@@ -1,5 +1,5 @@
 # Helm values the jenkins provider renders for a representative Standard
-# stack (Harbor, Slack alerts, default settings), with fake secrets. CI
+# stack (Harbor, default settings), with fake secrets. CI
 # installs the locked chart with them. Regenerate after changing the values
 # template or the lock:
 #   go test ./internal/providers/jenkins -run TestValuesGolden -update
@@ -156,9 +156,9 @@ controller:
               - key: IMAGE_REGISTRY
                 value: "harbor.admin.example.com"
               - key: IMAGE_REPOSITORY_PROJECT
-                value: "product"
+                value: "apps"
               - key: IMAGE_PULL_SECRET
-                value: "harbor-robot"
+                value: "registry-credentials"
               - key: OWNSTACK_LIBRARY_REPO
                 value: "https://github.com/getownstack/ownstack.git"
               - key: OWNSTACK_LIBRARY_REF
@@ -172,11 +172,9 @@ controller:
               - key: OWNSTACK_NAMESPACE
                 value: "prod"
               - key: OWNSTACK_BRANCHES
-                value: "main=prod"
+                value: "main=prod develop=dev release/*=qa"
               - key: OWNSTACK_PRODUCTION_ENVIRONMENT
                 value: "prod"
-              - key: OWNSTACK_SLACK_CHANNEL
-                value: "#deployments"
           clouds:
           - kubernetes:
               containerCap: 10
@@ -199,11 +197,6 @@ controller:
                         traits:
                           - "gitBranchDiscovery"
                           - "gitTagDiscovery"
-          slackNotifier:
-            botUser: true
-            teamDomain: ""
-            tokenCredentialId: "slack-token"
-            room: "#deployments"
         security:
           gitHostKeyVerificationConfiguration:
             sshHostKeyVerificationStrategy: acceptFirstConnectionStrategy

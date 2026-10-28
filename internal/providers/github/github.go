@@ -13,9 +13,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/githubapi"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Spec is the github provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "github", Aspect: "vcs", Name: "GitHub", Mono: "GH", Hosting: catalog.External,
+	Summary: "Repositories on GitHub. ownstackctl creates a private cluster repo for ownstack.yaml in your account.",
+	Params: []catalog.Param{
+		{Key: "owner", Label: "Owner", Kind: catalog.KindString, Required: true, Placeholder: "your-user-or-org",
+			Help: "GitHub user or organization that owns the cluster and application repos."},
+		{Key: "token", Label: "Access token", Kind: catalog.KindSecret, Required: true, Env: "GITHUB_TOKEN",
+			Help:    "Classic token with the repo and workflow scopes (pre-selected by the link).",
+			HelpURL: "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Ownstack"},
+		{Key: "clusterRepo", Label: "Cluster repo", Kind: catalog.KindString, Default: "ownstack-cluster",
+			Help: "Private repo that holds ownstack.yaml, created when missing. An existing repo is reused."},
+		{Key: "demoApp", Label: "Create demo app repo", Kind: catalog.KindBool, Default: "true", Advanced: true,
+			Help: "Generate the Lumen Yard demo app so the first pipeline run has something to deploy."},
+	},
+}
 
 const (
 	defaultAPI   = "https://api.github.com"
@@ -62,24 +80,6 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 
 func (p Provider) client(rt *stack.Runtime) *githubapi.Client {
 	return &githubapi.Client{Base: p.api(), Token: rt.Out.VCS.Token, HTTP: rt.HTTP}
-}
-
-func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	c := p.client(rt)
-	var steps []stack.Step
-	for _, r := range p.repos(rt) {
-		target := "repo " + rt.Out.VCS.Owner + "/" + r.name
-		if rt.Out.VCS.Token == "" {
-			steps = append(steps, stack.Step{Action: "ensure", Target: target, Detail: r.origin()})
-			continue
-		}
-		if _, err := c.Repo(ctx, rt.Out.VCS.Owner, r.name); err == nil {
-			steps = append(steps, stack.Step{Action: "verify", Target: target, Detail: "exists"})
-		} else {
-			steps = append(steps, stack.Step{Action: "create", Target: target, Detail: "private, " + r.origin()})
-		}
-	}
-	return steps
 }
 
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
@@ -223,25 +223,6 @@ func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir s
 		_ = os.RemoveAll(dir)
 		return git.Run(ctx, "git", "clone", "--branch", branch, rt.Out.VCS.ClusterRepoURL, dir)
 	})
-}
-
-// repoSpec is a repo the provider makes exist: a plain repo, or one
-// generated from template.
-type repoSpec struct{ name, template string }
-
-func (r repoSpec) origin() string {
-	if r.template == "" {
-		return "with " + readmePath
-	}
-	return "from template " + r.template
-}
-
-func (p Provider) repos(rt *stack.Runtime) []repoSpec {
-	repos := []repoSpec{{name: rt.Out.VCS.ClusterRepo}}
-	if rt.Out.VCS.DemoRepo != "" {
-		repos = append(repos, repoSpec{rt.Out.VCS.DemoRepo, demoTemplate})
-	}
-	return repos
 }
 
 func visibility(private bool) string {

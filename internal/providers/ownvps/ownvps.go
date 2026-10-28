@@ -15,8 +15,26 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/stack"
 )
+
+// Spec is the own-vps provider's catalog entry.
+var Spec = catalog.Provider{
+	ID: "own-vps", Aspect: "compute", Name: "Own VPS", Mono: "VPS", Hosting: catalog.SelfHosted,
+	Summary:   "Any Ubuntu server: bare metal, homelab, or a VPS from any host. k3s is installed on it and ownstackctl runs on the node itself.",
+	Resources: catalog.Resources{MemoryMiB: 800, DiskGiB: 10},
+	Params: []catalog.Param{
+		{Key: "host", Label: "Public IP", Kind: catalog.KindIP, Required: true, Placeholder: "203.0.113.10",
+			Help: "Public IPv4 address of the server. DNS records point here."},
+		{Key: "swapGiB", Label: "Swap (GiB)", Kind: catalog.KindInt, Default: "2", Advanced: true,
+			Help: "Swapfile created when the server has no swap, so a build spike does not take services down. 0 disables."},
+		{Key: "k3sChannel", Label: "k3s channel", Kind: catalog.KindString, Default: "stable", Advanced: true},
+		{Key: "k3sVersion", Label: "k3s version", Kind: catalog.KindString, Advanced: true,
+			Help:    "Pin an exact k3s release, for example v1.33.4+k3s1. Overrides the channel.",
+			Pattern: `^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+k3s[0-9]+)?$`, PatternHelp: "must be a k3s release such as v1.33.4+k3s1"},
+	},
+}
 
 type Provider struct{}
 
@@ -101,35 +119,6 @@ func addToList(config map[string]any, key, value string, trim bool) bool {
 	}
 	config[key] = append(list, value)
 	return true
-}
-
-func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
-	var steps []stack.Step
-	if missing := missingTools(rt); len(missing) > 0 {
-		steps = append(steps, stack.Step{Action: "install", Target: "base packages", Detail: strings.Join(missing, ", ")})
-	}
-	if gib := rt.SettingInt("swapGiB"); gib > 0 && swapTotalKiB() == 0 {
-		steps = append(steps, stack.Step{Action: "create", Target: "swapfile", Detail: fmt.Sprintf("%d GiB, swappiness 10 (the server has no swap)", gib)})
-	}
-	if version, ok := k3sVersion(ctx, rt); ok {
-		want := rt.Setting("k3sVersion")
-		switch action, err := k3sAction(version, want); {
-		case err != nil:
-			steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed; apply refuses: " + err.Error()})
-		case action == k3sUpgrade:
-			steps = append(steps, stack.Step{Action: "upgrade", Target: "k3s", Detail: version + " -> " + normalizeK3sVersion(want) + "; restarts the API server briefly"})
-		default:
-			steps = append(steps, stack.Step{Action: "verify", Target: "k3s", Detail: version + " installed"})
-		}
-	} else {
-		steps = append(steps, stack.Step{Action: "install", Target: "k3s", Detail: k3sTarget(rt) + ", bundled Traefik disabled, API certificate valid for " + rt.Setting("host")})
-	}
-	if rt.Exec.Has("helm") {
-		steps = append(steps, stack.Step{Action: "verify", Target: "helm", Detail: "installed"})
-	} else {
-		steps = append(steps, stack.Step{Action: "install", Target: "helm", Detail: helmVersion + ", official install script with checksum verification"})
-	}
-	return steps
 }
 
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {

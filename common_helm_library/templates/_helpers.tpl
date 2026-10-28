@@ -3,19 +3,18 @@ Application listening on port 80 exposed via an HTTPS URL: Deployment + Service 
 Usage: {{ include "public-url-application" . }}
 
 Values: id and image (set by the pipeline); url, or domain (set by the
-pipeline) to publish at <id>.<domain>; optional replicaCount, pathPrefix,
-and imagePullSecret (set by the pipeline from the registry contract).
+pipeline) to publish at <id>.<domain>; optional replicaCount and pathPrefix.
+Pods pull with their namespace's default service account, which carries the
+registry pull secret.
 
 Environments: the pipelines also set environment (the environment being
-deployed to) and productionEnvironment (where the default branch deploys)
-when they know them. The host is chosen like this:
+deployed to) and productionEnvironment (the stack's first environment). The
+host is chosen like this:
 - environment empty, productionEnvironment empty, or the two equal (a
-  production deploy, or a pipeline that sets neither): url, else
-  <id>.<domain>. Output is byte-identical to the library before environments
-  existed; internal/helmlib tests hold it to a frozen copy.
+  production deploy): url, else <id>.<domain>.
 - any other environment: environmentUrls.<environment> when the chart sets
   it, else <id>-<environment>.<domain>, which the stack's wildcard DNS record
-  and certificates already cover. url is ignored there: it names the
+  and certificate already cover. url is ignored there: it names the
   production host.
 Only strings and numbers count (--set reads 123 as a number); any other
 value, such as a map a chart keeps under environment for its own use, counts
@@ -59,8 +58,6 @@ spec:
       labels:
         app: {{ .Values.id }}
     spec:
-      imagePullSecrets:
-        - name: {{ .Values.imagePullSecret | default "harbor-robot" }}
       containers:
         - name: {{ .Values.id }}
           image: {{ .Values.image }}

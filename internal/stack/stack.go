@@ -6,6 +6,7 @@ package stack
 import (
 	"context"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -17,29 +18,14 @@ import (
 // Provider implements one aspect's contract.
 //
 // Resolve fills the provider's statically known contract outputs (hostnames,
-// names, credentials) without touching infrastructure, so plan and status can
-// run without applying. Apply converges the node towards the manifest and may
+// names, credentials) without touching infrastructure, so status can run
+// without applying. Apply converges the node towards the manifest and may
 // complete outputs only known after installation. Every step must be safe to
 // rerun.
 type Provider interface {
 	Resolve(ctx context.Context, rt *Runtime) error
-	Plan(ctx context.Context, rt *Runtime) []Step
 	Apply(ctx context.Context, rt *Runtime) error
 	Status(ctx context.Context, rt *Runtime) []Check
-}
-
-// Removable providers can detect and remove what they installed, so a
-// provider taken out of the manifest (or replaced by another) can be pruned.
-type Removable interface {
-	Installed(ctx context.Context, rt *Runtime) bool
-	Remove(ctx context.Context, rt *Runtime) error
-}
-
-// Step is one planned action.
-type Step struct {
-	Action string `json:"action"` // install, upgrade, configure, ensure, create, replace, remove, verify
-	Target string `json:"target"`
-	Detail string `json:"detail,omitempty"`
 }
 
 // Check states.
@@ -56,7 +42,7 @@ type Check struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// Runtime is everything a provider needs to plan, apply, and inspect.
+// Runtime is everything a provider needs to resolve, apply, and inspect.
 type Runtime struct {
 	Manifest *manifest.Manifest
 	Catalog  *catalog.Catalog
@@ -88,6 +74,15 @@ func NewRuntime(m *manifest.Manifest, cat *catalog.Catalog, store *secrets.Store
 
 // Kubeconfig is where k3s writes its admin kubeconfig.
 const Kubeconfig = "/etc/rancher/k3s/k3s.yaml"
+
+// StateDir is where ownstackctl keeps a node's state: $OWNSTACK_DIR, by
+// default /etc/ownstack.
+func StateDir() string {
+	if dir := os.Getenv("OWNSTACK_DIR"); dir != "" {
+		return dir
+	}
+	return "/etc/ownstack"
+}
 
 // For scopes the runtime to one aspect so Setting and Secret read that
 // aspect's component.
@@ -149,7 +144,6 @@ type Outputs struct {
 	Ingress *IngressOutput
 	VCS     *VCSOutput
 	Images  *ImagesOutput
-	Alerts  *AlertsOutput
 	CICD    *CICDOutput
 }
 
@@ -165,15 +159,9 @@ type ComputeOutput struct {
 	Arch string
 }
 
-// ACME challenge kinds.
-const (
-	ChallengeDNS     = "dns"
-	ChallengeTLSALPN = "tls-alpn"
-)
-
+// DNSOutput is how ingress proves domain ownership: DNS-01 through a lego
+// provider, with the environment that provider needs.
 type DNSOutput struct {
-	Challenge string
-	// For DNS-01: the lego provider name and the environment it needs.
 	ACMEProvider string
 	ACMEEnv      map[string]string
 }
@@ -210,27 +198,10 @@ type ImagesOutput struct {
 	PushUsername   string
 	PushPassword   string
 	PullSecretName string
-	// PullServer is the server key of the pull secret when it differs from
-	// Host (Docker Hub uses https://index.docker.io/v1/).
-	PullServer string
 	// Login tells a person how to sign in to the registry's web UI at
 	// https://<Host>, for the run summary; empty when it has none. It names
 	// where the password is kept, never the value.
 	Login string
-}
-
-// PullSecretServer returns the server key for image pull secrets.
-func (o *ImagesOutput) PullSecretServer() string {
-	if o.PullServer != "" {
-		return o.PullServer
-	}
-	return o.Host
-}
-
-type AlertsOutput struct {
-	Kind    string // slack
-	Channel string
-	Token   string
 }
 
 type CICDOutput struct {
@@ -240,8 +211,30 @@ type CICDOutput struct {
 	Login string
 }
 
+// ── Stack-wide settings ──────────────────────────────────────────────────────
+// Providers read the stack's own settings through these, never through
+// rt.Manifest (internal/providers/contract_test.go enforces it).
+
 // Domain is where applications are published: <app>.<domain>.
 func (rt *Runtime) Domain() string { return rt.Manifest.Spec.Domain }
+
+// AdminDomain is the parent domain of platform service hosts.
+func (rt *Runtime) AdminDomain() string { return rt.Manifest.AdminDomain() }
+
+// AdminHost is a platform service's host: <svc>.<adminDomain>.
+func (rt *Runtime) AdminHost(svc string) string { return svc + "." + rt.AdminDomain() }
+
+// Environment is one deploy environment: a namespace, and the branches
+// (a name, or a glob where * matches any characters, / included) that
+// deploy into it. Branch is empty when no branch deploys there.
+type Environment = manifest.Environment
+
+// Environments are the stack's environments in manifest order. The first is
+// production, and a branch deploys into the first one whose glob matches it.
+func (rt *Runtime) Environments() []Environment { return rt.Manifest.Environments() }
+
+// Production is the production environment, the first one.
+func (rt *Runtime) Production() Environment { return rt.Environments()[0] }
 
 // lowerFirst lowercases a leading capital unless it starts an acronym.
 func lowerFirst(s string) string {

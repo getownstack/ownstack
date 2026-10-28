@@ -124,10 +124,11 @@ func foreignAAAA(ctx context.Context, name string) []string {
 func Checks(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	ip := rt.Out.Compute.PublicIP
 	var checks []stack.Check
-	for i, name := range Names(rt.Manifest.Spec.Domain) {
-		label := rt.Manifest.Spec.Domain
+	domain := rt.Domain()
+	for i, name := range Names(domain) {
+		label := domain
 		if i == 1 {
-			label = "*." + rt.Manifest.Spec.Domain
+			label = "*." + domain
 		}
 		ok, detail := Matches(ctx, name, ip)
 		state := stack.OK
@@ -143,11 +144,6 @@ func Checks(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		checks = append(checks, stack.Check{Name: label, State: state, Detail: detail})
 	}
 	return checks
-}
-
-// AllMatch reports whether both names resolve to ip.
-func AllMatch(ctx context.Context, domain, ip string) bool {
-	return len(mismatches(ctx, domain, ip)) == 0
 }
 
 // mismatches describes each name that does not resolve to ip.
@@ -167,7 +163,7 @@ func mismatches(ctx context.Context, domain, ip string) []string {
 
 // WaitForRecords polls public DNS until both names resolve to ip.
 func WaitForRecords(ctx context.Context, rt *stack.Runtime, timeout time.Duration) error {
-	domain, ip := rt.Manifest.Spec.Domain, rt.Out.Compute.PublicIP
+	domain, ip := rt.Domain(), rt.Out.Compute.PublicIP
 	deadline := time.Now().Add(timeout)
 	for {
 		missing := mismatches(ctx, domain, ip)

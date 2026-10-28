@@ -1,35 +1,34 @@
-// Returns the environment (namespace) this build deploys into, or '' when it
-// only builds: pull requests, and branches that no mapping names.
+// The environment this build deploys into, or '' when it only builds: pull
+// requests, and branches no environment maps.
 //
-// ownstackctl sets OWNSTACK_BRANCHES in Jenkins global env to space-separated
-// <branch>=<environment> pairs, the deploy branch first, for example
-// "main=prod develop=dev release/*=qa". A '*' matches any run of characters,
-// '/' included, and the first matching pair wins. Stacks applied by an older
-// ownstackctl do not set it; then only OWNSTACK_DEPLOY_BRANCH deploys, into
-// OWNSTACK_NAMESPACE.
+// ownstackctl sets OWNSTACK_ENVIRONMENTS in Jenkins global env to
+// space-separated <environment>=<branch glob> items, production first, for
+// example "prod=main dev=develop qa=release/*". A '*' matches any run of
+// characters, '/' included, and the first matching item wins. An item
+// without a glob is an environment no branch deploys to.
 def call() {
-    if (env.CHANGE_ID) {
-        return ''
-    }
-    def cfg = values()
-    return environmentFor(env.BRANCH_NAME ?: '', cfg.branches as String, cfg.deployBranch as String, cfg.namespace as String)
+    return env.CHANGE_ID ? '' : environmentFor(env.BRANCH_NAME ?: '', env.OWNSTACK_ENVIRONMENTS ?: '')
+}
+
+// The production environment: the first one.
+def production() {
+    return productionOf(env.OWNSTACK_ENVIRONMENTS ?: '')
 }
 
 @NonCPS
-String environmentFor(String branch, String branches, String deployBranch, String namespace) {
-    if (!branch) {
-        return ''
-    }
-    if (!branches?.trim()) {
-        return branch == deployBranch ? namespace : ''
-    }
-    for (String pair : branches.trim().split('\\s+')) {
-        int eq = pair.indexOf('=')
-        if (eq > 0 && eq < pair.length() - 1 && branch.matches(globRegex(pair.substring(0, eq)))) {
-            return pair.substring(eq + 1)
+String environmentFor(String branch, String environments) {
+    for (String item : environments.trim().split('\\s+')) {
+        int eq = item.indexOf('=')
+        if (branch && eq > 0 && branch.matches(globRegex(item.substring(eq + 1)))) {
+            return item.substring(0, eq)
         }
     }
     return ''
+}
+
+@NonCPS
+String productionOf(String environments) {
+    return environments.trim().split('\\s+')[0].split('=')[0]
 }
 
 // globRegex turns a branch glob into a regular expression: '*' matches any

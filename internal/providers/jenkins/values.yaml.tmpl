@@ -59,13 +59,6 @@ controller:
                         traits:
                           - "gitBranchDiscovery"
                           - "gitTagDiscovery"
-{{- if .Slack }}
-          slackNotifier:
-            botUser: true
-            teamDomain: ""
-            tokenCredentialId: "{{ .AlertsCredentialID }}"
-            room: {{ printf "%q" .Slack.Channel }}
-{{- end }}
         security:
           gitHostKeyVerificationConfiguration:
             sshHostKeyVerificationStrategy: acceptFirstConnectionStrategy

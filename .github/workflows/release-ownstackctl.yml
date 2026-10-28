@@ -6,60 +6,43 @@ on:
       - "ownstackctl-v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  test:
-    name: Test
+  release:
+    name: Test, build, and publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       # The common_helm_library render tests need helm; in CI they fail without it.
-      - uses: azure/setup-helm@v4.3.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.22.1
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test ./...
-
-  build:
-    name: Build release binaries
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          mkdir -p dist
-          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/ownstackctl-${GOOS}-${GOARCH}" ./cmd/ownstackctl
-      - name: Checksums
+          mkdir dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" \
+              -o "dist/ownstackctl-linux-$arch" ./cmd/ownstackctl
+          done
+          cd dist && sha256sum ownstackctl-* > checksums.txt
+      # gh uploads the assets to a draft before publishing it, so a release
+      # never shows without one. -rc tags publish as prereleases and never
+      # become the latest release, which is what install.sh installs.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          cd dist
-          sha256sum ownstackctl-* > "checksums-${{ matrix.goos }}-${{ matrix.goarch }}.txt"
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          # Tags like ownstackctl-v0.2.0-rc.1 publish as prereleases and
-          # never become the latest release.
-          prerelease: ${{ contains(github.ref_name, '-rc') }}
-          make_latest: ${{ !contains(github.ref_name, '-rc') }}
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-rc* ]]; then flags=(--prerelease --latest=false); fi
+          gh release create "$GITHUB_REF_NAME" dist/* --generate-notes "${flags[@]}"

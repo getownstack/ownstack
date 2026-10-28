@@ -1,4 +1,5 @@
-// Package providers registers every implemented provider.
+// Package providers registers every provider: its catalog entry (Spec) and
+// its implementation.
 package providers
 
 import (
@@ -10,42 +11,47 @@ import (
 	"github.com/getownstack/ownstack/internal/providers/github"
 	"github.com/getownstack/ownstack/internal/providers/harbor"
 	"github.com/getownstack/ownstack/internal/providers/jenkins"
-	"github.com/getownstack/ownstack/internal/providers/manualdns"
 	"github.com/getownstack/ownstack/internal/providers/ownvps"
-	"github.com/getownstack/ownstack/internal/providers/registry"
-	"github.com/getownstack/ownstack/internal/providers/slack"
 	"github.com/getownstack/ownstack/internal/providers/traefik"
 	"github.com/getownstack/ownstack/internal/providers/zot"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-var implementations = map[string]stack.Provider{
-	catalog.Key("compute", "own-vps"): ownvps.Provider{},
-	catalog.Key("dns", "cloudflare"):  cloudflare.Provider{},
-	catalog.Key("dns", "manual"):      manualdns.Provider{},
-	catalog.Key("ingress", "traefik"): traefik.Provider{},
-	catalog.Key("vcs", "github"):      github.Provider{},
-	catalog.Key("images", "harbor"):   harbor.Provider{},
-	catalog.Key("images", "zot"):      zot.Provider{},
-	catalog.Key("images", "registry"): registry.Provider{},
-	catalog.Key("alerts", "slack"):    slack.Provider{},
-	catalog.Key("cicd", "jenkins"):    jenkins.Provider{},
-	catalog.Key("cicd", "gh-actions"): ghactions.Provider{},
+type provider struct {
+	spec catalog.Provider
+	impl stack.Provider
+}
+
+// registry is every provider, in the order the catalog lists them.
+var registry = []provider{
+	{ownvps.Spec, ownvps.Provider{}},
+	{cloudflare.Spec, cloudflare.Provider{}},
+	{traefik.Spec, traefik.Provider{}},
+	{github.Spec, github.Provider{}},
+	{zot.Spec, zot.Provider{}},
+	{harbor.Spec, harbor.Provider{}},
+	{ghactions.Spec, ghactions.Provider{}},
+	{jenkins.Spec, jenkins.Provider{}},
 }
 
 // Lookup returns the implementation of a provider.
 func Lookup(aspect, id string) (stack.Provider, bool) {
-	p, ok := implementations[catalog.Key(aspect, id)]
-	return p, ok
+	for _, p := range registry {
+		if p.spec.Aspect == aspect && p.spec.ID == id {
+			return p.impl, true
+		}
+	}
+	return nil, false
 }
 
-// Catalog returns the catalog with implemented providers marked available.
+// Catalog returns the catalog: the aspects and presets, and every provider's
+// Spec.
 func Catalog() *catalog.Catalog {
-	implemented := map[string]bool{}
-	for key := range implementations {
-		implemented[key] = true
+	cat := catalog.Default()
+	for _, p := range registry {
+		cat.Providers = append(cat.Providers, p.spec)
 	}
-	return catalog.Default().WithAvailability(implemented)
+	return cat
 }
 
 // RepoBootstrapper is implemented by VCS providers that can create the

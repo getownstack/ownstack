@@ -1,14 +1,11 @@
 // Package helmlib tests common_helm_library by rendering it the way both CI
 // providers deploy it: copied into an app chart's charts/ directory and
-// templated with the pipeline's --set flags. Both CI providers fetch the
-// library from this repository at deploy time, so these renders are a
-// compatibility contract for every existing app chart.
+// templated with the pipeline's --set flags.
 package helmlib
 
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -18,7 +15,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -28,41 +24,22 @@ import (
 
 const (
 	libraryDir = "../../common_helm_library"
-	// baselineDir is a frozen copy of the library from before environments.
-	// Production deploys must render byte-identically to it: ownstack.io and
-	// every existing app chart take the live library from main.
-	baselineDir = "testdata/baseline-library"
-	image       = "registry.example.com/product/app:main-abc1234"
+	image      = "registry.example.com/apps/app:0123456789ab"
 )
 
-// githubActionsFlags mirrors the helm upgrade in ghactions/ownstack.yml, which
-// always passes domain and imagePullSecret (empty when the variable is unset).
-// ownstack-workflow 3 adds environment and productionEnvironment
-// (withEnvironment); older workflows do not.
-func githubActionsFlags(domain, pullSecret string) []string {
-	return []string{"--set", "image=" + image, "--set", "id=app", "--set", "domain=" + domain, "--set", "imagePullSecret=" + pullSecret}
+// deployFlags mirrors the helm upgrade of both pipelines (ghactions/ownstack.yml
+// and helmDeploy.groovy), which pass the same values: the image, the app id,
+// the stack's domain, the environment being deployed to, and the production
+// environment.
+func deployFlags(domain, environment, production string) []string {
+	return []string{
+		"--set", "image=" + image, "--set", "id=app", "--set", "domain=" + domain,
+		"--set-string", "environment=" + environment, "--set-string", "productionEnvironment=" + production,
+	}
 }
 
-// withEnvironment adds the environment being deployed to and the production
-// environment, as ownstack-workflow 3 always does and the Jenkins library
-// does when it knows them.
-func withEnvironment(flags []string, environment, production string) []string {
-	return append(slices.Clone(flags), "--set-string", "environment="+environment, "--set-string", "productionEnvironment="+production)
-}
-
-// jenkinsFlags mirrors a production deploy by helmDeploy.groovy, which passes
-// domain and imagePullSecret only when Jenkins has them in its global env, and
-// always passes the environment (here prod, the production environment).
-func jenkinsFlags(domain, pullSecret string) []string {
-	flags := []string{"--set", "image=" + image, "--set", "id=app"}
-	if domain != "" {
-		flags = append(flags, "--set", "domain="+domain)
-	}
-	if pullSecret != "" {
-		flags = append(flags, "--set", "imagePullSecret="+pullSecret)
-	}
-	return withEnvironment(flags, "prod", "prod")
-}
+// prodFlags is a production deploy.
+func prodFlags(domain string) []string { return deployFlags(domain, "prod", "prod") }
 
 type deployment struct {
 	Metadata objectMeta
@@ -140,16 +117,16 @@ func helmPath(t *testing.T) string {
 }
 
 // renderChart builds an app chart from testdata with the given values.yaml
-// and extra templates (name -> content), copies library into
+// and extra templates (name -> content), copies the library into
 // charts/common_helm_library as both pipelines do, and runs helm template for
 // release "app" in namespace prod (flags may name another namespace). It
 // returns helm's output exactly.
-func renderChart(t *testing.T, library, values string, extra map[string]string, flags ...string) (string, error) {
+func renderChart(t *testing.T, values string, extra map[string]string, flags ...string) (string, error) {
 	t.Helper()
 	helm := helmPath(t)
 	chart := filepath.Join(t.TempDir(), "app")
 	copyDir(t, "testdata/app-chart", chart)
-	copyDir(t, library, filepath.Join(chart, "charts", "common_helm_library"))
+	copyDir(t, libraryDir, filepath.Join(chart, "charts", "common_helm_library"))
 	if values != "" {
 		if err := os.WriteFile(filepath.Join(chart, "values.yaml"), []byte(values), 0o644); err != nil {
 			t.Fatal(err)
@@ -184,7 +161,7 @@ func render(t *testing.T, values string, flags ...string) (rendered, error) {
 
 func renderWith(t *testing.T, values string, extra map[string]string, flags ...string) (rendered, error) {
 	t.Helper()
-	text, err := renderChart(t, libraryDir, values, extra, flags...)
+	text, err := renderChart(t, values, extra, flags...)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +228,7 @@ func copyDir(t *testing.T, src, dst string) {
 }
 
 func TestPublicURLApplication(t *testing.T) {
-	r := mustRender(t, "", githubActionsFlags("example.com", "registry-credentials")...)
+	r := mustRender(t, "", prodFlags("example.com")...)
 	if len(r) != 3 {
 		t.Errorf("rendered %d documents, want Deployment, Service, IngressRoute", len(r))
 	}
@@ -268,8 +245,9 @@ func TestPublicURLApplication(t *testing.T) {
 	if len(pod.Containers) != 1 || pod.Containers[0].Name != "app" || pod.Containers[0].Image != image {
 		t.Errorf("containers = %+v", pod.Containers)
 	}
-	if len(pod.ImagePullSecrets) != 1 || pod.ImagePullSecrets[0].Name != "registry-credentials" {
-		t.Errorf("imagePullSecrets = %+v", pod.ImagePullSecrets)
+	// Pods pull with the namespace's default service account.
+	if len(pod.ImagePullSecrets) != 0 {
+		t.Errorf("imagePullSecrets = %+v, want none", pod.ImagePullSecrets)
 	}
 
 	var s service
@@ -301,34 +279,12 @@ func TestPublicURLApplication(t *testing.T) {
 	}
 }
 
-// The pipeline's pull secret is used when set; charts deployed before the
-// registry contract existed rely on the harbor-robot default.
-func TestPullSecret(t *testing.T) {
-	for name, tc := range map[string]struct {
-		flags []string
-		want  string
-	}{
-		"github actions":                 {githubActionsFlags("example.com", "registry-credentials"), "registry-credentials"},
-		"github actions, unset variable": {githubActionsFlags("example.com", ""), "harbor-robot"},
-		"jenkins":                        {jenkinsFlags("example.com", "registry-credentials"), "registry-credentials"},
-		"jenkins, no IMAGE_PULL_SECRET":  {jenkinsFlags("example.com", ""), "harbor-robot"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			var d deployment
-			mustRender(t, "", tc.flags...).decode(t, "apps/v1 Deployment", &d)
-			secrets := d.Spec.Template.Spec.ImagePullSecrets
-			if len(secrets) != 1 || secrets[0].Name != tc.want {
-				t.Errorf("imagePullSecrets = %+v, want %s", secrets, tc.want)
-			}
-		})
-	}
-}
-
-// A chart's own url wins over the stack domain, with or without one.
+// In production a chart's own url wins over the stack domain, with or
+// without one.
 func TestURLOverridesDomain(t *testing.T) {
 	for name, flags := range map[string][]string{
-		"github actions":           githubActionsFlags("example.com", "registry-credentials"),
-		"jenkins without a domain": jenkinsFlags("", ""),
+		"domain":    prodFlags("example.com"),
+		"no domain": prodFlags(""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := mustRender(t, "url: shop.example.org\nreplicaCount: 3\n", flags...)
@@ -347,7 +303,7 @@ func TestURLOverridesDomain(t *testing.T) {
 }
 
 func TestPathPrefix(t *testing.T) {
-	r := mustRender(t, "pathPrefix: /docs\n", jenkinsFlags("example.com", "harbor-robot")...)
+	r := mustRender(t, "pathPrefix: /docs\n", prodFlags("example.com")...)
 	var ir ingressRoute
 	r.decode(t, "traefik.io/v1alpha1 IngressRoute", &ir)
 	want := "Host(`app.example.com`) && ( Path(`/docs`) || PathPrefix(`/docs/`) )"
@@ -357,80 +313,9 @@ func TestPathPrefix(t *testing.T) {
 }
 
 func TestDomainOrURLRequired(t *testing.T) {
-	for name, flags := range map[string][]string{
-		"github actions, empty domain": githubActionsFlags("", "registry-credentials"),
-		"jenkins, no OWNSTACK_DOMAIN":  jenkinsFlags("", ""),
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := render(t, "", flags...)
-			if err == nil || !strings.Contains(err.Error(), "url or domain is required") {
-				t.Errorf("err = %v, want 'url or domain is required'", err)
-			}
-		})
-	}
-}
-
-// Production deploys, and deploys by pipelines that name no environment (older
-// workflows and Jenkins libraries), render byte-identically to the library
-// before environments existed, for every value combination charts and
-// pipelines used. ownstack.io and every existing app chart take the live
-// library, so this must never be relaxed.
-func TestProductionOutputUnchanged(t *testing.T) {
-	values := map[string]string{
-		"defaults":                      "",
-		"url":                           "url: shop.example.org\nreplicaCount: 3\n",
-		"path prefix":                   "pathPrefix: /docs\n",
-		"url, path prefix, pull secret": "url: shop.example.org\npathPrefix: /api\nimagePullSecret: custom\n",
-		"environment urls":              "environmentUrls:\n  dev: dev.shop.example.org\n",
-		"chart's own environment map":   "environment:\n  region: eu\n",
-		"chart's own environment":       "environment: staging\n",
-	}
-	pipelines := map[string][]string{
-		"github actions":                  githubActionsFlags("example.com", "registry-credentials"),
-		"github actions, unset variables": githubActionsFlags("", ""),
-		"jenkins":                         jenkinsFlags("example.com", "registry-credentials"),
-		"jenkins, no domain":              jenkinsFlags("", ""),
-	}
-	environments := map[string][]string{
-		"no environment":        nil,
-		"prod":                  {"--set", "environment=prod", "--set", "productionEnvironment=prod"},
-		"production named live": {"--set", "environment=live", "--set", "productionEnvironment=live"},
-		"no production known":   {"--set", "environment=dev"},
-		"empty environment":     {"--set", "environment=", "--set", "productionEnvironment=prod"},
-	}
-	helmPath(t)
-	var mu sync.Mutex
-	renders, errs := 0, 0
-	t.Cleanup(func() {
-		// Both outcomes must be covered: renders, and the missing-domain error.
-		if !t.Failed() && (renders == 0 || errs == 0) {
-			t.Errorf("%d renders and %d errors compared; want both", renders, errs)
-		}
-	})
-	for vName, v := range values {
-		for pName, p := range pipelines {
-			for eName, e := range environments {
-				flags := append(slices.Clone(p), e...)
-				t.Run(vName+"/"+pName+"/"+eName, func(t *testing.T) {
-					t.Parallel()
-					want, wantErr := renderChart(t, baselineDir, v, nil, flags...)
-					got, gotErr := renderChart(t, libraryDir, v, nil, flags...)
-					if fmt.Sprint(gotErr) != fmt.Sprint(wantErr) {
-						t.Fatalf("error = %v, want %v", gotErr, wantErr)
-					}
-					if got != want {
-						t.Errorf("output changed:\n%s\nwant:\n%s", got, want)
-					}
-					mu.Lock()
-					defer mu.Unlock()
-					if wantErr != nil {
-						errs++
-					} else {
-						renders++
-					}
-				})
-			}
-		}
+	_, err := render(t, "", prodFlags("")...)
+	if err == nil || !strings.Contains(err.Error(), "url or domain is required") {
+		t.Errorf("err = %v, want 'url or domain is required'", err)
 	}
 }
 
@@ -438,23 +323,22 @@ func TestProductionOutputUnchanged(t *testing.T) {
 // <id>-<environment>.<domain>; url names the production host and is ignored.
 // Nothing but the host differs from a production render.
 func TestEnvironmentHost(t *testing.T) {
-	gh := githubActionsFlags("example.com", "registry-credentials")
 	urls := "environmentUrls:\n  dev: dev.shop.example.org\n"
 	for name, tc := range map[string]struct {
 		values string
 		flags  []string
 		want   string
 	}{
-		"dev":                        {"", withEnvironment(gh, "dev", "prod"), "app-dev.example.com"},
-		"url is the production host": {"url: shop.example.org\n", withEnvironment(gh, "qa", "prod"), "app-qa.example.com"},
-		"environment url":            {urls, withEnvironment(gh, "dev", "prod"), "dev.shop.example.org"},
-		"another environment's url":  {urls, withEnvironment(gh, "qa", "prod"), "app-qa.example.com"},
-		"environment url, no domain": {urls, withEnvironment(jenkinsFlags("", ""), "dev", "prod"), "dev.shop.example.org"},
-		"production named live":      {"url: shop.example.org\n", withEnvironment(gh, "prod", "live"), "app-prod.example.com"},
-		"jenkins":                    {"", withEnvironment(jenkinsFlags("example.com", ""), "staging", "prod"), "app-staging.example.com"},
-		"numeric environment":        {"", withEnvironment(gh, "2", "prod"), "app-2.example.com"},
-		"environment named true":     {"", withEnvironment(gh, "true", "prod"), "app-true.example.com"},
-		"environment named null":     {"", withEnvironment(gh, "null", "prod"), "app-null.example.com"},
+		"dev":                        {"", deployFlags("example.com", "dev", "prod"), "app-dev.example.com"},
+		"url is the production host": {"url: shop.example.org\n", deployFlags("example.com", "qa", "prod"), "app-qa.example.com"},
+		"environment url":            {urls, deployFlags("example.com", "dev", "prod"), "dev.shop.example.org"},
+		"another environment's url":  {urls, deployFlags("example.com", "qa", "prod"), "app-qa.example.com"},
+		"environment url, no domain": {urls, deployFlags("", "dev", "prod"), "dev.shop.example.org"},
+		"production named live":      {"url: shop.example.org\n", deployFlags("example.com", "prod", "live"), "app-prod.example.com"},
+		"production is live":         {"url: shop.example.org\n", deployFlags("example.com", "live", "live"), "shop.example.org"},
+		"numeric environment":        {"", deployFlags("example.com", "2", "prod"), "app-2.example.com"},
+		"environment named true":     {"", deployFlags("example.com", "true", "prod"), "app-true.example.com"},
+		"environment named null":     {"", deployFlags("example.com", "null", "prod"), "app-null.example.com"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := mustRender(t, tc.values, append(tc.flags, "--namespace", "dev")...)
@@ -470,7 +354,7 @@ func TestEnvironmentHost(t *testing.T) {
 	}
 
 	t.Run("path prefix", func(t *testing.T) {
-		r := mustRender(t, "pathPrefix: /docs\n", withEnvironment(jenkinsFlags("example.com", "harbor-robot"), "dev", "prod")...)
+		r := mustRender(t, "pathPrefix: /docs\n", deployFlags("example.com", "dev", "prod")...)
 		var ir ingressRoute
 		r.decode(t, "traefik.io/v1alpha1 IngressRoute", &ir)
 		want := "Host(`app-dev.example.com`) && ( Path(`/docs`) || PathPrefix(`/docs/`) )"
@@ -481,12 +365,11 @@ func TestEnvironmentHost(t *testing.T) {
 
 	t.Run("only the host differs", func(t *testing.T) {
 		values := "replicaCount: 2\npathPrefix: /api\n"
-		flags := append(withEnvironment(gh, "dev", "prod"), "--namespace", "dev")
-		got, err := renderChart(t, libraryDir, values, nil, flags...)
+		got, err := renderChart(t, values, nil, append(deployFlags("example.com", "dev", "prod"), "--namespace", "dev")...)
 		if err != nil {
 			t.Fatal(err)
 		}
-		production, err := renderChart(t, baselineDir, values, nil, flags...)
+		production, err := renderChart(t, values, nil, append(prodFlags("example.com"), "--namespace", "dev")...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -497,7 +380,7 @@ func TestEnvironmentHost(t *testing.T) {
 	})
 
 	t.Run("domain or environment url required", func(t *testing.T) {
-		_, err := render(t, "url: shop.example.org\n", withEnvironment(jenkinsFlags("", ""), "dev", "prod")...)
+		_, err := render(t, "url: shop.example.org\n", deployFlags("", "dev", "prod")...)
 		if err == nil || !strings.Contains(err.Error(), "environmentUrls.dev or domain is required") {
 			t.Errorf("err = %v", err)
 		}
@@ -544,25 +427,27 @@ func TestWorkflowHostRuleMatchesLibrary(t *testing.T) {
 		t.Skip("python3 not on PATH")
 	}
 	rule := workflowHostRule(t)
-	gh := githubActionsFlags("example.com", "registry-credentials")
+	// noEnvironment renders without the environment flags, as a chart
+	// rendered outside the pipelines would be.
+	noEnvironment := []string{"--set", "image=" + image, "--set", "id=app", "--set", "domain=example.com"}
 	urls := "environmentUrls:\n  dev: dev.shop.example.org\n"
 	cases := map[string]struct {
 		values string
 		flags  []string
 	}{
-		"older workflow":           {"", gh},
-		"older workflow, url":      {"url: shop.example.org\n", gh},
-		"production":               {"url: shop.example.org\n", withEnvironment(gh, "prod", "prod")},
-		"production, no url":       {urls, withEnvironment(gh, "prod", "prod")},
-		"dev":                      {"url: shop.example.org\n", withEnvironment(gh, "dev", "prod")},
-		"dev url":                  {urls, withEnvironment(gh, "dev", "prod")},
-		"qa, dev url":              {urls, withEnvironment(gh, "qa", "prod")},
-		"no production known":      {"", append(slices.Clone(gh), "--set", "environment=dev")},
-		"empty environment":        {"url: shop.example.org\n", withEnvironment(gh, "", "prod")},
-		"chart's environment map":  {"environment:\n  region: eu\n", append(slices.Clone(gh), "--set", "productionEnvironment=prod")},
-		"chart's environment":      {"environment: staging\n", gh},
-		"numeric environment":      {"", withEnvironment(gh, "2", "prod")},
-		"jenkins, environment url": {urls, withEnvironment(jenkinsFlags("", ""), "dev", "prod")},
+		"no environment":             {"", noEnvironment},
+		"no environment, url":        {"url: shop.example.org\n", noEnvironment},
+		"production":                 {"url: shop.example.org\n", prodFlags("example.com")},
+		"production, no url":         {urls, prodFlags("example.com")},
+		"dev":                        {"url: shop.example.org\n", deployFlags("example.com", "dev", "prod")},
+		"dev url":                    {urls, deployFlags("example.com", "dev", "prod")},
+		"qa, dev url":                {urls, deployFlags("example.com", "qa", "prod")},
+		"no production known":        {"", append(slices.Clone(noEnvironment), "--set", "environment=dev")},
+		"empty environment":          {"url: shop.example.org\n", deployFlags("example.com", "", "prod")},
+		"chart's environment map":    {"environment:\n  region: eu\n", append(slices.Clone(noEnvironment), "--set", "productionEnvironment=prod")},
+		"chart's environment":        {"environment: staging\n", noEnvironment},
+		"numeric environment":        {"", deployFlags("example.com", "2", "prod")},
+		"environment url, no domain": {urls, deployFlags("", "dev", "prod")},
 	}
 	names := make([]string, 0, len(cases))
 	for name := range cases {

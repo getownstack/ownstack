@@ -66,9 +66,6 @@ func TestExactMatch(t *testing.T) {
 			t.Errorf("%+v", c)
 		}
 	}
-	if !AllMatch(context.Background(), "example.com", "203.0.113.10") {
-		t.Error("AllMatch = false")
-	}
 }
 
 func TestExtraAddressesAndMissingNames(t *testing.T) {

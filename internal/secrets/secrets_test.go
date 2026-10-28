@@ -57,12 +57,8 @@ func TestResolveOrderAndPersistence(t *testing.T) {
 	}
 }
 
-func TestOverridesAndFileRefs(t *testing.T) {
+func TestFileRefs(t *testing.T) {
 	s := newTestStore(t, map[string]string{"GITHUB_TOKEN": "env"})
-	s.Overrides = map[string]string{"GITHUB_TOKEN": "override"}
-	if v, _ := s.Get(Request{Ref: "env:GITHUB_TOKEN"}); v != "override" {
-		t.Errorf("override = %q", v)
-	}
 	path := filepath.Join(t.TempDir(), "token")
 	os.WriteFile(path, []byte("file-token\n"), 0o600)
 	if v, _ := s.Get(Request{Ref: "file:" + path}); v != "file-token" {

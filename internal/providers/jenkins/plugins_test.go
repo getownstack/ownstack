@@ -6,16 +6,13 @@ import (
 	"flag"
 	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
 	"github.com/getownstack/ownstack/internal/providers/providertest"
-	"github.com/getownstack/ownstack/internal/providers/slack"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
@@ -25,7 +22,7 @@ const goldenPath = "testdata/values.golden.yaml"
 
 // goldenHeader starts the golden values; helm reads them as values.
 const goldenHeader = `# Helm values the jenkins provider renders for a representative Standard
-# stack (Harbor, Slack alerts, default settings), with fake secrets. CI
+# stack (Harbor, default settings), with fake secrets. CI
 # installs the locked chart with them. Regenerate after changing the values
 # template or the lock:
 #   go test ./internal/providers/jenkins -run TestValuesGolden -update
@@ -62,15 +59,11 @@ func TestLockCoversPluginsIn(t *testing.T) {
 	}
 }
 
-// The catalog's default chart is the one the plugins are locked for.
-func TestCatalogChartMatchesLock(t *testing.T) {
-	p, ok := catalog.Default().Provider("cicd", "jenkins")
-	if !ok {
-		t.Fatal("no jenkins provider")
-	}
-	param, ok := p.Param("chartVersion")
-	if !ok || param.Default != pluginLock.Chart || catalog.JenkinsChartVersion != pluginLock.Chart {
-		t.Errorf("catalog chartVersion %q (JenkinsChartVersion %q), plugins.lock chart %s; run lockgen", param.Default, catalog.JenkinsChartVersion, pluginLock.Chart)
+// The default chart is the one the plugins are locked for.
+func TestChartMatchesLock(t *testing.T) {
+	param, ok := Spec.Param("chartVersion")
+	if !ok || param.Default != pluginLock.Chart || ChartVersion != pluginLock.Chart {
+		t.Errorf("chartVersion default %q (ChartVersion %q), plugins.lock chart %s; run lockgen", param.Default, ChartVersion, pluginLock.Chart)
 	}
 	if got := jenkinsRuntime(t, "").Setting("chartVersion"); got != pluginLock.Chart {
 		t.Errorf("default chartVersion setting = %q", got)
@@ -141,10 +134,6 @@ func TestValuesExtraPlugins(t *testing.T) {
 	if !strings.Contains(got, " zz-extra:1.2.3") || !strings.HasPrefix(got, locked.Name+":999.v1 ") || strings.Contains(got, locked.String()) {
 		t.Errorf("installPlugins = %v", plugins)
 	}
-	summary := pluginSummary(rt)
-	if want := "Jenkins " + pluginLock.Jenkins + ", " + strconv.Itoa(len(pluginLock.Plugins)) + " locked plugins (+2 extra; " + locked.Name + " " + locked.Version + " → 999.v1)"; summary != want {
-		t.Errorf("summary = %q, want %q", summary, want)
-	}
 
 	// The manifest's pattern rejects malformed values; resolving rejects
 	// them too, before anything is installed.
@@ -153,45 +142,22 @@ func TestValuesExtraPlugins(t *testing.T) {
 	}
 }
 
-// Plan names the Jenkins version and plugin count, and warns when the chart
-// is not the one the plugins are locked for.
-func TestPlanPlugins(t *testing.T) {
-	rt := jenkinsRuntime(t, "")
-	summary := pluginSummary(rt)
-	if !strings.HasPrefix(summary, "Jenkins "+pluginLock.Jenkins+", ") || !strings.HasSuffix(summary, " locked plugins") {
-		t.Errorf("summary = %q", summary)
+// A chartVersion other than the locked chart keeps working, with a warning.
+func TestChartMismatch(t *testing.T) {
+	if got := chartMismatch(jenkinsRuntime(t, "")); got != "" {
+		t.Errorf("default chart warns: %q", got)
 	}
-	var found bool
-	for _, step := range (Provider{}).Plan(context.Background(), rt) {
-		if step.Target == "plugins" {
-			found = step.Detail == summary
-		}
-	}
-	if !found {
-		t.Error("plan has no plugins step")
-	}
-	if strings.Contains(summary, "warning") {
-		t.Errorf("default chart warns: %q", summary)
-	}
-	// An explicit chartVersion keeps working, with a warning.
-	other := jenkinsRuntime(t, "      chartVersion: 5.0.0\n")
-	if err := (Provider{}).Resolve(context.Background(), other); err != nil {
-		t.Fatal(err)
-	}
-	want := "warning: plugins are locked for chart " + pluginLock.Chart + " / Jenkins " + pluginLock.Jenkins + "; a different chart may not start"
-	if got := pluginSummary(other); got != summary+"; "+want {
-		t.Errorf("summary with another chart = %q", got)
+	want := "plugins are locked for chart " + pluginLock.Chart + " / Jenkins " + pluginLock.Jenkins + "; a different chart may not start"
+	if got := chartMismatch(jenkinsRuntime(t, "      chartVersion: 5.0.0\n")); got != want {
+		t.Errorf("another chart: %q", got)
 	}
 }
 
 // The golden values are what CI installs the locked chart with.
 func TestValuesGolden(t *testing.T) {
-	rt, _ := providertest.Runtime(t)
+	rt, _ := providertest.Runtime(t, Spec)
 	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", APIURL: "https://api.github.com", ClusterRepoURL: "https://github.com/acme/ownstack-cluster.git"}
-	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "product", PullSecretName: "harbor-robot"}
-	if err := (slack.Provider{}).Resolve(context.Background(), rt.For("alerts")); err != nil {
-		t.Fatal(err)
-	}
+	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PullSecretName: "registry-credentials"}
 	jrt := rt.For("cicd")
 	password, err := jrt.Secret("adminPassword")
 	if err != nil {

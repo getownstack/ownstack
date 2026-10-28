@@ -19,7 +19,6 @@ certificatesResolvers:
 {{- if .Staging }}
       caServer: {{ .StagingURL }}
 {{- end }}
-{{- if eq .Challenge "dns" }}
       dnsChallenge:
         provider: {{ .DNSProvider }}
         # Give the DNS provider time to publish the TXT record before Let's
@@ -29,9 +28,6 @@ certificatesResolvers:
         resolvers:
           - 1.1.1.1:53
           - 8.8.8.8:53
-{{- else }}
-      tlsChallenge: true
-{{- end }}
 {{- if .EnvNames }}
 env:
 {{- range .EnvNames }}
