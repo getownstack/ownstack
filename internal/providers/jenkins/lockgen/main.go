@@ -40,11 +40,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins/pluginlock"
+	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
 )
 
 const (
-	module = "github.com/getownstack/ownstack-cluster-template"
+	module = "github.com/getownstack/ownstack"
 
 	inputPath  = "internal/providers/jenkins/plugins.in"
 	lockPath   = "internal/providers/jenkins/plugins.lock"
@@ -258,7 +258,7 @@ func lock(ctx context.Context, cfg config) error {
 		fmt.Fprintln(cfg.stdout, "- "+c)
 	}
 	if chartChanged {
-		fmt.Fprintf(cfg.stderr, "The catalog's jenkins chartVersion default is now %s: run scripts/sync-catalog.sh in the Ownstack SaaS repo.\n", chart)
+		fmt.Fprintf(cfg.stderr, "The catalog's jenkins chartVersion default is now %s: run scripts/sync-catalog.sh in the portal repo (getownstack/ownstack-portal).\n", chart)
 	}
 	return nil
 }

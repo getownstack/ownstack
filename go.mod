@@ -1,4 +1,4 @@
-module github.com/getownstack/ownstack-cluster-template
+module github.com/getownstack/ownstack
 
 go 1.22
 

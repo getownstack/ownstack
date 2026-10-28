@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/dnscheck"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/providers/dnscheck"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 type Provider struct {

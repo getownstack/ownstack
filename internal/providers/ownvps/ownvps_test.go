@@ -8,7 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
 )
 
 func TestK3sAction(t *testing.T) {

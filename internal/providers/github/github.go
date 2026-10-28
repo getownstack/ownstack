@@ -1,5 +1,6 @@
 // Package github implements the VCS contract with GitHub. It also bootstraps
-// the customer-owned cluster repo from the Ownstack template.
+// the customer-owned cluster repo: a private repo that holds ownstack.yaml
+// (and a short README.md), created when missing.
 package github
 
 import (
@@ -9,17 +10,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/githubapi"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/githubapi"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 const (
-	defaultAPI      = "https://api.github.com"
-	defaultTemplate = "getownstack/ownstack-cluster-template"
-	demoTemplate    = "getownstack/lumen-yard"
-	demoRepo        = "lumen-yard"
+	defaultAPI   = "https://api.github.com"
+	demoTemplate = "getownstack/lumen-yard"
+	demoRepo     = "lumen-yard"
+
+	clusterDescription = "Ownstack stack definition (ownstack.yaml)"
+	readmePath         = "README.md"
 )
 
 type Provider struct {
@@ -32,15 +36,6 @@ func (p Provider) api() string {
 		return p.APIURL
 	}
 	return defaultAPI
-}
-
-// Template is the cluster template repo new cluster repos are generated from.
-// OWNSTACK_TEMPLATE_REPO overrides it for development forks.
-func Template() string {
-	if t := os.Getenv("OWNSTACK_TEMPLATE_REPO"); t != "" {
-		return t
-	}
-	return defaultTemplate
 }
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
@@ -75,13 +70,13 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	for _, r := range p.repos(rt) {
 		target := "repo " + rt.Out.VCS.Owner + "/" + r.name
 		if rt.Out.VCS.Token == "" {
-			steps = append(steps, stack.Step{Action: "ensure", Target: target, Detail: "from template " + r.template})
+			steps = append(steps, stack.Step{Action: "ensure", Target: target, Detail: r.origin()})
 			continue
 		}
 		if _, err := c.Repo(ctx, rt.Out.VCS.Owner, r.name); err == nil {
 			steps = append(steps, stack.Step{Action: "verify", Target: target, Detail: "exists"})
 		} else {
-			steps = append(steps, stack.Step{Action: "create", Target: target, Detail: "private, from template " + r.template})
+			steps = append(steps, stack.Step{Action: "create", Target: target, Detail: "private, " + r.origin()})
 		}
 	}
 	return steps
@@ -95,12 +90,68 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}
 	rt.Out.VCS.Username = login
 	rt.Logf("GitHub: authenticated as %s", login)
-	for _, r := range p.repos(rt) {
-		if err := c.EnsureRepo(ctx, rt, rt.Out.VCS.Owner, r.name, r.template, r.description); err != nil {
+	if err := ensureClusterRepo(ctx, rt, c, login); err != nil {
+		return err
+	}
+	if demo := rt.Out.VCS.DemoRepo; demo != "" {
+		return c.GenerateRepo(ctx, rt, rt.Out.VCS.Owner, demo, demoTemplate, "Ownstack demo application")
+	}
+	return nil
+}
+
+// ensureClusterRepo makes the cluster repo exist: a private plain repo with
+// README.md, created when missing. An existing repo is reused, including
+// ones generated from the former cluster template.
+func ensureClusterRepo(ctx context.Context, rt *stack.Runtime, c *githubapi.Client, login string) error {
+	owner, name := rt.Out.VCS.Owner, rt.Out.VCS.ClusterRepo
+	created := false
+	info, err := c.Repo(ctx, owner, name)
+	if err == nil {
+		rt.Logf("GitHub: %s/%s exists", owner, name)
+	} else {
+		if err := c.CreateRepo(ctx, rt, login, owner, name, clusterDescription); err != nil {
+			return err
+		}
+		created = true
+		if info, err = c.Repo(ctx, owner, name); err != nil {
 			return err
 		}
 	}
+	current, sha, err := c.File(ctx, owner, name, info.DefaultBranch, readmePath)
+	if err != nil {
+		return err
+	}
+	// A README the repo already has (the former template's, or the
+	// customer's own) stays. GitHub's placeholder from creation is replaced,
+	// also when an earlier run stopped before replacing it.
+	if sha != "" && !created && !placeholderReadme(current, name) {
+		return nil
+	}
+	if err := c.PutFile(ctx, rt, owner, name, info.DefaultBranch, readmePath, clusterReadme(name), sha, "Add README.md"); err != nil {
+		return err
+	}
+	rt.Logf("GitHub: committed %s to %s/%s", readmePath, owner, name)
 	return nil
+}
+
+// clusterReadme is the README.md of a new cluster repo.
+func clusterReadme(name string) []byte {
+	return []byte("# " + name + "\n\n" +
+		"The stack definition of an Ownstack server. `ownstack.yaml` describes the stack: its domain, registry, CI, and environments. " +
+		"Secrets are not stored here; they stay on the server.\n\n" +
+		"To change the stack, edit `ownstack.yaml`, commit it, and run `ownstackctl apply` in `/root/ownstack-cluster` on the server " +
+		"(`git pull` there first when you committed elsewhere).\n\n" +
+		"Documentation: https://github.com/getownstack/ownstack\n")
+}
+
+// placeholderReadme reports whether content is the README GitHub writes for
+// a repo it initializes: a "# <name>" heading, perhaps with the description.
+func placeholderReadme(content []byte, name string) bool {
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if strings.TrimSpace(lines[0]) != "# "+name || len(lines) > 2 {
+		return false
+	}
+	return len(lines) == 1 || strings.TrimSpace(lines[1]) == clusterDescription
 }
 
 func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
@@ -174,12 +225,21 @@ func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir s
 	})
 }
 
-type repoSpec struct{ name, template, description string }
+// repoSpec is a repo the provider makes exist: a plain repo, or one
+// generated from template.
+type repoSpec struct{ name, template string }
+
+func (r repoSpec) origin() string {
+	if r.template == "" {
+		return "with " + readmePath
+	}
+	return "from template " + r.template
+}
 
 func (p Provider) repos(rt *stack.Runtime) []repoSpec {
-	repos := []repoSpec{{rt.Out.VCS.ClusterRepo, Template(), "Ownstack cluster configuration"}}
+	repos := []repoSpec{{name: rt.Out.VCS.ClusterRepo}}
 	if rt.Out.VCS.DemoRepo != "" {
-		repos = append(repos, repoSpec{rt.Out.VCS.DemoRepo, demoTemplate, "Ownstack demo application"})
+		repos = append(repos, repoSpec{rt.Out.VCS.DemoRepo, demoTemplate})
 	}
 	return repos
 }

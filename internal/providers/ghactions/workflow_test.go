@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 type workflowStep struct {
@@ -191,6 +193,33 @@ func TestWorkflowDeployJob(t *testing.T) {
 	script := runScript(t)
 	if !strings.Contains(script, `--set-string environment="$NAMESPACE" --set-string productionEnvironment="$PRODUCTION_ENVIRONMENT"`) {
 		t.Error("helm does not get environment and productionEnvironment")
+	}
+}
+
+// The deploy job takes common_helm_library from the Ownstack repository at
+// the ref ownstackctl sets (OWNSTACK_LIBRARY_REF), main without it.
+func TestWorkflowFetchesTheLibraryAtTheLibraryRef(t *testing.T) {
+	var library *workflowStep
+	steps := workflowSteps(t)
+	for i := range steps {
+		if steps[i].With["path"] == ".ownstack" {
+			library = &steps[i]
+		}
+	}
+	if library == nil {
+		t.Fatal("the deploy job does not fetch the Helm library into .ownstack")
+	}
+	if library.Uses != "actions/checkout@v5" {
+		t.Errorf("library step uses %s", library.Uses)
+	}
+	for key, want := range map[string]string{
+		"repository":      stack.LibraryRepo,
+		"ref":             "${{ vars.OWNSTACK_LIBRARY_REF || 'main' }}",
+		"sparse-checkout": "common_helm_library",
+	} {
+		if library.With[key] != want {
+			t.Errorf("library step %s = %q, want %q", key, library.With[key], want)
+		}
 	}
 }
 

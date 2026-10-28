@@ -13,7 +13,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 const (

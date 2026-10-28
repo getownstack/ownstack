@@ -13,7 +13,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 type Provider struct {

@@ -45,6 +45,14 @@ func branchesParam(defaultBranch, unmapped, older string) Param {
 			older}
 }
 
+// libraryRefParam is the cicd providers' setting for the ref of the Ownstack
+// repository (stack.LibraryRepo) their pipelines take the libraries from;
+// help says which refs work and what takes them.
+func libraryRefParam(help string) Param {
+	return Param{Key: "libraryRef", Label: "Ownstack library ref", Kind: KindString, Advanced: true,
+		Help: help + " Empty: the tag of the ownstackctl release running on the server, or main for development builds."}
+}
+
 // environmentHelp completes the cicd providers' environment setting help.
 const environmentHelp = "Apps publish at their url, else <id>.<domain>, there; in the other environments at the chart's environmentUrls.<environment>, else <id>-<environment>.<domain>."
 
@@ -101,7 +109,7 @@ func Default() *Catalog {
 					Summary: "Hosts the customer-owned cluster repo and application repos, with a credential CI can clone with.",
 					Outputs: []Output{
 						{Key: "owner", Description: "Account or organization that owns the repos."},
-						{Key: "clusterRepo", Description: "Name and clone URL of the cluster repo (pipeline and Helm libraries)."},
+						{Key: "clusterRepo", Description: "Name and clone URL of the cluster repo, which holds ownstack.yaml."},
 						{Key: "demoRepo", Description: "Demo application repo, when the stack has one."},
 						{Key: "credential", Description: "Username and token for cloning and repository discovery."},
 					},
@@ -227,7 +235,7 @@ func Default() *Catalog {
 			// ── vcs ────────────────────────────────────────────────────
 			{
 				ID: "github", Aspect: "vcs", Name: "GitHub", Mono: "GH", Hosting: External, Recommended: true,
-				Summary:  "Repositories on GitHub. The cluster repo is generated from the Ownstack template into your account.",
+				Summary:  "Repositories on GitHub. ownstackctl creates a private cluster repo for ownstack.yaml in your account.",
 				Requires: []string{"compute"},
 				Params: []Param{
 					{Key: "owner", Label: "Owner", Kind: KindString, Required: true, Placeholder: "your-user-or-org",
@@ -235,7 +243,8 @@ func Default() *Catalog {
 					{Key: "token", Label: "Access token", Kind: KindSecret, Required: true, Env: "GITHUB_TOKEN",
 						Help:    "Classic token with the repo and workflow scopes (pre-selected by the link).",
 						HelpURL: "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Ownstack"},
-					{Key: "clusterRepo", Label: "Cluster repo", Kind: KindString, Default: "ownstack-cluster"},
+					{Key: "clusterRepo", Label: "Cluster repo", Kind: KindString, Default: "ownstack-cluster",
+						Help: "Private repo that holds ownstack.yaml, created when missing. An existing repo is reused."},
 					{Key: "demoApp", Label: "Create demo app repo", Kind: KindBool, Default: "true", Advanced: true,
 						Help: "Generate the Lumen Yard demo app so the first pipeline run has something to deploy."},
 				},
@@ -329,7 +338,7 @@ func Default() *Catalog {
 			// ── cicd ───────────────────────────────────────────────────
 			{
 				ID: "jenkins", Aspect: "cicd", Name: "Jenkins", Mono: "JK", Hosting: SelfHosted,
-				Summary:   "Jenkins with Kubernetes pod agents and the shared Ownstack pipeline library from your cluster repo.",
+				Summary:   "Jenkins with Kubernetes pod agents and the shared Ownstack pipeline library.",
 				Requires:  []string{"compute", "ingress", "vcs", "images"},
 				Resources: Resources{MemoryMiB: 1500, DiskGiB: 10},
 				Params: []Param{
@@ -341,11 +350,12 @@ func Default() *Catalog {
 						Help: "Space-separated wildcards, such as app-* api-*. Matching repos with a Jenkinsfile get a pipeline."},
 					{Key: "jenkinsfilePath", Label: "Jenkinsfile path", Kind: KindString, Default: "infrastructure/Jenkinsfile", Advanced: true},
 					{Key: ParamEnvironment, Label: "Production environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
-						Help: "Environment the deploy branch deploys into, exported to Jenkins as OWNSTACK_NAMESPACE. " + environmentHelp + " Cluster repos with an older pipeline library always deploy to prod."},
+						Help: "Environment the deploy branch deploys into, exported to Jenkins as OWNSTACK_NAMESPACE. " + environmentHelp + " Pipeline libraries from before environments (an older libraryRef) always deploy to prod."},
 					{Key: ParamDeployBranch, Label: "Deploy branch", Kind: KindString, Required: true, Default: DefaultBranch, Advanced: true,
 						Help:    "Branch the organization folder builds automatically and the pipeline pushes and deploys into the production environment, exported as OWNSTACK_DEPLOY_BRANCH. Other branches build only unless Branch environments maps them.",
 						Pattern: `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, PatternHelp: "must be a branch name of letters, digits, '.', '_', '-' and '/'"},
-					branchesParam("The deploy branch", "Branches that match no pair build only.", "Cluster repos with an older pipeline library deploy only the deploy branch."),
+					branchesParam("The deploy branch", "Branches that match no pair build only.", "Pipeline libraries from before branch environments (an older libraryRef) deploy only the deploy branch."),
+					libraryRefParam("Branch, or ownstackctl-vX.Y.Z release tag, of getownstack/ownstack that Jenkins loads the pipeline and Helm libraries from."),
 					{Key: "chartVersion", Label: "Chart version", Kind: KindString, Default: JenkinsChartVersion, Advanced: true,
 						Help: "jenkins/jenkins Helm chart. Each ownstackctl release locks Jenkins and every plugin for its default chart; with another chart the locked plugins may not start."},
 					{Key: "extraPlugins", Label: "Extra plugins", Kind: KindString, Advanced: true, Placeholder: "build-timeout:1.41 ansicolor:542.v03d235fee02d",
@@ -362,8 +372,7 @@ func Default() *Catalog {
 				Params: []Param{
 					{Key: "repoFilter", Label: "Repository filter", Kind: KindString, Default: "*", Advanced: true,
 						Help: "Space-separated wildcards, such as app-* api-*. Matching repos that contain .github/workflows/ownstack.yml get the deploy credential."},
-					{Key: "libraryRef", Label: "Ownstack library ref", Kind: KindString, Advanced: true,
-						Help: "Branch or tag of getownstack/ownstack-cluster-template the workflow takes the Helm library from. Empty: the ownstackctl release running on the server, or main for development builds."},
+					libraryRefParam("Branch or tag of getownstack/ownstack the workflow takes the Helm library from."),
 					{Key: ParamEnvironment, Label: "Production environment", Kind: KindEnvironment, Required: true, Default: "prod", Advanced: true,
 						Help: "Environment that pushes to main deploy into. " + environmentHelp},
 					branchesParam(DefaultBranch, "Pushes to branches that match no pair do not deploy.", "App repos with a workflow older than ownstack-workflow 3 deploy only main."),

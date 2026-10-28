@@ -12,11 +12,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins/pluginlock"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/slack"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/catalog"
+	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/providers/slack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 var update = flag.Bool("update", false, "rewrite testdata/values.golden.yaml")

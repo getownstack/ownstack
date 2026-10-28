@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers/ghactions"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // Providers read only other aspects' contract outputs, never their manifest

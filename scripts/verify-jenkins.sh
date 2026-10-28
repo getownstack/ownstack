@@ -189,6 +189,10 @@ jenkins:
             value: "prod"
           - key: "OWNSTACK_BRANCHES"
             value: "main=prod develop=dev"
+          - key: "OWNSTACK_LIBRARY_REPO"
+            value: "https://github.com/getownstack/ownstack.git"
+          - key: "OWNSTACK_LIBRARY_REF"
+            value: "main"
   clouds:
     - kubernetes:
         name: "kubernetes-cluster"
@@ -212,10 +216,10 @@ unclassified:
             libraryPath: "jenkins_pipeline_library/"
             scm:
               git:
-                credentialsId: "github-pat"
-                remote: "https://github.com/getownstack/ownstack-cluster-template.git"
+                remote: "https://github.com/getownstack/ownstack.git"
                 traits:
                   - "gitBranchDiscovery"
+                  - "gitTagDiscovery"
   slackNotifier:
     botUser: true
     teamDomain: ""
@@ -275,6 +279,11 @@ EOF
       /var/jenkins_home/org.jenkinsci.plugins.workflow.libs.GlobalLibraries.xml; then
     boot_failed "Jenkins started without applying the JCasC configuration"
   fi
+  # Release library refs (ownstackctl-v*) are tags; without tag discovery
+  # they would not resolve.
+  docker exec "$container" grep -q TagDiscoveryTrait \
+    /var/jenkins_home/org.jenkinsci.plugins.workflow.libs.GlobalLibraries.xml ||
+    boot_failed "the global library does not discover tags"
   loaded=$(docker exec "$container" bash -c 'ls /var/jenkins_home/plugins/*.jpi 2>/dev/null | wc -l' | tr -d ' ')
   warnings=$(docker logs "$container" 2>&1 | grep -c -E '[[:space:]]WARNING[[:space:]]' || true)
   log "ok: Jenkins $core answered /login 200 after $(($(date +%s) - started))s with $loaded plugins and the JCasC configuration, no SEVERE lines ($warnings WARNING lines)"
@@ -370,5 +379,8 @@ EOF
   kube exec jenkins-0 -c jenkins -- grep -q jenkins_pipeline_library \
     /var/jenkins_home/org.jenkinsci.plugins.workflow.libs.GlobalLibraries.xml ||
     kind_failed "Jenkins started without applying the JCasC configuration"
+  kube exec jenkins-0 -c jenkins -- grep -q TagDiscoveryTrait \
+    /var/jenkins_home/org.jenkinsci.plugins.workflow.libs.GlobalLibraries.xml ||
+    kind_failed "the global library does not discover tags"
   log "ok: chart $chart is ready in $context, controller $tag, JCasC applied, no SEVERE lines"
 fi

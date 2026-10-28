@@ -16,9 +16,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // ghRuntime is the test stack with gh-actions as its CI provider; settings
@@ -157,21 +157,6 @@ func TestApplyRefusesWithoutPushCredential(t *testing.T) {
 		err := Provider{}.Apply(context.Background(), rt)
 		if err == nil || !strings.Contains(err.Error(), "push credential") {
 			t.Errorf("images %+v: err = %v", images, err)
-		}
-	}
-}
-
-func TestLibraryRef(t *testing.T) {
-	for _, c := range []struct{ setting, version, want string }{
-		{"main", "ownstackctl-v0.3.0", "main"},
-		{"my-branch", "dev", "my-branch"},
-		{"", "ownstackctl-v0.3.0", "ownstackctl-v0.3.0"},
-		{"", "ownstackctl-v0.3.0-rc1", "ownstackctl-v0.3.0-rc1"},
-		{"", "dev", "main"},
-		{"", "v0.3.0", "main"},
-	} {
-		if got := libraryRef(c.setting, c.version); got != c.want {
-			t.Errorf("libraryRef(%q, %q) = %q, want %q", c.setting, c.version, got, c.want)
 		}
 	}
 }
@@ -417,8 +402,9 @@ func TestStatusScansWithoutRecord(t *testing.T) {
 }
 
 func TestWorkflowMarker(t *testing.T) {
-	// 3 added environments; status must warn about repos with older copies.
-	if workflowVersion < 3 {
+	// 3 added environments, 4 takes the Helm library from getownstack/ownstack;
+	// status must warn about repos with older copies.
+	if workflowVersion < 4 {
 		t.Fatalf("embedded workflow version = %d", workflowVersion)
 	}
 	for content, want := range map[string]int{

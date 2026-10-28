@@ -7,12 +7,14 @@
 Design the stack in Ownstack, or start from an example in `examples/`. Then, on a fresh Ubuntu 22.04+ server, as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getownstack/ownstack-cluster-template/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/getownstack/ownstack/main/install.sh | bash
 ownstackctl plan -f ownstack.yaml     # what will happen, whether it fits, which secrets it needs
 ownstackctl up -f ownstack.yaml       # build it
 ```
 
-`up` creates your private cluster repo from this template (if it does not exist), commits `ownstack.yaml` to it, checks it out at `/root/ownstack-cluster`, applies it, and finishes with a health check. Later changes: edit `ownstack.yaml` in the repo and run `ownstackctl apply` in the checkout.
+`up` creates your cluster repo (if it does not exist), commits `ownstack.yaml` to it, checks it out at `/root/ownstack-cluster`, applies it, and finishes with a health check. Later changes: edit `ownstack.yaml` in the repo, commit, and run `ownstackctl apply` in the checkout.
+
+The cluster repo is `<owner>/<clusterRepo>` (github settings, `clusterRepo` defaults to `ownstack-cluster`). ownstackctl creates it as a private repository with a short `README.md` and your `ownstack.yaml`; it needs nothing else. The pipeline libraries your CI runs come from this repository at a pinned version (see "Pipeline libraries").
 
 ## Presets
 
@@ -31,10 +33,10 @@ ownstackctl up -f ownstack.yaml       # build it
 | compute | `own-vps` | k3s on the server ownstackctl runs on. The public IP is added to the API certificate. `k3sVersion` pins a release; setting it to a newer one upgrades k3s on the next apply (one minor version at a time, never down; the API server restarts briefly). |
 | dns | `cloudflare`, `manual` | Cloudflare manages A records and DNS-01 certificates. It only changes records it created (comment `managed by ownstack`) or A records already pointing at the server; see "Troubleshooting". Manual: you create `A domain` and `A *.domain`; certificates use TLS-ALPN. |
 | ingress | `traefik` | Let's Encrypt certificates; `acmeStaging: true` for test runs (health checks then accept the staging certificate, but CI pushing from outside the server will not trust it). |
-| vcs | `github` | Cluster repo and app repos; optionally a demo app repo. |
+| vcs | `github` | The private cluster repo (created when missing) and app repos; optionally a demo app repo, generated from the Lumen Yard template. |
 | images | `zot`, `harbor`, `registry` | `registry` = a registry you already have; its credential is verified (push access too, where the registry's token lists it), nothing is installed. Zot keeps every tag unless `keepTags` is set: then it keeps that many most recently pushed tags per repository, plus tags pulled in the last 30 days, and deletes the rest. Set it well above the number of tags you might roll back to. |
 | alerts | `slack` | Pipeline notifications (Jenkins). |
-| cicd | `gh-actions`, `jenkins` | See "Deploying apps". `environment` (default `prod`) is the production environment, where the default branch deploys (`main`, or Jenkins' `deployBranch`); `branches` sends other branches to other environments, such as `develop=dev release/*=qa`. See "Environments and promotion". Jenkins installs locked plugins: every plugin, dependencies included, at the version each ownstackctl release resolved and tested for the Jenkins release of its default `chartVersion` (`plan` shows `Jenkins <version>, <N> locked plugins`). `extraPlugins` adds space-separated `name:version` pairs; a pair naming a locked plugin replaces its version. Plugins installed through the Jenkins UI are removed when Jenkins restarts. Another `chartVersion` still applies, with a warning that the plugins are locked for a different Jenkins. |
+| cicd | `gh-actions`, `jenkins` | See "Deploying apps". `environment` (default `prod`) is the production environment, where the default branch deploys (`main`, or Jenkins' `deployBranch`); `branches` sends other branches to other environments, such as `develop=dev release/*=qa`. See "Environments and promotion". Jenkins installs locked plugins: every plugin, dependencies included, at the version each ownstackctl release resolved and tested for the Jenkins release of its default `chartVersion` (`plan` shows `Jenkins <version>, <N> locked plugins`). `extraPlugins` adds space-separated `name:version` pairs; a pair naming a locked plugin replaces its version. Plugins installed through the Jenkins UI are removed when Jenkins restarts. Another `chartVersion` still applies, with a warning that the plugins are locked for a different Jenkins. Both providers take `libraryRef`; see "Pipeline libraries". |
 
 `ownstackctl catalog` prints every aspect, contract, provider, setting, and preset as JSON.
 
@@ -94,12 +96,12 @@ The `repoFilter` setting of both CI providers takes space-separated wildcards, s
 - **GitHub Actions**: add `.github/workflows/ownstack.yml` (print it with `ownstackctl workflow`) and rerun `ownstackctl apply`. ownstackctl gives every repo that has the workflow a deploy credential limited to the environment namespaces, plus the registry credential, as Actions secrets and variables. Builds run on GitHub's runners; the server only runs apps.
   - The workflow runs on pushes to every branch. A small `resolve` job picks the environment from `OWNSTACK_BRANCHES`; branches that map to none stop there, without building. Deploys to one environment run one at a time.
   - Images are built for the server's architecture (`OWNSTACK_PLATFORM`). On an ARM server, GitHub's default runners build under emulation, which is slower; set the repo or organization variable `OWNSTACK_RUNNER` to an ARM runner (for example `ubuntu-24.04-arm`) to build natively.
-  - The Helm library comes from this repository at the tag of the ownstackctl release that last applied the stack, so it changes only when you apply with a newer release. Set `libraryRef` to pin another branch or tag.
+  - The Helm library comes from this repository at the stack's library version (see "Pipeline libraries").
   - `status` checks the repos the last apply configured, and warns when a repo's workflow is older than the one `ownstackctl workflow` prints. After adding the workflow to a new repo, rerun `apply`.
   - A repo that could not be checked for the workflow (for example, 403 from an organization's SSO) fails the apply after the other repos are configured.
   - Removing GitHub Actions with `--prune` also deletes the `OWNSTACK_*` secrets and variables from the repos it configured, when the GitHub token is available.
 - **Pods** in the environment namespaces must meet the Kubernetes Pod Security `baseline` level: no privileged containers, host network/PID/IPC, or hostPath volumes. Run anything that needs those in a namespace of its own. Pods that name no `imagePullSecrets` (hooks, CronJobs, third-party charts) pull with the environment's pull secret through the `default` service account; `public-url-application` names it explicitly.
-- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically and builds the `deployBranch` (default `main`) and every branch `branches` maps automatically. The `deployBranch` pushes and deploys into the `environment` setting (default `prod`), mapped branches into theirs; other branches and pull requests build only. When the owner, `repoFilter`, `jenkinsfilePath`, `deployBranch`, or `branches` changes, apply rewrites the organization folder's configuration (`plan` shows it), replacing manual edits to the folder; Jenkins then deletes the jobs of repos that no longer match.
+- **Jenkins**: add `infrastructure/Jenkinsfile` with `runPipeline('<app>')`. The organization folder discovers repos automatically and builds the `deployBranch` (default `main`) and every branch `branches` maps automatically. The `deployBranch` pushes and deploys into the `environment` setting (default `prod`), mapped branches into theirs; other branches and pull requests build only. When the owner, `repoFilter`, `jenkinsfilePath`, `deployBranch`, or `branches` changes, apply rewrites the organization folder's configuration (`plan` shows it), replacing manual edits to the folder; Jenkins then deletes the jobs of repos that no longer match. The pipeline library (`runPipeline`) and the Helm library both come from this repository at the stack's library version.
 
 ## Environments and promotion
 
@@ -130,11 +132,30 @@ Promotion with GitHub Actions: images are tagged `<branch>-<commit>` (for exampl
 
 ownstackctl sets `OWNSTACK_BRANCHES` (the mapping, default branch first, such as `main=prod develop=dev release/*=qa`) and `OWNSTACK_PRODUCTION_ENVIRONMENT` for both providers: GitHub Actions repo variables (plus `OWNSTACK_ENVIRONMENTS`) and Jenkins global environment.
 
-Existing stacks:
+## Pipeline libraries
 
-- GitHub Actions app repos with a workflow older than `# ownstack-workflow: 3` keep deploying only `main`, into `environment`; replace the file with the output of `ownstackctl workflow` (`status` warns about older copies). The new workflow deploys only `main` until the stack is applied with a release that sets `OWNSTACK_BRANCHES`.
-- A deploy outside the production environment refuses a Helm library from before environments, which would publish it at the production host: with GitHub Actions an old `libraryRef`, with Jenkins the cluster repo's older `common_helm_library`.
-- Jenkins cluster repos keep the pipeline library they were generated with, which deploys only the `deployBranch`, until a newer `jenkins_pipeline_library` is copied in.
+App pipelines run code from this repository: the Helm library `common_helm_library` with both CI providers, and the Jenkins shared library `jenkins_pipeline_library` with Jenkins. Your cluster repo does not carry copies. Both are taken at one version, the library ref:
+
+1. the cicd setting `libraryRef` (a branch or tag of `getownstack/ownstack`), when set;
+2. else the tag of the ownstackctl release that applied the stack (`ownstackctl-vX.Y.Z`);
+3. else `main` (development builds).
+
+So without `libraryRef`, a stack's pipelines change only when you apply it with a newer release, and they always match the release that applied them.
+
+- **GitHub Actions**: ownstackctl sets the repo variable `OWNSTACK_LIBRARY_REF`, and the workflow checks out the Helm library at it (`main` when the variable is missing).
+- **Jenkins**: the global library loads from `https://github.com/getownstack/ownstack.git` at the ref, and the deploy step fetches the Helm library from the same repository and ref (Jenkins global environment `OWNSTACK_LIBRARY_REPO` and `OWNSTACK_LIBRARY_REF`). With Jenkins, `libraryRef` must be a branch or an `ownstackctl-v*` release tag; the deploy step does not find other tags. The libraries of `ownstackctl-v0.3.2` and earlier take the Helm library from `main` instead of their own tag.
+
+`libraryRef: main` follows every change to `main` as soon as it lands; use it only for testing.
+
+## Upgrading
+
+Apply the stack with a newer release (`install.sh`, then `ownstackctl apply` in `/root/ownstack-cluster`). It upgrades the components and moves the pipeline libraries to the new release's tag. Notes for existing stacks:
+
+- **Cluster repos created from the former template** (which held a copy of the ownstackctl source, the libraries, and scripts) keep working: ownstackctl commits their `ownstack.yaml`, and adds the short `README.md` when they have none. Once a release with this layout has applied the stack, nothing uses the other files; you can delete them.
+- **Jenkins stacks** keep loading the libraries from the cluster repo until a release with this layout applies them; that apply switches Jenkins to this repository at the library ref. Changes you made to the libraries in your cluster repo stop applying then.
+- **GitHub Actions app repos** with a workflow older than `# ownstack-workflow: 4` fetch the Helm library from this repository's former name; replace the file with the output of `ownstackctl workflow` (`status` warns about older copies). Workflows older than 3 also deploy only `main`, into `environment`. A new workflow deploys only `main` until the stack is applied with a release that sets `OWNSTACK_BRANCHES`.
+- With GitHub Actions, a deploy outside the production environment refuses a `libraryRef` whose Helm library predates environments, which would publish it at the production host.
+- The install command moved: use `https://raw.githubusercontent.com/getownstack/ownstack/main/install.sh`.
 
 ## Secrets
 
@@ -195,10 +216,9 @@ Stages are the aspects in order, plus `repo` (from `up`), `environments`, `prune
 - **"DNS records that ownstackctl did not create already exist"**: the domain or its wildcard has A, AAAA, or CNAME records that point elsewhere, such as an existing website. Nothing was changed. Remove them, point them at the server, or set `replaceRecords: true` under `spec.dns.settings` to let ownstackctl replace them, then remove the setting again. Moving to a new server needs the setting only for records written by ownstackctl versions that did not mark them.
 - **"violates PodSecurity" when deploying**: the pod needs privileges the environments do not allow (see "Deploying apps"). Apply lists existing pods that would be rejected the first time it enforces Pod Security on a namespace.
 - **GitHub Actions cannot deploy**: the cluster API (port 6443) must be reachable from the internet; `apply` verifies this from the public address.
-- **Older runners**: `setup_system.sh` installs the pinned release and runs `apply`. Without an `ownstack.io/v1` manifest, ownstackctl builds one from the legacy lowercase environment variables.
 
 ## Releases
 
 Tag `ownstackctl-vX.Y.Z` to test and build Linux amd64/arm64 binaries with checksums; `-rc` tags publish as prereleases. `install.sh` pins the version through `OWNSTACKCTL_VERSION`.
 
-A release fixes the versions it installs by default: Helm chart versions, the Jenkins controller image and every Jenkins plugin, and the Helm version for servers without one. Applying a stack with the same release installs the same versions; applying it with a newer release upgrades them. k3s is the exception: new servers get the `k3sChannel` release unless `k3sVersion` pins one.
+A release fixes the versions it installs by default: Helm chart versions, the Jenkins controller image and every Jenkins plugin, the Helm version for servers without one, and the pipeline libraries (its own tag). Applying a stack with the same release installs the same versions; applying it with a newer release upgrades them. k3s is the exception: new servers get the `k3sChannel` release unless `k3sVersion` pins one.

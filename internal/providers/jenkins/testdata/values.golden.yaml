@@ -159,8 +159,12 @@ controller:
                 value: "product"
               - key: IMAGE_PULL_SECRET
                 value: "harbor-robot"
+              - key: OWNSTACK_LIBRARY_REPO
+                value: "https://github.com/getownstack/ownstack.git"
+              - key: OWNSTACK_LIBRARY_REF
+                value: "main"
               - key: COMMON_HELM_LIBRARY_GITHUB_REPO
-                value: "https://github.com/acme/ownstack-cluster.git"
+                value: "https://github.com/getownstack/ownstack.git"
               - key: OWNSTACK_DOMAIN
                 value: "example.com"
               - key: OWNSTACK_DEPLOY_BRANCH
@@ -181,6 +185,8 @@ controller:
         unclassified:
           globalLibraries:
             libraries:
+              # The public Ownstack repository at the stack's library ref: a
+              # release tag (ownstackctl-v*), or a branch.
               - defaultVersion: "main"
                 implicit: true
                 name: "jenkins_pipeline_library"
@@ -189,10 +195,10 @@ controller:
                     libraryPath: "jenkins_pipeline_library/"
                     scm:
                       git:
-                        credentialsId: "github-pat"
-                        remote: "https://github.com/acme/ownstack-cluster.git"
+                        remote: "https://github.com/getownstack/ownstack.git"
                         traits:
                           - "gitBranchDiscovery"
+                          - "gitTagDiscovery"
           slackNotifier:
             botUser: true
             teamDomain: ""

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // environments creates one namespace per environment, enforces Pod Security

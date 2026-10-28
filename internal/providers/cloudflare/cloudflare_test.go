@@ -10,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // fakeCloudflare keeps DNS records for one zone, example.com.

@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/secrets"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/secrets"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 func newEngine(t *testing.T, src string) *Engine {

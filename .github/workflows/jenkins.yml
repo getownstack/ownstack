@@ -32,13 +32,14 @@ concurrency:
   group: jenkins-lock-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Cluster repos are generated from this template and inherit its workflows.
-# Every job checks the repository so they never run (or bill) there.
+# Forks and copies of this repository (including cluster repos generated from
+# it when it was a template) carry these workflows. Every job checks the
+# repository so they never run (or bill) there.
 jobs:
   verify:
     name: Verify the plugin lock
     if: >-
-      github.repository == 'getownstack/ownstack-cluster-template' &&
+      github.repository == 'getownstack/ownstack' &&
       (github.event_name == 'pull_request' || github.event_name == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -69,7 +70,7 @@ jobs:
   bump:
     name: Propose a new plugin lock
     if: >-
-      github.repository == 'getownstack/ownstack-cluster-template' &&
+      github.repository == 'getownstack/ownstack' &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -211,9 +212,9 @@ jobs:
             echo "After merging:"
             echo
             if git diff --quiet -- internal/catalog/data.go; then
-              echo "- The chart is unchanged; the SaaS catalog needs no sync."
+              echo "- The chart is unchanged; the portal's catalog needs no sync."
             else
-              echo "- Run \`scripts/sync-catalog.sh\` in the SaaS repo (getownstack/ownstack) so the designer's Jenkins chart version default is $chart."
+              echo "- Run \`scripts/sync-catalog.sh\` in the portal repo (getownstack/ownstack-portal) so the designer's Jenkins chart version default is $chart."
             fi
             echo "- Stacks get these plugins when an ownstackctl release that contains this lock applies them."
           } >"$RUNNER_TEMP/pr.md"

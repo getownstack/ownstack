@@ -11,16 +11,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/slack"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/providers/slack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 func TestValuesRenderWithAlerts(t *testing.T) {
@@ -56,7 +57,7 @@ func TestValuesRenderWithAlerts(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(casc), &cascDoc); err != nil {
 		t.Fatalf("invalid JCasC YAML: %v\n%s", err, casc)
 	}
-	for _, want := range []string{"IMAGE_REGISTRY", "harbor.admin.example.com", "OWNSTACK_SLACK_CHANNEL", "slackNotifier", "ownstack-cluster.git"} {
+	for _, want := range []string{"IMAGE_REGISTRY", "harbor.admin.example.com", "OWNSTACK_SLACK_CHANNEL", "slackNotifier", stack.LibraryRepoURL} {
 		if !strings.Contains(casc, want) {
 			t.Errorf("JCasC missing %q", want)
 		}
@@ -311,35 +312,121 @@ func TestPlanDescribesBranchMappings(t *testing.T) {
 	}
 }
 
-// helmDeploy refuses a non-production deploy when the cluster repo's Helm
-// library predates environments, by looking for a word in its templates. The
-// live library must contain that word, or every such deploy would fail.
-func TestHelmDeployRecognizesCurrentHelmLibrary(t *testing.T) {
+// Jenkins loads the pipeline library from the Ownstack repository at the
+// stack's library ref, and global env names the same repository and ref, so
+// helmDeploy fetches common_helm_library from where the library came from.
+// Cluster repos are not involved.
+func TestLibrariesComeFromTheOwnstackRepoAtOneRef(t *testing.T) {
+	saved := stack.EngineVersion
+	t.Cleanup(func() { stack.EngineVersion = saved })
+	for _, c := range []struct{ version, settings, want string }{
+		{"dev", "", "main"},
+		{"ownstackctl-v0.4.0", "", "ownstackctl-v0.4.0"},
+		{"ownstackctl-v0.4.0", "      libraryRef: my-branch\n", "my-branch"},
+	} {
+		stack.EngineVersion = c.version
+		rt := jenkinsRuntime(t, c.settings)
+		data := valuesData(rt, "pw")
+		env := map[string]string{}
+		for _, v := range data["GlobalEnv"].([]envVar) {
+			env[v.Key] = v.Value
+		}
+		if env["OWNSTACK_LIBRARY_REPO"] != "https://github.com/getownstack/ownstack.git" || env["OWNSTACK_LIBRARY_REF"] != c.want {
+			t.Errorf("%s %q: library env = %q @ %q, want %s", c.version, c.settings, env["OWNSTACK_LIBRARY_REPO"], env["OWNSTACK_LIBRARY_REF"], c.want)
+		}
+		// Older pipeline libraries (a libraryRef naming an earlier release)
+		// read the Helm library from here.
+		if env["COMMON_HELM_LIBRARY_GITHUB_REPO"] != stack.LibraryRepoURL {
+			t.Errorf("COMMON_HELM_LIBRARY_GITHUB_REPO = %q", env["COMMON_HELM_LIBRARY_GITHUB_REPO"])
+		}
+		values, err := stack.Render(valuesTmpl, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		library := globalLibrary(t, values)
+		if library.DefaultVersion != c.want || library.Name != "jenkins_pipeline_library" || !library.Implicit {
+			t.Errorf("%s %q: global library = %+v", c.version, c.settings, library)
+		}
+		git := library.Retriever.ModernSCM.SCM.Git
+		if library.Retriever.ModernSCM.LibraryPath != "jenkins_pipeline_library/" || git.Remote != stack.LibraryRepoURL {
+			t.Errorf("library retriever = %+v", library.Retriever)
+		}
+		// A release ref is a tag; without tag discovery it would not resolve.
+		if !slices.Contains(git.Traits, "gitTagDiscovery") || !slices.Contains(git.Traits, "gitBranchDiscovery") {
+			t.Errorf("library traits = %v", git.Traits)
+		}
+		// The repository is public; the VCS token is for the customer's repos.
+		if git.CredentialsID != "" {
+			t.Errorf("library uses credential %q", git.CredentialsID)
+		}
+		if !strings.Contains(libraryDetail(rt), "getownstack/ownstack@"+c.want) {
+			t.Errorf("plan detail = %q", libraryDetail(rt))
+		}
+	}
+
 	deploy, err := os.ReadFile("../../../jenkins_pipeline_library/vars/helmDeploy.groovy")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`grep -q (\w+) \./tmp-infrastructure/common_helm_library/templates/\*\.tpl`).FindSubmatch(deploy)
-	if m == nil {
-		t.Fatal("helmDeploy.groovy does not check the Helm library")
-	}
-	if !strings.Contains(string(deploy), "--set-string "+string(m[1])+"=") {
-		t.Errorf("helmDeploy.groovy checks for %s but does not set it", m[1])
-	}
-	templates, err := filepath.Glob("../../../common_helm_library/templates/*.tpl")
-	if err != nil || len(templates) == 0 {
-		t.Fatalf("no library templates: %v", err)
-	}
-	for _, f := range templates {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(data), string(m[1])) {
-			return
+	for _, want := range []string{
+		"if (env.OWNSTACK_LIBRARY_REPO) {",
+		"def ref = env.OWNSTACK_LIBRARY_REF ?: 'main'",
+		// Release refs are tags; stack.ReleaseTag accepts only ownstackctl-v*.
+		"ref.startsWith('ownstackctl-v') ? 'refs/tags/' + ref : '*/' + ref",
+		"remote = [url: env.OWNSTACK_LIBRARY_REPO]",
+		"branches: [[name: branch]]",
+	} {
+		if !strings.Contains(string(deploy), want) {
+			t.Errorf("helmDeploy.groovy does not contain %q", want)
 		}
 	}
-	t.Errorf("common_helm_library never mentions %s, so helmDeploy would refuse every non-production deploy", m[1])
+}
+
+type jcascLibrary struct {
+	DefaultVersion string `yaml:"defaultVersion"`
+	Implicit       bool   `yaml:"implicit"`
+	Name           string `yaml:"name"`
+	Retriever      struct {
+		ModernSCM struct {
+			LibraryPath string `yaml:"libraryPath"`
+			SCM         struct {
+				Git struct {
+					CredentialsID string   `yaml:"credentialsId"`
+					Remote        string   `yaml:"remote"`
+					Traits        []string `yaml:"traits"`
+				} `yaml:"git"`
+			} `yaml:"scm"`
+		} `yaml:"modernSCM"`
+	} `yaml:"retriever"`
+}
+
+// globalLibrary is the one global library of rendered values' JCasC.
+func globalLibrary(t *testing.T, values string) jcascLibrary {
+	t.Helper()
+	var parsed struct {
+		Controller struct {
+			JCasC struct {
+				ConfigScripts map[string]string `yaml:"configScripts"`
+			} `yaml:"JCasC"`
+		}
+	}
+	if err := yaml.Unmarshal([]byte(values), &parsed); err != nil {
+		t.Fatalf("invalid values YAML: %v", err)
+	}
+	var casc struct {
+		Unclassified struct {
+			GlobalLibraries struct {
+				Libraries []jcascLibrary `yaml:"libraries"`
+			} `yaml:"globalLibraries"`
+		} `yaml:"unclassified"`
+	}
+	if err := yaml.Unmarshal([]byte(parsed.Controller.JCasC.ConfigScripts["main"]), &casc); err != nil {
+		t.Fatalf("invalid JCasC YAML: %v", err)
+	}
+	if n := len(casc.Unclassified.GlobalLibraries.Libraries); n != 1 {
+		t.Fatalf("JCasC has %d global libraries", n)
+	}
+	return casc.Unclassified.GlobalLibraries.Libraries[0]
 }
 
 // jenkinsStored is how Jenkins keeps a folder ownstackctl created: XML 1.1,

@@ -45,7 +45,9 @@ controller:
         unclassified:
           globalLibraries:
             libraries:
-              - defaultVersion: "main"
+              # The public Ownstack repository at the stack's library ref: a
+              # release tag (ownstackctl-v*), or a branch.
+              - defaultVersion: {{ printf "%q" .LibraryRef }}
                 implicit: true
                 name: "jenkins_pipeline_library"
                 retriever:
@@ -53,10 +55,10 @@ controller:
                     libraryPath: "jenkins_pipeline_library/"
                     scm:
                       git:
-                        credentialsId: "{{ .VCSCredentialID }}"
-                        remote: {{ printf "%q" .ClusterRepoURL }}
+                        remote: {{ printf "%q" .LibraryRepoURL }}
                         traits:
                           - "gitBranchDiscovery"
+                          - "gitTagDiscovery"
 {{- if .Slack }}
           slackNotifier:
             botUser: true

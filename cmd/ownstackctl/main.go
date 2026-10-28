@@ -15,14 +15,14 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/engine"
-	"github.com/getownstack/ownstack-cluster-template/internal/health"
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
-	"github.com/getownstack/ownstack-cluster-template/internal/report"
-	"github.com/getownstack/ownstack-cluster-template/internal/secrets"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/engine"
+	"github.com/getownstack/ownstack/internal/health"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers"
+	"github.com/getownstack/ownstack/internal/providers/ghactions"
+	"github.com/getownstack/ownstack/internal/report"
+	"github.com/getownstack/ownstack/internal/secrets"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // version is set at release build time with -ldflags "-X main.version=...".
@@ -230,7 +230,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	applyFlags(fs, &opts)
 	hf.register(fs)
 	fs.StringVar(&only, "only", "", "comma-separated aspects to apply")
-	fs.String("legacy-script", "", "ignored; kept for setup_system.sh from earlier template versions")
+	fs.String("legacy-script", "", "ignored; older cluster repos' setup scripts pass it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

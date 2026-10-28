@@ -1,6 +1,6 @@
 // Package helmlib tests common_helm_library by rendering it the way both CI
 // providers deploy it: copied into an app chart's charts/ directory and
-// templated with the pipeline's --set flags. GitHub Actions stacks fetch the
+// templated with the pipeline's --set flags. Both CI providers fetch the
 // library from this repository at deploy time, so these renders are a
 // compatibility contract for every existing app chart.
 package helmlib
@@ -23,14 +23,14 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
+	"github.com/getownstack/ownstack/internal/providers/ghactions"
 )
 
 const (
 	libraryDir = "../../common_helm_library"
 	// baselineDir is a frozen copy of the library from before environments.
 	// Production deploys must render byte-identically to it: ownstack.io and
-	// every existing app chart take the live library from template main.
+	// every existing app chart take the live library from main.
 	baselineDir = "testdata/baseline-library"
 	image       = "registry.example.com/product/app:main-abc1234"
 )

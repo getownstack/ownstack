@@ -21,7 +21,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
+	"github.com/getownstack/ownstack/internal/catalog"
 )
 
 const (

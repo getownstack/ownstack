@@ -15,7 +15,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 const (

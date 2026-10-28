@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers"
-	"github.com/getownstack/ownstack-cluster-template/internal/secrets"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/catalog"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers"
+	"github.com/getownstack/ownstack/internal/secrets"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // EnvironmentsStage prepares the deployment namespaces. It is not an aspect;

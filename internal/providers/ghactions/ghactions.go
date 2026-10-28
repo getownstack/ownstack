@@ -24,9 +24,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
-	"github.com/getownstack/ownstack-cluster-template/internal/githubapi"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/catalog"
+	"github.com/getownstack/ownstack/internal/githubapi"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 const (
@@ -38,8 +38,6 @@ const (
 	targetsConfigMap = "ownstack-ci-targets"
 	workflowFile     = "ownstack.yml"
 	workflowPath     = ".github/workflows/" + workflowFile
-	// libraryRepo is where the workflow takes common_helm_library from.
-	libraryRepo = "getownstack/ownstack-cluster-template"
 )
 
 // Workflow is the pipeline committed to app repos; docs link to it too.
@@ -95,7 +93,7 @@ func (p Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 	steps := []stack.Step{
 		{Action: "ensure", Target: "deploy identity", Detail: fmt.Sprintf("service account %s/%s, may only change %s", systemNamespace, deployer, strings.Join(rt.Manifest.Environments(), ", "))},
 		{Action: "configure", Target: "app pipelines", Detail: fmt.Sprintf("Helm library %s@%s, images for %s, deploys %s",
-			libraryRepo, libraryRef(rt.Setting("libraryRef"), stack.EngineVersion), platform(nodeArch(rt)), deploysDetail(rt))},
+			stack.LibraryRepo, rt.LibraryRef(), platform(nodeArch(rt)), deploysDetail(rt))},
 	}
 	if rt.Out.VCS.Token == "" {
 		return append(steps, stack.Step{Action: "configure", Target: "app repos", Detail: "repos with " + workflowPath})
@@ -145,7 +143,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if demo {
 		repos, failed = withDemo(repos, failed, target{rt.Out.VCS.Owner, demoRepo})
 	}
-	ref := libraryRef(rt.Setting("libraryRef"), stack.EngineVersion)
+	ref := rt.LibraryRef()
 	secrets := map[string]string{
 		"OWNSTACK_KUBECONFIG":        kubeconfig,
 		"OWNSTACK_REGISTRY_PASSWORD": rt.Out.Images.PushPassword,
@@ -170,7 +168,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err := recordTargets(ctx, rt, repos, failed); err != nil {
 		return err
 	}
-	rt.Logf("App pipelines take the Helm library from %s@%s, build images for %s, and deploy %s", libraryRepo, ref, platform(nodeArch(rt)), deploysDetail(rt))
+	rt.Logf("App pipelines take the Helm library from %s@%s, build images for %s, and deploy %s", stack.LibraryRepo, ref, platform(nodeArch(rt)), deploysDetail(rt))
 	if demo {
 		info, err := gh.Repo(ctx, rt.Out.VCS.Owner, demoRepo)
 		if err != nil {
@@ -371,20 +369,6 @@ func discoveryError(failed []repoError) error {
 		reasons[i] = f.String() + ": " + f.err.Error()
 	}
 	return fmt.Errorf("could not check %d repos for %s (%s); the other repos are configured", len(failed), workflowPath, strings.Join(reasons, "; "))
-}
-
-// libraryRef is the template ref app pipelines take the Helm library from:
-// the libraryRef setting, else the tag of the running ownstackctl release,
-// so a stack's library only changes when a newer release applies it.
-// Development builds use main.
-func libraryRef(setting, version string) string {
-	if setting != "" {
-		return setting
-	}
-	if tag := stack.ReleaseTag(version); tag != "" {
-		return tag
-	}
-	return "main"
 }
 
 // nodeArch is the server's architecture from the compute output, "" when

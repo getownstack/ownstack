@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // fakeDNS answers from records keyed by "server network name". A missing

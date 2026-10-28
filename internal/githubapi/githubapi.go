@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // Client is a minimal GitHub REST client.
@@ -93,9 +93,9 @@ func (c *Client) Repo(ctx context.Context, owner, name string) (RepoInfo, error)
 	return info, err
 }
 
-// EnsureRepo creates owner/name from template when it does not exist and
+// GenerateRepo creates owner/name from template when it does not exist and
 // waits until the generated repo has content.
-func (c *Client) EnsureRepo(ctx context.Context, rt *stack.Runtime, owner, name, template, description string) error {
+func (c *Client) GenerateRepo(ctx context.Context, rt *stack.Runtime, owner, name, template, description string) error {
 	if _, err := c.Repo(ctx, owner, name); err == nil {
 		rt.Logf("GitHub: %s/%s exists", owner, name)
 		return nil
@@ -109,6 +109,36 @@ func (c *Client) EnsureRepo(ctx context.Context, rt *stack.Runtime, owner, name,
 		return err
 	}
 	// Generation is asynchronous; wait until the default branch has content.
+	return c.waitForBranch(ctx, rt, owner, name)
+}
+
+// CreateRepo creates the private repo owner/name with an initial commit.
+// login is the authenticated user: their own repos are created through
+// /user/repos, any other owner must be an organization the token can create
+// repos in.
+func (c *Client) CreateRepo(ctx context.Context, rt *stack.Runtime, login, owner, name, description string) error {
+	endpoint := "/orgs/" + owner + "/repos"
+	if strings.EqualFold(owner, login) {
+		endpoint = "/user/repos"
+	}
+	rt.Logf("GitHub: creating private %s/%s", owner, name)
+	err := c.Do(ctx, http.MethodPost, endpoint, map[string]any{
+		"name": name, "description": description, "private": true,
+		// An initial commit gives the repo its default branch, so files can
+		// be committed through the contents API.
+		"auto_init": true,
+	}, nil)
+	if errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("cannot create %s/%s: %s is neither the token's user (%s) nor an organization it can see", owner, name, owner, login)
+	}
+	if err != nil {
+		return err
+	}
+	return c.waitForBranch(ctx, rt, owner, name)
+}
+
+// waitForBranch waits until a new repo's default branch exists.
+func (c *Client) waitForBranch(ctx context.Context, rt *stack.Runtime, owner, name string) error {
 	return stack.Retry(ctx, rt.Console, owner+"/"+name+" contents", 20, 3*time.Second, func() error {
 		info, err := c.Repo(ctx, owner, name)
 		if err != nil {
@@ -118,32 +148,51 @@ func (c *Client) EnsureRepo(ctx context.Context, rt *stack.Runtime, owner, name,
 	})
 }
 
-// UpsertFile commits content to path unless it is already identical.
-func (c *Client) UpsertFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, message string) (bool, error) {
-	endpoint := "/repos/" + owner + "/" + repo + "/contents/" + path
+// File returns the content of path on branch and its blob sha; sha is ""
+// when the file does not exist.
+func (c *Client) File(ctx context.Context, owner, repo, branch, path string) (content []byte, sha string, err error) {
 	var existing struct {
 		SHA     string `json:"sha"`
 		Content string `json:"content"`
 	}
-	err := c.Do(ctx, http.MethodGet, endpoint+"?ref="+branch, nil, &existing)
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		return false, err
+	err = c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+repo+"/contents/"+path+"?ref="+branch, nil, &existing)
+	if errors.Is(err, ErrNotFound) {
+		return nil, "", nil
 	}
-	if existing.SHA != "" {
-		current, _ := base64.StdEncoding.DecodeString(strings.ReplaceAll(existing.Content, "\n", ""))
-		if bytes.Equal(current, content) {
-			return false, nil
-		}
+	if err != nil {
+		return nil, "", err
 	}
+	content, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(existing.Content, "\n", ""))
+	if err != nil {
+		return nil, "", fmt.Errorf("GitHub %s/%s %s: %w", owner, repo, path, err)
+	}
+	return content, existing.SHA, nil
+}
+
+// PutFile commits content to path on branch. sha is the blob it replaces,
+// "" for a new file.
+func (c *Client) PutFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, sha, message string) error {
 	body := map[string]any{
 		"message": message,
 		"content": base64.StdEncoding.EncodeToString(content),
 		"branch":  branch,
 	}
-	if existing.SHA != "" {
-		body["sha"] = existing.SHA
+	if sha != "" {
+		body["sha"] = sha
 	}
-	return true, stack.Retry(ctx, rt.Console, "commit "+path, 5, 3*time.Second, func() error {
-		return c.Do(ctx, http.MethodPut, endpoint, body, nil)
+	return stack.Retry(ctx, rt.Console, "commit "+path, 5, 3*time.Second, func() error {
+		return c.Do(ctx, http.MethodPut, "/repos/"+owner+"/"+repo+"/contents/"+path, body, nil)
 	})
+}
+
+// UpsertFile commits content to path unless it is already identical.
+func (c *Client) UpsertFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, message string) (bool, error) {
+	current, sha, err := c.File(ctx, owner, repo, branch, path)
+	if err != nil {
+		return false, err
+	}
+	if sha != "" && bytes.Equal(current, content) {
+		return false, nil
+	}
+	return true, c.PutFile(ctx, rt, owner, repo, branch, path, content, sha, message)
 }

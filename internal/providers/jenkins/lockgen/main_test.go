@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins/pluginlock"
+	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
 )
 
 const index = `apiVersion: v1

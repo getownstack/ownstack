@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 func TestNamespaceObject(t *testing.T) {

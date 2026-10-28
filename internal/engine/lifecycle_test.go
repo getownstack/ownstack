@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/providertest"
-	"github.com/getownstack/ownstack-cluster-template/internal/secrets"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/catalog"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers"
+	"github.com/getownstack/ownstack/internal/providers/providertest"
+	"github.com/getownstack/ownstack/internal/secrets"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // The environments stage and orphan detection call kubectl and helm. These

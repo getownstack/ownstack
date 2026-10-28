@@ -5,24 +5,28 @@ def call(String applicationId) {
     // call from an unmapped build keeps the earlier target, the deploy namespace.
     def environment = deployEnvironment() ?: values.namespace
 
+    // common_helm_library comes from the public Ownstack repository at the
+    // ref this pipeline library was loaded from: ownstackctl sets both in
+    // Jenkins global env. Release refs (ownstackctl-v*) are tags, anything
+    // else a branch. Jenkins configured by an ownstackctl from before sets
+    // neither and keeps the cluster repo's copy at main.
+    def branch = '*/main'
+    def remote = [url: env.COMMON_HELM_LIBRARY_GITHUB_REPO, credentialsId: 'github-pat']
+    if (env.OWNSTACK_LIBRARY_REPO) {
+        def ref = env.OWNSTACK_LIBRARY_REF ?: 'main'
+        branch = ref.startsWith('ownstackctl-v') ? 'refs/tags/' + ref : '*/' + ref
+        remote = [url: env.OWNSTACK_LIBRARY_REPO]
+    }
+
     // The pipeline's agent has already checked out the app repo into the
     // shared pod workspace; only the Helm library needs fetching here.
     container('helm') {
         dir('./tmp-infrastructure'){
             checkout([
                 $class: 'GitSCM',
-                branches: [[name: '*/main']],
-                userRemoteConfigs: [[
-                    url: env.COMMON_HELM_LIBRARY_GITHUB_REPO, // todo: add url to config if needed
-                    credentialsId: 'github-pat'
-                ]]
+                branches: [[name: branch]],
+                userRemoteConfigs: [remote]
             ])
-        }
-        // A Helm library from before environments ignores environment and
-        // would publish this environment at the production host.
-        if (environment != values.productionEnvironment &&
-                sh(script: "grep -q productionEnvironment ./tmp-infrastructure/common_helm_library/templates/*.tpl", returnStatus: true) != 0) {
-            error "The cluster repo's common_helm_library predates environments and would publish ${environment} at the production host. Update common_helm_library in the cluster repo from the Ownstack template."
         }
         sh "mkdir -p ./infrastructure/${applicationId}/helm/charts"
         sh "cp -r ./tmp-infrastructure/common_helm_library ./infrastructure/${applicationId}/helm/charts/common_helm_library"

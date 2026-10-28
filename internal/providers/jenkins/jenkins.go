@@ -1,6 +1,7 @@
 // Package jenkins implements the CI/CD contract with Jenkins: Kubernetes pod
-// agents, the shared pipeline library from the cluster repo, and a GitHub
-// organization folder that discovers application repos.
+// agents, the shared pipeline library from the Ownstack repository
+// (stack.LibraryRepo) at the stack's library ref, and a GitHub organization
+// folder that discovers application repos.
 package jenkins
 
 import (
@@ -18,8 +19,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins/pluginlock"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/providers/jenkins/pluginlock"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 const (
@@ -140,6 +141,7 @@ func (Provider) Plan(ctx context.Context, rt *stack.Runtime) []stack.Step {
 		stack.Step{Action: "ensure", Target: "credentials", Detail: credentialSummary(rt)},
 		stack.HelmStep(ctx, rt, release, namespace, rt.Setting("chartVersion")),
 		stack.Step{Action: "ensure", Target: "plugins", Detail: pluginSummary(rt)},
+		stack.Step{Action: "configure", Target: "pipeline libraries", Detail: libraryDetail(rt)},
 		folderStep(ctx, rt),
 	)
 	return steps
@@ -218,6 +220,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		rt.Logf("warning: %s", warning)
 	}
 	rt.Logf("Applying Jenkins %s (chart %s, %d plugins) at https://%s", pluginLock.Jenkins, rt.Setting("chartVersion"), len(installPlugins(rt)), host)
+	rt.Logf("Pipelines take %s", libraryDetail(rt))
 	if err := stack.Retry(ctx, rt.Console, "jenkins helm release", 3, 20*time.Second, func() error {
 		return rt.Kube.HelmUpgrade(ctx, stack.Chart{
 			Release: release, Namespace: namespace, Repo: chartRepo, Name: "jenkins",
@@ -479,15 +482,29 @@ func folderChanges(current, desired string) (changes []string, ok bool, err erro
 	return changes, true, nil
 }
 
+// libraryDetail says where pipelines take the Ownstack libraries from, for
+// plan and apply.
+func libraryDetail(rt *stack.Runtime) string {
+	return fmt.Sprintf("jenkins_pipeline_library and common_helm_library from %s@%s", stack.LibraryRepo, rt.LibraryRef())
+}
+
 type envVar struct{ Key, Value string }
 
 func valuesData(rt *stack.Runtime, password string) map[string]any {
-	images, vcs := rt.Out.Images, rt.Out.VCS
+	images := rt.Out.Images
+	ref := rt.LibraryRef()
 	env := []envVar{
 		{"IMAGE_REGISTRY", images.Host},
 		{"IMAGE_REPOSITORY_PROJECT", images.Project},
 		{"IMAGE_PULL_SECRET", images.PullSecretName},
-		{"COMMON_HELM_LIBRARY_GITHUB_REPO", vcs.ClusterRepoURL},
+		// helmDeploy fetches common_helm_library from the repository and ref
+		// the pipeline library itself is loaded from.
+		{"OWNSTACK_LIBRARY_REPO", stack.LibraryRepoURL},
+		{"OWNSTACK_LIBRARY_REF", ref},
+		// Pipeline libraries from before OWNSTACK_LIBRARY_REPO (a libraryRef
+		// that names an older release) fetch common_helm_library from here at
+		// main; cluster repos no longer carry it.
+		{"COMMON_HELM_LIBRARY_GITHUB_REPO", stack.LibraryRepoURL},
 		{"OWNSTACK_DOMAIN", rt.Domain()},
 		// Libraries without branch mappings deploy only this branch, into
 		// this namespace.
@@ -510,8 +527,8 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 		"Password":           password,
 		"Annotations":        rt.Out.Ingress.Annotations,
 		"GlobalEnv":          env,
-		"VCSCredentialID":    vcsCredentialID,
-		"ClusterRepoURL":     vcs.ClusterRepoURL,
+		"LibraryRepoURL":     stack.LibraryRepoURL,
+		"LibraryRef":         ref,
 		"Slack":              slack,
 		"AlertsCredentialID": alertsCredentialID,
 	}

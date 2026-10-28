@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // ProbeLabel is resolved under the domain to check the wildcard record.

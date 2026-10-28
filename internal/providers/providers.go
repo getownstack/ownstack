@@ -4,19 +4,19 @@ package providers
 import (
 	"context"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/cloudflare"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/ghactions"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/github"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/harbor"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/jenkins"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/manualdns"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/ownvps"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/registry"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/slack"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/traefik"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers/zot"
-	"github.com/getownstack/ownstack-cluster-template/internal/stack"
+	"github.com/getownstack/ownstack/internal/catalog"
+	"github.com/getownstack/ownstack/internal/providers/cloudflare"
+	"github.com/getownstack/ownstack/internal/providers/ghactions"
+	"github.com/getownstack/ownstack/internal/providers/github"
+	"github.com/getownstack/ownstack/internal/providers/harbor"
+	"github.com/getownstack/ownstack/internal/providers/jenkins"
+	"github.com/getownstack/ownstack/internal/providers/manualdns"
+	"github.com/getownstack/ownstack/internal/providers/ownvps"
+	"github.com/getownstack/ownstack/internal/providers/registry"
+	"github.com/getownstack/ownstack/internal/providers/slack"
+	"github.com/getownstack/ownstack/internal/providers/traefik"
+	"github.com/getownstack/ownstack/internal/providers/zot"
+	"github.com/getownstack/ownstack/internal/stack"
 )
 
 var implementations = map[string]stack.Provider{

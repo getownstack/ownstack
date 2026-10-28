@@ -4,7 +4,7 @@
 # production); other branches do not build. Run it by hand to deploy a branch
 # to another environment, or with an image tag to promote an existing build.
 # ownstackctl manages the OWNSTACK_* secrets and variables this reads.
-# ownstack-workflow: 3
+# ownstack-workflow: 4
 name: ownstack
 
 on:
@@ -106,7 +106,7 @@ jobs:
       - name: Fetch the Ownstack Helm library
         uses: actions/checkout@v5
         with:
-          repository: getownstack/ownstack-cluster-template
+          repository: getownstack/ownstack
           ref: ${{ vars.OWNSTACK_LIBRARY_REF || 'main' }}
           path: .ownstack
           sparse-checkout: common_helm_library

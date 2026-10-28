@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/manifest"
-	"github.com/getownstack/ownstack-cluster-template/internal/providers"
+	"github.com/getownstack/ownstack/internal/manifest"
+	"github.com/getownstack/ownstack/internal/providers"
 )
 
 const valid = `

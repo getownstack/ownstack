@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs ownstackctl from a pinned GitHub Release after verifying its checksum.
 #
-#   curl -fsSL https://raw.githubusercontent.com/getownstack/ownstack-cluster-template/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/getownstack/ownstack/main/install.sh | sudo bash
 #
 # Environment:
 #   OWNSTACKCTL_VERSION      release tag (default below)
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 version="${OWNSTACKCTL_VERSION:-ownstackctl-v0.3.2}"
-repo="${OWNSTACKCTL_REPO:-getownstack/ownstack-cluster-template}"
+repo="${OWNSTACKCTL_REPO:-getownstack/ownstack}"
 install_dir="${OWNSTACKCTL_INSTALL_DIR:-/usr/local/bin}"
 
 case "$(uname -s)-$(uname -m)" in

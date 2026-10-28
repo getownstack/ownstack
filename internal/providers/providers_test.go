@@ -3,7 +3,7 @@ package providers
 import (
 	"testing"
 
-	"github.com/getownstack/ownstack-cluster-template/internal/catalog"
+	"github.com/getownstack/ownstack/internal/catalog"
 )
 
 func TestCatalogIsConsistent(t *testing.T) {
