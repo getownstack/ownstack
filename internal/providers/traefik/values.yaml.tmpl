@@ -4,8 +4,16 @@ ingressRoute:
     matchRule: Host(`{{ .DashboardHost }}`)
     entryPoints:
       - {{ .EntryPoint }}
+    # The stack's one certificate. Routers whose hosts it covers order
+    # nothing more.
     tls:
       certResolver: {{ .CertResolver }}
+      domains:
+        - main: {{ printf "%q" (index .Certificate 0) }}
+          sans:
+{{- range slice .Certificate 1 }}
+            - {{ printf "%q" . }}
+{{- end }}
 providers:
   kubernetesGateway:
     enabled: true

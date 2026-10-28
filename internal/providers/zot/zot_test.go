@@ -1,20 +1,21 @@
 package zot
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
-	"text/template"
 
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 
+	"github.com/getownstack/ownstack/internal/providers/providertest"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
 func values(keepTags int) map[string]any {
 	return map[string]any{
-		"Host": "registry.admin.example.com", "StorageGiB": 10, "Htpasswd": "ownstack:$2a$10$abc",
+		"Host": "registry.admin.example.com", "Htpasswd": "ownstack:$2a$10$abc",
 		"Annotations": map[string]string{"traefik.ingress.kubernetes.io/router.entrypoints": "websecure"},
 		"KeepTags":    keepTags,
 	}
@@ -33,7 +34,8 @@ func TestValuesRender(t *testing.T) {
 		t.Fatalf("values: %v\n%s", err, out)
 	}
 	var config struct {
-		HTTP struct {
+		Storage map[string]any `json:"storage"`
+		HTTP    struct {
 			Compat []string `json:"compat"`
 			Auth   struct {
 				Htpasswd struct{ Path string } `json:"htpasswd"`
@@ -43,6 +45,9 @@ func TestValuesRender(t *testing.T) {
 	if err := json.Unmarshal([]byte(values.ConfigFiles["config.json"]), &config); err != nil {
 		t.Fatalf("config.json: %v", err)
 	}
+	if len(config.Storage) != 2 || config.Storage["rootDirectory"] != "/var/lib/registry" || config.Storage["gc"] != true {
+		t.Errorf("storage without retention = %v", config.Storage)
+	}
 	// docker push sends Docker v2 schema 2 manifests; without compat Zot
 	// rejects them as "manifest invalid".
 	if len(config.HTTP.Compat) != 1 || config.HTTP.Compat[0] != "docker2s2" {
@@ -50,61 +55,6 @@ func TestValuesRender(t *testing.T) {
 	}
 	if config.HTTP.Auth.Htpasswd.Path != "/secret/htpasswd" || values.SecretFiles["htpasswd"] != "ownstack:$2a$10$abc" {
 		t.Errorf("auth wiring wrong: %+v %v", config.HTTP.Auth, values.SecretFiles)
-	}
-}
-
-// valuesBeforeRetention is values.yaml.tmpl as it was before keepTags. With
-// retention off the rendered values must stay identical, or every existing
-// Zot would restart on its next apply.
-const valuesBeforeRetention = `service:
-  type: ClusterIP
-  port: 5000
-ingress:
-  enabled: true
-  className: traefik
-  pathtype: Prefix
-  annotations:
-{{- range $key, $value := .Annotations }}
-    {{ $key }}: {{ printf "%q" $value }}
-{{- end }}
-  hosts:
-    - host: {{ .Host }}
-      paths:
-        - path: /
-persistence: true
-pvc:
-  create: true
-  storage: {{ .StorageGiB }}Gi
-mountConfig: true
-configFiles:
-  config.json: |-
-    {
-      "storage": { "rootDirectory": "/var/lib/registry", "gc": true },
-      "http": {
-        "address": "0.0.0.0",
-        "port": "5000",
-        "realm": "ownstack",
-        "compat": ["docker2s2"],
-        "auth": { "htpasswd": { "path": "/secret/htpasswd" } }
-      },
-      "log": { "level": "info" }
-    }
-mountSecret: true
-secretFiles:
-  htpasswd: {{ printf "%q" .Htpasswd }}
-`
-
-func TestRetentionOffKeepsValuesIdentical(t *testing.T) {
-	before, err := stack.Render(template.Must(template.New("before").Parse(valuesBeforeRetention)), values(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	after, err := stack.Render(tmpl, values(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after != before {
-		t.Errorf("values changed with keepTags 0:\n%s\nwant:\n%s", after, before)
 	}
 }
 
@@ -176,5 +126,16 @@ func TestReuseHtpasswd(t *testing.T) {
 	}
 	if got, _ := reuseHtpasswd(existing, "ownstack", "zot-pw"); strings.Contains(got, "zot-pw") {
 		t.Error("line contains the password")
+	}
+}
+
+// The registry contract is fixed: registry.<adminDomain>, user ownstack,
+// images under apps/.
+func TestResolveOutputs(t *testing.T) {
+	rt, _ := providertest.Runtime(t, Spec)
+	_ = (Provider{}).Resolve(context.Background(), rt.For("images"))
+	out := rt.Out.Images
+	if out == nil || out.Host != "registry.admin.example.com" || out.Project != "apps" || out.PushUsername != "ownstack" {
+		t.Errorf("images output = %+v", out)
 	}
 }

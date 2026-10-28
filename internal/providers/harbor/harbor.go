@@ -37,9 +37,6 @@ const (
 	chartVersion = "1.17.2"
 	// project is the Harbor project CI pushes images to.
 	project = "apps"
-	// pullSecret is the image pull secret in every environment, the same
-	// for every registry.
-	pullSecret = "registry-credentials"
 	// robotName is the CI robot account; Harbor reports it as robot$ownstack-ci.
 	robotName = "ownstack-ci"
 	// robotSecret stores the robot credential in the registry's own namespace
@@ -61,10 +58,9 @@ type Provider struct{}
 
 func (Provider) Resolve(ctx context.Context, rt *stack.Runtime) error {
 	out := &stack.ImagesOutput{
-		Host:           rt.AdminHost("harbor"),
-		Project:        project,
-		PullSecretName: pullSecret,
-		Login:          "user admin, password HARBOR_ADMIN_PASSWORD",
+		Host:    rt.AdminHost("harbor"),
+		Project: project,
+		Login:   "user admin, password HARBOR_ADMIN_PASSWORD",
 	}
 	rt.Out.Images = out
 	if user, ok := rt.Kube.SecretValue(ctx, namespace, robotSecret, "username"); ok {

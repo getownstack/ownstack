@@ -1,7 +1,6 @@
 # Helm values the jenkins provider renders for a representative Standard
-# stack (Harbor, default settings), with fake secrets. CI
-# installs the locked chart with them. Regenerate after changing the values
-# template or the lock:
+# stack (Harbor, default settings), with fake secrets. CI installs the locked
+# chart with them. Regenerate after changing the values template or the lock:
 #   go test ./internal/providers/jenkins -run TestValuesGolden -update
 controller:
   image:
@@ -153,28 +152,16 @@ controller:
           globalNodeProperties:
           - envVars:
               env:
-              - key: IMAGE_REGISTRY
-                value: "harbor.admin.example.com"
-              - key: IMAGE_REPOSITORY_PROJECT
-                value: "apps"
-              - key: IMAGE_PULL_SECRET
-                value: "registry-credentials"
+              - key: OWNSTACK_DOMAIN
+                value: "example.com"
+              - key: OWNSTACK_REGISTRY
+                value: "harbor.admin.example.com/apps"
+              - key: OWNSTACK_ENVIRONMENTS
+                value: "prod=main dev=develop qa=release/*"
               - key: OWNSTACK_LIBRARY_REPO
                 value: "https://github.com/getownstack/ownstack.git"
               - key: OWNSTACK_LIBRARY_REF
                 value: "main"
-              - key: COMMON_HELM_LIBRARY_GITHUB_REPO
-                value: "https://github.com/getownstack/ownstack.git"
-              - key: OWNSTACK_DOMAIN
-                value: "example.com"
-              - key: OWNSTACK_DEPLOY_BRANCH
-                value: "main"
-              - key: OWNSTACK_NAMESPACE
-                value: "prod"
-              - key: OWNSTACK_BRANCHES
-                value: "main=prod develop=dev release/*=qa"
-              - key: OWNSTACK_PRODUCTION_ENVIRONMENT
-                value: "prod"
           clouds:
           - kubernetes:
               containerCap: 10
@@ -183,8 +170,8 @@ controller:
         unclassified:
           globalLibraries:
             libraries:
-              # The public Ownstack repository at the stack's library ref: a
-              # release tag (ownstackctl-v*), or a branch.
+              # The public Ownstack repository at the tag of the release that
+              # applied the stack (ownstackctl-v*), or main for development builds.
               - defaultVersion: "main"
                 implicit: true
                 name: "jenkins_pipeline_library"

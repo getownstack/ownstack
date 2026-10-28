@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,8 +14,12 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
+// starter is the test stack (Standard) with the Starter providers.
+var starter = strings.Replace(providertest.Manifest, "images: {provider: harbor}\ncicd: {provider: jenkins}\n", "", 1)
+
 func newEngine(t *testing.T, src string) *Engine {
 	t.Helper()
+	t.Setenv("OWNSTACK_DIR", t.TempDir())
 	m, err := manifest.Parse([]byte(src))
 	if err != nil {
 		t.Fatal(err)
@@ -33,16 +38,17 @@ func stageIDs(e *Engine) string {
 }
 
 func TestStageOrder(t *testing.T) {
-	e := newEngine(t, providertest.Manifest)
-	if got := stageIDs(e); got != "compute,dns,ingress,vcs,images,environments,cicd" {
-		t.Errorf("stages = %s", got)
+	for _, src := range []string{providertest.Manifest, starter} {
+		if got := stageIDs(newEngine(t, src)); got != "compute,dns,ingress,vcs,images,environments,cicd" {
+			t.Errorf("stages = %s", got)
+		}
 	}
 }
 
 func TestApplyRejectsInvalidManifest(t *testing.T) {
 	e := newEngine(t, strings.Replace(providertest.Manifest, "provider: jenkins", "provider: woodpecker", 1))
 	err := e.Apply(context.Background(), ApplyOptions{})
-	if err == nil || !strings.Contains(err.Error(), "spec.cicd.provider") {
+	if err == nil || !strings.Contains(err.Error(), "cicd.provider") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -55,12 +61,28 @@ func TestMemoryPreflight(t *testing.T) {
 	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 1642, AllowLowMemory: true}); err != nil {
 		t.Fatalf("override ignored: %v", err)
 	}
-	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 8192}); err != nil {
-		t.Fatalf("8 GB server refused: %v", err)
+	if err := e.memoryPreflight(ApplyOptions{MemTotalMiB: 3800}); err != nil {
+		t.Fatalf("Standard refused on a 4 GB server: %v", err)
 	}
-	starter := strings.NewReplacer("provider: harbor", "provider: zot", "provider: jenkins", "provider: gh-actions").Replace(providertest.Manifest)
 	if err := newEngine(t, starter).memoryPreflight(ApplyOptions{MemTotalMiB: 1642}); err != nil {
 		t.Fatalf("Starter stack should fit 1.6 GB: %v", err)
+	}
+}
+
+// Secrets and resources follow the providers the manifest picks, defaults
+// included.
+func TestSecretsAndResources(t *testing.T) {
+	var envs []string
+	for _, s := range newEngine(t, starter).Secrets() {
+		envs = append(envs, s.Aspect+"."+s.Key+"="+s.Env)
+	}
+	if want := []string{"dns.apiToken=CLOUDFLARE_API_TOKEN", "vcs.token=GITHUB_TOKEN", "images.password=ZOT_PASSWORD"}; !slices.Equal(envs, want) {
+		t.Errorf("secrets = %v", envs)
+	}
+	starterMiB := newEngine(t, starter).Resources().MemoryMiB
+	standardMiB := newEngine(t, providertest.Manifest).Resources().MemoryMiB
+	if starterMiB == 0 || standardMiB < starterMiB+2000 {
+		t.Errorf("memory: Starter %d MiB, Standard %d MiB", starterMiB, standardMiB)
 	}
 }
 
@@ -86,7 +108,7 @@ func TestPlanProblems(t *testing.T) {
 	}
 
 	plan := Plan{
-		Issues:  []manifest.Issue{{Path: "spec.domain", Message: "x"}},
+		Issues:  []manifest.Issue{{Path: "domain", Message: "x"}},
 		Server:  []stack.Check{{Name: "root", State: stack.Fail}, {Name: "arch", State: stack.OK}},
 		Missing: []string{"GitHub access token"},
 	}

@@ -32,8 +32,6 @@ var Spec = catalog.Provider{
 		{Key: "apiToken", Label: "API token", Kind: catalog.KindSecret, Required: true, Env: "CLOUDFLARE_API_TOKEN",
 			Help:    "Use the \"Edit zone DNS\" template, limited to this domain's zone.",
 			HelpURL: "https://dash.cloudflare.com/profile/api-tokens"},
-		{Key: "zone", Label: "Zone", Kind: catalog.KindHostname, Advanced: true,
-			Help: "Cloudflare zone name. Detected from the domain when empty."},
 		{Key: "replaceRecords", Label: "Replace existing records", Kind: catalog.KindBool, Default: "false", Advanced: true,
 			Help: "Let ownstackctl replace records for the domain and its wildcard that it did not create. When off, apply stops instead of overwriting them."},
 	},
@@ -57,7 +55,7 @@ func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
 
 // replaceSetting is the manifest path of the setting that allows replacing
 // records ownstackctl did not create.
-const replaceSetting = "spec.dns.settings.replaceRecords"
+const replaceSetting = "dns.replaceRecords"
 
 func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	api := p.client(rt)
@@ -67,7 +65,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	var zoneID string
 	err := stack.Retry(ctx, rt.Console, "find Cloudflare zone", 5, 10*time.Second, func() error {
 		var err error
-		zoneID, err = api.findZone(ctx, rt.Setting("zone"), domain)
+		zoneID, err = api.findZone(ctx, domain)
 		return err
 	})
 	if err != nil {
@@ -289,18 +287,11 @@ func (c *client) do(ctx context.Context, method, path string, body any, out any)
 	return nil
 }
 
-// findZone returns the zone for the explicit zone name, or the closest
-// enclosing zone of the domain.
-func (c *client) findZone(ctx context.Context, explicit, domain string) (string, error) {
-	candidates := []string{explicit}
-	if explicit == "" {
-		candidates = nil
-		labels := strings.Split(domain, ".")
-		for i := 0; i < len(labels)-1; i++ {
-			candidates = append(candidates, strings.Join(labels[i:], "."))
-		}
-	}
-	for _, name := range candidates {
+// findZone returns the closest zone enclosing the domain.
+func (c *client) findZone(ctx context.Context, domain string) (string, error) {
+	labels := strings.Split(domain, ".")
+	for i := 0; i < len(labels)-1; i++ {
+		name := strings.Join(labels[i:], ".")
 		var zones []struct{ ID string }
 		if err := c.do(ctx, http.MethodGet, "/zones?name="+url.QueryEscape(name)+"&per_page=1", nil, &zones); err != nil {
 			return "", err

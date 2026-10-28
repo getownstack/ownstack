@@ -16,15 +16,14 @@ ingress:
 persistence: true
 pvc:
   create: true
-  storage: {{ .StorageGiB }}Gi
+  storage: 10Gi
 mountConfig: true
 configFiles:
   config.json: |-
     {
-{{- if gt .KeepTags 0 }}
       "storage": {
         "rootDirectory": "/var/lib/registry",
-        "gc": true,
+        "gc": true{{ if gt .KeepTags 0 }},
         "retention": {
           "policies": [
             {
@@ -33,11 +32,8 @@ configFiles:
               "keepTags": [{ "mostRecentlyPushedCount": {{ .KeepTags }}, "pulledWithin": "720h" }]
             }
           ]
-        }
+        }{{ end }}
       },
-{{- else }}
-      "storage": { "rootDirectory": "/var/lib/registry", "gc": true },
-{{- end }}
       "http": {
         "address": "0.0.0.0",
         "port": "5000",

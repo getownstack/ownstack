@@ -1,8 +1,10 @@
 package ownvps
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -17,21 +19,17 @@ func TestK3sAction(t *testing.T) {
 		action          string
 		err             string
 	}{
-		{"v1.33.4+k3s1", "", k3sNone, ""},
 		{"v1.33.4+k3s1", "v1.33.4+k3s1", k3sNone, ""},
 		{"v1.33.4+k3s1", "1.33.4+k3s1", k3sNone, ""},
-		{"v1.33.4+k3s1", "v1.33.4", k3sNone, ""},
 		{"v1.33.4+k3s1", "v1.33.5+k3s1", k3sUpgrade, ""},
 		{"v1.33.4+k3s1", "v1.33.4+k3s2", k3sUpgrade, ""},
 		{"v1.33.4+k3s1", "1.34.1+k3s1", k3sUpgrade, ""},
 		{"v1.34.0-rc1+k3s1", "v1.34.0+k3s1", k3sUpgrade, ""},
-		{"v1.33.4+k3s1", "v1.35.0+k3s1", "", "one minor version at a time: pin v1.34 first"},
+		{"v1.33.4+k3s1", "v1.35.0+k3s1", "", "one minor version at a time: run curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=v1.34 sh -s - and apply again"},
 		{"v1.33.4+k3s1", "v1.33.3+k3s1", "", "does not support downgrades"},
 		{"v1.33.4+k3s2", "v1.33.4+k3s1", "", "does not support downgrades"},
 		{"v1.33.4+k3s1", "v1.32.9+k3s1", "", "does not support downgrades"},
-		{"v1.33.4+k3s1", "v2.0.0+k3s1", "", "major version"},
-		{"v1.33.4+k3s1", "v1.33.5", "", "names no build"},
-		{"v1.33.4+k3s1", "latest", "", "not a k3s release"},
+		{"v1.33.4+k3s1", "v2.0.0+k3s1", "", "another major version"},
 		{"garbage", "v1.33.4+k3s1", "", "cannot read the installed k3s version"},
 	} {
 		action, err := k3sAction(tc.installed, tc.want)
@@ -43,6 +41,46 @@ func TestK3sAction(t *testing.T) {
 		case err == nil && action != tc.action:
 			t.Errorf("%s -> %q: action = %q, want %q", tc.installed, tc.want, action, tc.action)
 		}
+	}
+}
+
+// The release pins one exact k3s build, and the install script installs it.
+func TestK3sIsPinned(t *testing.T) {
+	r, ok := parseK3sVersion(k3sVersion)
+	if !ok || r.pre || r.build < 1 || !strings.HasPrefix(k3sVersion, "v") {
+		t.Errorf("k3sVersion %s is not a k3s release build", k3sVersion)
+	}
+	if k3sInstallScript != "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION='"+k3sVersion+"' sh -s -" {
+		t.Errorf("install = %s", k3sInstallScript)
+	}
+}
+
+func TestNodeReady(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stubs")
+	}
+	dir := t.TempDir()
+	nodes := filepath.Join(dir, "nodes.json")
+	stub := "#!/bin/sh\n[ -f " + nodes + " ] && cat " + nodes + " || { echo 'The connection to the server was refused' >&2; exit 1; }\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	rt, out := providertest.Runtime(t, Spec)
+
+	if ok, detail := nodeReady(context.Background(), rt); ok || !strings.Contains(detail, "connection to the server was refused") {
+		t.Errorf("API server down: ok=%v detail=%q", ok, detail)
+	}
+	node := func(ready string) string {
+		return `{"items":[{"metadata":{"name":"box"},"status":{"conditions":[{"type":"Ready","status":"` + ready + `"}],"nodeInfo":{"kubeletVersion":"v1.36.5+k3s1"}}}]}`
+	}
+	os.WriteFile(nodes, []byte(node("False")), 0o600)
+	if ok, detail := nodeReady(context.Background(), rt); ok || detail != "no ready node yet" {
+		t.Errorf("node not ready: ok=%v detail=%q", ok, detail)
+	}
+	os.WriteFile(nodes, []byte(node("True")), 0o600)
+	if ok, _ := nodeReady(context.Background(), rt); !ok || !strings.Contains(out.String(), "Node box is ready (v1.36.5+k3s1)") {
+		t.Errorf("ready node: ok=%v output %q", ok, out.String())
 	}
 }
 
@@ -172,23 +210,6 @@ func TestParseMeminfo(t *testing.T) {
 	info := parseMeminfo("MemTotal:        2014412 kB\nMemFree:          123456 kB\nMemAvailable:    1048576 kB\nSwapTotal:             0 kB\nHugePages_Total:       0\n")
 	if info["MemTotal"] != 2014412 || info["MemAvailable"] != 1048576 || info["SwapTotal"] != 0 || len(info) != 5 {
 		t.Errorf("info = %v", info)
-	}
-}
-
-func TestK3sInstallEnv(t *testing.T) {
-	rt, _ := providertest.Runtime(t, Spec)
-	rt = rt.For("compute")
-	if got := k3sInstallEnv(rt); got != "INSTALL_K3S_CHANNEL='stable'" {
-		t.Errorf("default = %s", got)
-	}
-	settings := rt.Manifest.Spec.Components["compute"].Settings
-	settings["k3sVersion"] = "1.33.4+k3s1"
-	if got := k3sInstallEnv(rt); got != "INSTALL_K3S_VERSION='v1.33.4+k3s1'" {
-		t.Errorf("pinned = %s", got)
-	}
-	settings["k3sVersion"] = "v1'; rm -rf /"
-	if got := k3sInstallEnv(rt); got != `INSTALL_K3S_VERSION='v1'\''; rm -rf /'` {
-		t.Errorf("quoting = %s", got)
 	}
 }
 

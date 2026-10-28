@@ -1,7 +1,7 @@
 // Package jenkins implements the CI/CD contract with Jenkins: Kubernetes pod
 // agents, the shared pipeline library from the Ownstack repository
-// (stack.LibraryRepo) at the stack's library ref, and a GitHub organization
-// folder that discovers application repos.
+// (stack.LibraryRepo) at the running release's tag, and a GitHub
+// organization folder that builds the listed app repos.
 package jenkins
 
 import (
@@ -9,12 +9,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"text/template"
 	"time"
@@ -33,18 +35,12 @@ var Spec = catalog.Provider{
 	Summary:   "Jenkins with Kubernetes pod agents and the shared Ownstack pipeline library.",
 	Resources: catalog.Resources{MemoryMiB: 1500, DiskGiB: 10},
 	Params: []catalog.Param{
-		{Key: "host", Label: "Host", Kind: catalog.KindHostname, Default: "jenkins.{adminDomain}"},
 		{Key: "adminPassword", Label: "Admin password", Kind: catalog.KindSecret, Required: true, Generate: true, Env: "JENKINS_ADMIN_PASSWORD",
 			Help: "Generated on the server when not provided."},
-		{Key: "orgFolder", Label: "Organization folder", Kind: catalog.KindString, Default: "Repositories", Advanced: true},
-		{Key: "repoFilter", Label: "Repository filter", Kind: catalog.KindString, Default: "*", Advanced: true,
-			Help: "Space-separated wildcards, such as app-* api-*. Matching repos with a Jenkinsfile get a pipeline."},
-		{Key: "jenkinsfilePath", Label: "Jenkinsfile path", Kind: catalog.KindString, Default: "infrastructure/Jenkinsfile", Advanced: true},
-		{Key: "libraryRef", Label: "Ownstack library ref", Kind: catalog.KindString, Advanced: true,
-			Help: "Branch, or ownstackctl-vX.Y.Z release tag, of getownstack/ownstack that Jenkins loads the pipeline and Helm libraries from. " +
-				"Empty: the tag of the ownstackctl release running on the server, or main for development builds."},
-		{Key: "chartVersion", Label: "Chart version", Kind: catalog.KindString, Default: ChartVersion, Advanced: true,
-			Help: "jenkins/jenkins Helm chart. Each ownstackctl release locks Jenkins and every plugin for its default chart; with another chart the locked plugins may not start."},
+		{Key: "repos", Label: "App repositories", Kind: catalog.KindString, Placeholder: "api web",
+			Help:        "Space-separated repos under the VCS owner that Jenkins builds from their " + jenkinsfilePath + ". The demo repo is always included.",
+			Pattern:     `^ *[A-Za-z0-9._-]+(?: +[A-Za-z0-9._-]+)* *$`,
+			PatternHelp: "must be space-separated repo names under the VCS owner, such as api web"},
 		{Key: "extraPlugins", Label: "Extra plugins", Kind: catalog.KindString, Advanced: true, Placeholder: "build-timeout:1.41 ansicolor:542.v03d235fee02d",
 			Help:    "Plugins to add to the locked set, as space-separated name:version pairs; versions are required so installs stay reproducible. A locked plugin listed here gets this version instead. Dependencies missing from the locked set are installed at the oldest version the plugin accepts, so list them too.",
 			Pattern: pluginsPattern, PatternHelp: "must be space-separated name:version pairs, such as build-timeout:1.41"},
@@ -56,9 +52,14 @@ const (
 	release   = "jenkins"
 	chartRepo = "https://charts.jenkins.io"
 
-	// Credential IDs referenced by the shared pipeline library.
+	// orgFolder is the organization folder that builds the app repos.
+	orgFolder       = "Repositories"
+	jenkinsfilePath = "infrastructure/Jenkinsfile"
+
+	// Credential IDs referenced by the organization folder and the shared
+	// pipeline library.
 	vcsCredentialID      = "github-pat"
-	registryCredentialID = "harbor-robot"
+	registryCredentialID = "registry"
 
 	defaultGitHubAPI = "https://api.github.com"
 )
@@ -94,7 +95,7 @@ var (
 type Provider struct{}
 
 func (Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
-	rt.Out.CICD = &stack.CICDOutput{URL: "https://" + rt.Setting("host"), Login: "user admin, password JENKINS_ADMIN_PASSWORD"}
+	rt.Out.CICD = &stack.CICDOutput{URL: "https://" + rt.AdminHost("jenkins"), Login: "user admin, password JENKINS_ADMIN_PASSWORD"}
 	if _, err := extraPlugins(rt); err != nil {
 		return err
 	}
@@ -124,15 +125,6 @@ func installPlugins(rt *stack.Runtime) []string {
 	return out
 }
 
-// chartMismatch describes the risk of a chartVersion other than the one the
-// plugins are locked for, or is empty.
-func chartMismatch(rt *stack.Runtime) string {
-	if chart := rt.Setting("chartVersion"); chart != "" && chart != pluginLock.Chart {
-		return fmt.Sprintf("plugins are locked for chart %s / Jenkins %s; a different chart may not start", pluginLock.Chart, pluginLock.Jenkins)
-	}
-	return ""
-}
-
 func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if rt.Out.VCS.Kind != "github" {
 		return fmt.Errorf("jenkins supports the github VCS provider only")
@@ -144,45 +136,31 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if _, err := extraPlugins(rt); err != nil {
 		return err
 	}
-
-	if !rt.Exec.Has("docker") {
-		rt.Logf("Installing Docker (agent pods build through the host Docker socket)")
-		if err := stack.Retry(ctx, rt.Console, "docker install", 3, 20*time.Second, func() error {
-			return rt.Exec.Shell(ctx, dockerInstallScript)
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err := rt.Kube.EnsureNamespace(ctx, namespace); err != nil {
-		return err
-	}
 	// Jenkins deploys Helm charts into every environment, so its service
 	// accounts are cluster admins. This is a deliberate single-tenant default.
-	if err := rt.Kube.Apply(ctx, clusterAdminBinding()); err != nil {
+	if err := rt.Kube.Apply(ctx, clusterObjects(rt)...); err != nil {
 		return err
 	}
-	if err := applyCredentials(ctx, rt); err != nil {
-		return err
-	}
+	rt.Logf("Jenkins credentials ready: %s, %s", vcsCredentialID, registryCredentialID)
 
-	host := rt.Setting("host")
+	host := rt.AdminHost("jenkins")
 	values, err := stack.Render(valuesTmpl, valuesData(rt, password))
 	if err != nil {
 		return err
 	}
-	if warning := chartMismatch(rt); warning != "" {
-		rt.Logf("warning: %s", warning)
-	}
-	rt.Logf("Applying Jenkins %s (chart %s, %d plugins) at https://%s", pluginLock.Jenkins, rt.Setting("chartVersion"), len(installPlugins(rt)), host)
-	rt.Logf("Pipelines take %s", libraryDetail(rt))
-	if err := stack.Retry(ctx, rt.Console, "jenkins helm release", 3, 20*time.Second, func() error {
-		return rt.Kube.HelmUpgrade(ctx, stack.Chart{
-			Release: release, Namespace: namespace, Repo: chartRepo, Name: "jenkins",
-			Version: rt.Setting("chartVersion"), Values: values, Overrides: rt.Values(),
-			Timeout: 15 * time.Minute,
-		})
-	}); err != nil {
+	rt.Logf("Applying Jenkins %s (chart %s, %d plugins) at https://%s", pluginLock.Jenkins, ChartVersion, len(installPlugins(rt)), host)
+	rt.Logf("Pipelines take jenkins_pipeline_library and common_helm_library from %s@%s", stack.LibraryRepo, stack.LibraryRef(stack.EngineVersion))
+	// Agent pods build through the host Docker socket. Docker is installed
+	// while the release starts; neither needs the other. A failed release
+	// does not cancel the install: apt killed halfway leaves dpkg broken.
+	docker := make(chan error, 1)
+	go func() { docker <- installDocker(ctx, rt) }()
+	helmErr := rt.Kube.HelmUpgrade(ctx, stack.Chart{
+		Release: release, Namespace: namespace, Repo: chartRepo, Name: "jenkins",
+		Version: ChartVersion, Values: values, Overrides: rt.Values(),
+		Timeout: 15 * time.Minute,
+	})
+	if err := errors.Join(helmErr, <-docker); err != nil {
 		return err
 	}
 
@@ -190,45 +168,50 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	if err != nil {
 		return err
 	}
-	if err := stack.Retry(ctx, rt.Console, "jenkins ready", 40, 15*time.Second, func() error {
-		return api.ready(ctx)
+	if err := stack.WaitFor(ctx, rt, "Jenkins API", 5*time.Minute, func(ctx context.Context) (bool, string) {
+		_, ok, err := api.get(ctx, "/api/json")
+		switch {
+		case err != nil:
+			return false, err.Error()
+		case !ok:
+			return false, "HTTP 404"
+		}
+		return true, ""
 	}); err != nil {
 		return err
 	}
-
-	folder := rt.Setting("orgFolder")
-	xmlConfig, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
-	if err != nil {
+	if err := applyFolder(ctx, rt, api); err != nil {
 		return err
 	}
-	current, exists, err := api.get(ctx, "/job/"+url.PathEscape(folder)+"/config.xml")
-	if err != nil {
-		return err
-	}
-	if exists {
-		if err := convergeFolder(ctx, rt, api, folder, current, xmlConfig); err != nil {
-			return err
-		}
-	} else {
-		if err := stack.Retry(ctx, rt.Console, "create organization folder", 5, 15*time.Second, func() error {
-			return api.post(ctx, "/createItem?name="+url.QueryEscape(folder), "application/xml", xmlConfig)
-		}); err != nil {
-			return err
-		}
-		rt.Logf("Jenkins organization folder %s created", folder)
-	}
-	if err := api.post(ctx, "/job/"+url.PathEscape(folder)+"/build", "", ""); err != nil {
+	if err := api.post(ctx, "/job/"+url.PathEscape(orgFolder)+"/build", "", ""); err != nil {
 		return fmt.Errorf("trigger repository scan: %w", err)
 	}
-	rt.Logf("Jenkins scanning %s repositories", rt.Out.VCS.Owner)
+	if names := repos(rt); len(names) > 0 {
+		rt.Logf("Jenkins scanning %s/{%s}", rt.Out.VCS.Owner, strings.Join(names, ","))
+	} else {
+		rt.Logf("No app repos yet: list them in the cicd repos setting and rerun apply.")
+	}
 	return nil
+}
+
+// installDocker installs Docker Engine unless the host has it.
+func installDocker(ctx context.Context, rt *stack.Runtime) error {
+	if rt.Exec.Has("docker") {
+		return nil
+	}
+	rt.Logf("Installing Docker (agent pods build through the host Docker socket)")
+	// apt fails while another apt run (unattended upgrades on a fresh
+	// server) holds its lock.
+	return stack.Retry(ctx, rt.Console, "docker install", 3, 20*time.Second, func() error {
+		return rt.Exec.Shell(ctx, dockerInstallScript)
+	})
 }
 
 func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	checks := []stack.Check{
 		stack.ReleaseCheck(ctx, rt, release, namespace),
 		stack.WorkloadCheck(ctx, rt, namespace),
-		rt.CheckHTTPS(ctx, rt.Setting("host"), "/login"),
+		rt.CheckHTTPS(ctx, rt.AdminHost("jenkins"), "/login"),
 	}
 	password, err := rt.Secret("adminPassword")
 	if err != nil {
@@ -237,8 +220,8 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	api, err := newClient(rt, password)
 	if err == nil {
 		var exists bool
-		if exists, err = api.exists(ctx, rt.Setting("orgFolder")); err == nil && exists {
-			return append(checks, stack.Check{Name: "organization folder", State: stack.OK, Detail: rt.Setting("orgFolder")})
+		if _, exists, err = api.get(ctx, "/job/"+url.PathEscape(orgFolder)+"/config.xml"); err == nil && exists {
+			return append(checks, stack.Check{Name: "organization folder", State: stack.OK, Detail: orgFolder})
 		}
 	}
 	detail := "missing"
@@ -248,55 +231,71 @@ func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	return append(checks, stack.Check{Name: "organization folder", State: stack.Fail, Detail: detail})
 }
 
-// convergeFolder replaces an existing organization folder's config.xml when
-// a field ownstackctl manages differs from the manifest. Admin edits to the
-// folder survive only while the managed fields match.
-func convergeFolder(ctx context.Context, rt *stack.Runtime, api *client, folder, current, desired string) error {
-	changes, ok, err := folderChanges(current, desired)
-	switch {
-	case err != nil:
-		rt.Logf("warning: cannot read Jenkins folder %s (%v); leaving it unchanged", folder, err)
-		return nil
-	case !ok:
-		rt.Logf("warning: Jenkins item %s is not an organization folder; leaving it unchanged", folder)
-		return nil
-	case len(changes) == 0:
-		rt.Logf("Jenkins organization folder %s is up to date", folder)
-		return nil
+// applyFolder creates the organization folder, or replaces its config.xml
+// when a field ownstackctl manages differs. Admin edits to the folder
+// survive only while the managed fields match. Jenkins may refuse items for
+// a moment after its API answers, so posts are retried.
+func applyFolder(ctx context.Context, rt *stack.Runtime, api *client) error {
+	desired, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
+	if err != nil {
+		return err
 	}
-	if err := stack.Retry(ctx, rt.Console, "update organization folder", 5, 15*time.Second, func() error {
-		return api.post(ctx, "/job/"+url.PathEscape(folder)+"/config.xml", "application/xml", desired)
+	current, exists, err := api.get(ctx, "/job/"+url.PathEscape(orgFolder)+"/config.xml")
+	if err != nil {
+		return err
+	}
+	path, done := "/createItem?name="+url.QueryEscape(orgFolder), "created"
+	if exists {
+		changes, ok, err := folderChanges(current, desired)
+		switch {
+		case err != nil:
+			rt.Logf("warning: cannot read Jenkins folder %s (%v); leaving it unchanged", orgFolder, err)
+			return nil
+		case !ok:
+			rt.Logf("warning: Jenkins item %s is not an organization folder; leaving it unchanged", orgFolder)
+			return nil
+		case len(changes) == 0:
+			rt.Logf("Jenkins organization folder %s is up to date", orgFolder)
+			return nil
+		}
+		path, done = "/job/"+url.PathEscape(orgFolder)+"/config.xml", "updated: "+strings.Join(changes, ", ")
+	}
+	if err := stack.Retry(ctx, rt.Console, "organization folder", 5, 10*time.Second, func() error {
+		return api.post(ctx, path, "application/xml", desired)
 	}); err != nil {
 		return err
 	}
-	rt.Logf("Jenkins organization folder %s updated: %s", folder, strings.Join(changes, ", "))
+	rt.Logf("Jenkins organization folder %s %s", orgFolder, done)
 	return nil
 }
 
-// branchMapping maps a branch, a name or a glob where '*' matches any run of
-// characters including '/', to the environment it deploys into.
-type branchMapping struct{ Branch, Environment string }
-
-// branchMappings are the environments' branches in order, the first match
-// winning: the production environment's first when it has one.
-func branchMappings(rt *stack.Runtime) []branchMapping {
-	var mappings []branchMapping
-	for _, env := range rt.Environments() {
-		if env.Branch != "" {
-			mappings = append(mappings, branchMapping{env.Branch, env.Name})
+// repos are the repos the organization folder builds: the demo repo, when
+// the VCS provider created one, and the repos setting.
+func repos(rt *stack.Runtime) []string {
+	var out []string
+	if demo := rt.Out.VCS.DemoRepo; demo != "" {
+		out = append(out, demo)
+	}
+	for _, name := range strings.Fields(rt.Setting("repos")) {
+		if !slices.ContainsFunc(out, func(have string) bool { return strings.EqualFold(have, name) }) {
+			out = append(out, name)
 		}
 	}
-	return mappings
+	return out
 }
 
-// branchesEnv formats mappings for OWNSTACK_BRANCHES, the shared library's
-// input: space-separated <branch>=<environment> pairs, deploy branch first.
-func branchesEnv(mappings []branchMapping) string {
-	pairs := make([]string, len(mappings))
-	for i, m := range mappings {
-		pairs[i] = m.Branch + "=" + m.Environment
+// environments is OWNSTACK_ENVIRONMENTS: the <name>[=<branch glob>] items,
+// production first, space-separated.
+func environments(rt *stack.Runtime) string {
+	items := make([]string, 0, len(rt.Environments()))
+	for _, env := range rt.Environments() {
+		item := env.Name
+		if env.Branch != "" {
+			item += "=" + env.Branch
+		}
+		items = append(items, item)
 	}
-	return strings.Join(pairs, " ")
+	return strings.Join(items, " ")
 }
 
 // globRegexp turns a branch glob into a regular expression: '*' matches any
@@ -311,11 +310,14 @@ func globRegexp(glob string) string {
 }
 
 // triggerBranches is the organization folder's NoTrigger regular expression:
-// every mapped branch, so each one builds and deploys on push.
-func triggerBranches(mappings []branchMapping) string {
-	alternatives := make([]string, len(mappings))
-	for i, m := range mappings {
-		alternatives[i] = globRegexp(m.Branch)
+// every environment's branch glob, so each one builds and deploys on push.
+// Jenkins matches it against the whole branch name.
+func triggerBranches(rt *stack.Runtime) string {
+	var alternatives []string
+	for _, env := range rt.Environments() {
+		if env.Branch != "" {
+			alternatives = append(alternatives, globRegexp(env.Branch))
+		}
 	}
 	return strings.Join(alternatives, "|")
 }
@@ -329,11 +331,9 @@ func orgFolderData(rt *stack.Runtime) map[string]string {
 		"Owner":           rt.Out.VCS.Owner,
 		"APIURL":          api,
 		"CredentialID":    vcsCredentialID,
-		"RepoFilter":      rt.Setting("repoFilter"),
-		"JenkinsfilePath": rt.Setting("jenkinsfilePath"),
-		// NoTriggerOrganizationFolderProperty takes a regular expression,
-		// which Jenkins matches against the whole branch name.
-		"TriggerBranches": triggerBranches(branchMappings(rt)),
+		"Repos":           strings.Join(repos(rt), " "),
+		"JenkinsfilePath": jenkinsfilePath,
+		"TriggerBranches": triggerBranches(rt),
 	}
 }
 
@@ -390,7 +390,7 @@ func folderChanges(current, desired string) (changes []string, ok bool, err erro
 		{"owner", have.Owner, want.Owner},
 		{"API", have.APIURL, want.APIURL},
 		{"credential", have.CredentialID, want.CredentialID},
-		{"repository filter", have.Includes, want.Includes},
+		{"repositories", have.Includes, want.Includes},
 		{"Jenkinsfile path", have.ScriptPath, want.ScriptPath},
 		{"auto-build branches", have.TriggerBranches, want.TriggerBranches},
 	} {
@@ -401,40 +401,23 @@ func folderChanges(current, desired string) (changes []string, ok bool, err erro
 	return changes, true, nil
 }
 
-// libraryDetail says where pipelines take the Ownstack libraries from.
-func libraryDetail(rt *stack.Runtime) string {
-	return fmt.Sprintf("jenkins_pipeline_library and common_helm_library from %s@%s", stack.LibraryRepo, rt.LibraryRef())
-}
-
 type envVar struct{ Key, Value string }
 
 func valuesData(rt *stack.Runtime, password string) map[string]any {
 	images := rt.Out.Images
-	ref := rt.LibraryRef()
+	ref := stack.LibraryRef(stack.EngineVersion)
+	// The shared library reads exactly these (C7).
 	env := []envVar{
-		{"IMAGE_REGISTRY", images.Host},
-		{"IMAGE_REPOSITORY_PROJECT", images.Project},
-		{"IMAGE_PULL_SECRET", images.PullSecretName},
-		// helmDeploy fetches common_helm_library from the repository and ref
-		// the pipeline library itself is loaded from.
+		{"OWNSTACK_DOMAIN", rt.Domain()},
+		{"OWNSTACK_REGISTRY", images.Host + "/" + images.Project},
+		{"OWNSTACK_ENVIRONMENTS", environments(rt)},
+		// The Deploy stage clones common_helm_library from the repository and
+		// ref the pipeline library itself is loaded from.
 		{"OWNSTACK_LIBRARY_REPO", stack.LibraryRepoURL},
 		{"OWNSTACK_LIBRARY_REF", ref},
-		// Pipeline libraries from before OWNSTACK_LIBRARY_REPO (a libraryRef
-		// that names an older release) fetch common_helm_library from here at
-		// main; cluster repos no longer carry it.
-		{"COMMON_HELM_LIBRARY_GITHUB_REPO", stack.LibraryRepoURL},
-		{"OWNSTACK_DOMAIN", rt.Domain()},
-		// Libraries without branch mappings deploy only this branch, into
-		// this namespace.
-		{"OWNSTACK_DEPLOY_BRANCH", rt.Production().Branch},
-		{"OWNSTACK_NAMESPACE", rt.Production().Name},
-		// Newer libraries deploy each mapped branch into its environment
-		// and tell the Helm library which environment is production.
-		{"OWNSTACK_BRANCHES", branchesEnv(branchMappings(rt))},
-		{"OWNSTACK_PRODUCTION_ENVIRONMENT", rt.Production().Name},
 	}
 	return map[string]any{
-		"Host":           rt.Setting("host"),
+		"Host":           rt.AdminHost("jenkins"),
 		"ImageTag":       pluginLock.ImageTag(),
 		"Plugins":        installPlugins(rt),
 		"Password":       password,
@@ -445,45 +428,27 @@ func valuesData(rt *stack.Runtime, password string) map[string]any {
 	}
 }
 
-// applyCredentials turns the VCS and registry contract outputs into Jenkins
-// credentials through the kubernetes-credentials-provider plugin.
-func applyCredentials(ctx context.Context, rt *stack.Runtime) error {
+// clusterObjects are what Jenkins needs before its release: its namespace,
+// the cluster-admin binding of its service accounts, and the VCS and
+// registry contract outputs as Jenkins credentials (through the
+// kubernetes-credentials-provider plugin).
+func clusterObjects(rt *stack.Runtime) []map[string]any {
 	userPass := map[string]string{"jenkins.io/credentials-type": "usernamePassword"}
-	images := rt.Out.Images
-	if images.PushUsername == "" {
-		return fmt.Errorf("the registry did not provide a push credential; apply the images aspect first")
-	}
-	creds := []struct {
-		name string
-		data map[string]string
-	}{
-		{vcsCredentialID, map[string]string{"username": rt.Out.VCS.Username, "password": rt.Out.VCS.Token}},
-		{registryCredentialID, map[string]string{"username": shellEscapeDollar(images.PushUsername), "password": shellEscapeDollar(images.PushPassword)}},
-	}
-	for _, c := range creds {
-		if err := rt.Kube.ApplySecret(ctx, namespace, c.name, "", c.data, userPass); err != nil {
-			return fmt.Errorf("credential %s: %w", c.name, err)
-		}
-	}
-	rt.Logf("Jenkins credentials ready: %s, %s", vcsCredentialID, registryCredentialID)
-	return nil
-}
-
-// shellEscapeDollar escapes $ for credentials used inside the Kubernetes
-// plugin's container() steps, which run commands through a shell: Harbor's
-// robot$name username would otherwise reach docker login as "robot".
-func shellEscapeDollar(s string) string { return strings.ReplaceAll(s, "$", `\$`) }
-
-func clusterAdminBinding() map[string]any {
-	return map[string]any{
-		"apiVersion": "rbac.authorization.k8s.io/v1",
-		"kind":       "ClusterRoleBinding",
-		"metadata":   map[string]any{"name": "jenkins-cluster-admin"},
-		"subjects": []map[string]any{
-			{"kind": "ServiceAccount", "name": "default", "namespace": namespace},
-			{"kind": "ServiceAccount", "name": "jenkins", "namespace": namespace},
+	return []map[string]any{
+		{"apiVersion": "v1", "kind": "Namespace", "metadata": map[string]any{"name": namespace}},
+		{
+			"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+			"metadata": map[string]any{"name": "jenkins-cluster-admin"},
+			"subjects": []map[string]any{
+				{"kind": "ServiceAccount", "name": "default", "namespace": namespace},
+				{"kind": "ServiceAccount", "name": "jenkins", "namespace": namespace},
+			},
+			"roleRef": map[string]any{"kind": "ClusterRole", "name": "cluster-admin", "apiGroup": "rbac.authorization.k8s.io"},
 		},
-		"roleRef": map[string]any{"kind": "ClusterRole", "name": "cluster-admin", "apiGroup": "rbac.authorization.k8s.io"},
+		stack.SecretObject(namespace, vcsCredentialID, "", map[string]string{"username": rt.Out.VCS.Username, "password": rt.Out.VCS.Token}, userPass),
+		// dockerPush hands the credential to the shell only as environment
+		// variables, so Harbor's robot$name needs no escaping.
+		stack.SecretObject(namespace, registryCredentialID, "", map[string]string{"username": rt.Out.Images.PushUsername, "password": rt.Out.Images.PushPassword}, userPass),
 	}
 }
 
@@ -520,7 +485,7 @@ func newClient(rt *stack.Runtime, password string) (*client, error) {
 	}
 	httpClient := *rt.ServiceClient()
 	httpClient.Jar = jar
-	return &client{base: "https://" + rt.Setting("host"), password: password, http: &httpClient}, nil
+	return &client{base: "https://" + rt.AdminHost("jenkins"), password: password, http: &httpClient}, nil
 }
 
 func (c *client) request(ctx context.Context, method, path, contentType, body string, crumb *crumb) (int, []byte, error) {
@@ -549,17 +514,6 @@ type crumb struct {
 	Field string `json:"crumbRequestField"`
 }
 
-func (c *client) ready(ctx context.Context) error {
-	code, _, err := c.request(ctx, http.MethodGet, "/api/json", "", "", nil)
-	if err != nil {
-		return err
-	}
-	if code != http.StatusOK {
-		return fmt.Errorf("HTTP %d", code)
-	}
-	return nil
-}
-
 // get returns a page; exists is false on 404.
 func (c *client) get(ctx context.Context, path string) (body string, exists bool, err error) {
 	code, data, err := c.request(ctx, http.MethodGet, path, "", "", nil)
@@ -573,20 +527,6 @@ func (c *client) get(ctx context.Context, path string) (body string, exists bool
 		return "", false, nil
 	}
 	return "", false, fmt.Errorf("GET %s: HTTP %d", path, code)
-}
-
-func (c *client) exists(ctx context.Context, job string) (bool, error) {
-	code, _, err := c.request(ctx, http.MethodGet, "/job/"+url.PathEscape(job)+"/api/json", "", "", nil)
-	if err != nil {
-		return false, err
-	}
-	switch code {
-	case http.StatusOK:
-		return true, nil
-	case http.StatusNotFound:
-		return false, nil
-	}
-	return false, fmt.Errorf("HTTP %d", code)
 }
 
 func (c *client) post(ctx context.Context, path, contentType, body string) error {

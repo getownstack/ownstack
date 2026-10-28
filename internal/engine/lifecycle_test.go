@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 // $OWNSTACK_STUB_DIR/secret.json.
 const kubectlStub = `#!/bin/sh
 case "$*" in
-  "apply -f -") cat >/dev/null ;;
+  "apply "*) cat >/dev/null ;;
   "get --raw /readyz"|"get namespace "*) ;;
   "get secret "*) [ -f "$OWNSTACK_STUB_DIR/secret.json" ] && cat "$OWNSTACK_STUB_DIR/secret.json" || exit 1 ;;
   "get ingressroutes.traefik.io "*|"get ingresses.networking.k8s.io "*|"get httproutes.gateway.networking.k8s.io "*) echo '{"items":[]}' ;;
@@ -53,13 +54,16 @@ func stubTools(t *testing.T) string {
 
 // fake is a recording provider.
 type fake struct {
-	aspect   string
-	log      *[]string
-	resolve  func(rt *stack.Runtime)
-	apply    func(rt *stack.Runtime) error
-	checks   []stack.Check
-	booted   bool
-	bootable bool
+	aspect  string
+	log     *[]string
+	resolve func(rt *stack.Runtime)
+	apply   func(rt *stack.Runtime) error
+
+	mu     sync.Mutex
+	checks []stack.Check
+	// status, when set, answers the n-th status call (from 1) instead.
+	status func(n int) []stack.Check
+	calls  int
 }
 
 func (f *fake) Resolve(_ context.Context, rt *stack.Runtime) error {
@@ -78,17 +82,22 @@ func (f *fake) Apply(_ context.Context, rt *stack.Runtime) error {
 }
 
 func (f *fake) Status(context.Context, *stack.Runtime) []stack.Check {
-	if f.checks == nil {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	switch {
+	case f.status != nil:
+		return f.status(f.calls)
+	case f.checks == nil:
 		return []stack.Check{{Name: f.aspect, State: stack.OK}}
 	}
 	return f.checks
 }
 
-type bootstrapper struct{ *fake }
-
-func (b bootstrapper) Bootstrap(context.Context, *stack.Runtime, []byte, string) error {
-	b.booted = true
-	return nil
+func (f *fake) statusCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 type harness struct {
@@ -99,32 +108,31 @@ type harness struct {
 	stubs  string
 	store  *secrets.Store
 	secret string // secrets file path
+	state  string // $OWNSTACK_DIR
 }
 
 // newHarness builds an engine over src whose providers are all fakes. env
 // holds the secret environment.
 func newHarness(t *testing.T, src string, env map[string]string) *harness {
 	t.Helper()
-	h := &harness{fakes: map[string]*fake{}, stubs: stubTools(t)}
+	h := &harness{fakes: map[string]*fake{}, stubs: stubTools(t), state: t.TempDir()}
+	t.Setenv("OWNSTACK_DIR", h.state)
 	m, err := manifest.Parse([]byte(src))
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.secret = filepath.Join(t.TempDir(), "secrets.env")
+	h.secret = filepath.Join(h.state, "secrets.env")
 	h.store = secrets.NewStore(h.secret)
 	h.store.Getenv = func(k string) string { return env[k] }
 	h.store.Out = io.Discard
+	cat := providers.Catalog()
 	lookup := func(aspect, id string) (stack.Provider, bool) {
-		if c, ok := m.Component(aspect); ok && c.Provider == id {
-			f := h.fake(aspect)
-			if f.bootable {
-				return bootstrapper{f}, true
-			}
-			return f, true
+		if m.Provider(cat, aspect) != id {
+			return nil, false
 		}
-		return nil, false
+		return h.fake(aspect), true
 	}
-	h.e = NewWith(m, h.store, stack.NewConsole(&h.out), providers.Catalog(), lookup)
+	h.e = NewWith(m, h.store, stack.NewConsole(&h.out), cat, lookup)
 	return h
 }
 
@@ -135,22 +143,34 @@ func (h *harness) fake(aspect string) *fake {
 	return h.fakes[aspect]
 }
 
-var eventField = regexp.MustCompile(`id="([^"]*)"`)
-
-// events lists "name id" for every structured event line.
-func (h *harness) events() []string {
+// events lists "name id" for every structured event line, and fails the
+// test when one is not a JSON object of strings.
+func (h *harness) events(t *testing.T) []string {
+	t.Helper()
 	var out []string
 	for _, line := range strings.Split(h.out.String(), "\n") {
-		name, rest, ok := strings.Cut(strings.TrimPrefix(line, "ownstack.event="), " ")
-		if !strings.HasPrefix(line, "ownstack.event=") || !ok {
+		data, ok := strings.CutPrefix(line, stack.EventPrefix)
+		if !ok {
 			continue
 		}
-		if m := eventField.FindStringSubmatch(rest); m != nil {
-			name += " " + m[1]
+		var fields map[string]string
+		if err := json.Unmarshal([]byte(data), &fields); err != nil || fields["event"] == "" {
+			t.Fatalf("event line is not JSON: %q (%v)", line, err)
 		}
-		out = append(out, name)
+		out = append(out, strings.TrimSpace(fields["event"]+" "+fields["id"]))
 	}
 	return out
+}
+
+// event returns the fields of the first event named name.
+func (h *harness) event(name string) map[string]string {
+	for _, line := range strings.Split(h.out.String(), "\n") {
+		var fields map[string]string
+		if data, ok := strings.CutPrefix(line, stack.EventPrefix); ok && json.Unmarshal([]byte(data), &fields) == nil && fields["event"] == name {
+			return fields
+		}
+	}
+	return nil
 }
 
 func stageEvents(ids ...string) []string {
@@ -175,25 +195,39 @@ var fits = ApplyOptions{MemTotalMiB: 16384}
 
 func TestApplyLifecycle(t *testing.T) {
 	h := newHarness(t, providertest.Manifest, withoutEnv("JENKINS_ADMIN_PASSWORD"))
-	// Secrets are saved before the first stage, including a generated one
-	// that no fake Resolve asks for.
+	// Secrets and the node's copy of the manifest are saved before the first
+	// stage, including a generated secret that no fake Resolve asks for.
 	h.fake("compute").apply = func(*stack.Runtime) error {
 		data, _ := os.ReadFile(h.secret)
 		if !strings.Contains(string(data), "JENKINS_ADMIN_PASSWORD=") || !strings.Contains(string(data), "GITHUB_TOKEN=") {
 			return fmt.Errorf("secrets not saved before apply:\n%s", data)
+		}
+		if data, _ := os.ReadFile(filepath.Join(h.state, "ownstack.yaml")); string(data) != providertest.Manifest {
+			return fmt.Errorf("manifest not saved before apply: %q", data)
+		}
+		return nil
+	}
+	// The vcs provider gets the file as applied, to mirror it.
+	h.fake("vcs").apply = func(rt *stack.Runtime) error {
+		if string(rt.ManifestFile()) != providertest.Manifest {
+			return fmt.Errorf("manifest file = %q", rt.ManifestFile())
 		}
 		return nil
 	}
 	if err := h.e.Apply(context.Background(), fits); err != nil {
 		t.Fatalf("%v\n%s", err, h.out.String())
 	}
-	if !strings.Contains(h.out.String(), `stages="compute,dns,ingress,vcs,images,environments,cicd"`) {
-		t.Errorf("run_started does not list the stages:\n%s", h.out.String())
+	started := h.event("run_started")
+	if started["domain"] != "example.com" || started["stages"] != "compute,dns,ingress,vcs,images,environments,cicd,verify" {
+		t.Errorf("run_started = %v", started)
 	}
 	want := append([]string{"run_started"}, stageEvents("compute", "dns", "ingress", "vcs", "images", "environments", "cicd", "verify")...)
 	want = append(want, "run_completed")
-	if got := h.events(); !slices.Equal(got, want) {
+	if got := h.events(t); !slices.Equal(got, want) {
 		t.Errorf("events:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if !slices.Equal(h.log, []string{"apply compute", "apply dns", "apply ingress", "apply vcs", "apply images", "apply cicd"}) {
+		t.Errorf("applied: %v", h.log)
 	}
 }
 
@@ -210,17 +244,35 @@ func TestApplyFailureIsRedacted(t *testing.T) {
 	}
 	want := append([]string{"run_started"}, stageEvents("compute", "dns", "ingress", "vcs")...)
 	want = append(want, "stage_started images", "stage_failed images", "run_failed")
-	if got := h.events(); !slices.Equal(got, want) {
+	if got := h.events(t); !slices.Equal(got, want) {
 		t.Errorf("events:\n%s", strings.Join(got, "\n"))
 	}
 	if strings.Contains(h.out.String(), "en99") {
 		t.Errorf("secret leaked:\n%s", h.out.String())
 	}
+	if failed := h.event("stage_failed"); !strings.Contains(failed["error"], "push denied for token [redacted]") {
+		t.Errorf("stage_failed = %v", failed)
+	}
 }
 
-func TestVerify(t *testing.T) {
-	defer func(timeout, interval time.Duration) { VerifyTimeout, verifyInterval = timeout, interval }(VerifyTimeout, verifyInterval)
-	VerifyTimeout, verifyInterval = 50*time.Millisecond, 5*time.Millisecond
+// A missing secret stops apply before anything is saved or changed.
+func TestApplyStopsOnMissingSecret(t *testing.T) {
+	h := newHarness(t, providertest.Manifest, withoutEnv("CLOUDFLARE_API_TOKEN"))
+	err := h.e.Apply(context.Background(), fits)
+	if err == nil || !strings.Contains(err.Error(), "CLOUDFLARE_API_TOKEN") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(h.log) > 0 || slices.Contains(h.events(t), "stage_started compute") {
+		t.Errorf("stages ran: %v", h.log)
+	}
+	if _, err := os.Stat(filepath.Join(h.state, "ownstack.yaml")); !os.IsNotExist(err) {
+		t.Error("manifest saved by a run that could not start")
+	}
+}
+
+func TestVerifyFails(t *testing.T) {
+	defer func(timeout time.Duration) { VerifyTimeout = timeout }(VerifyTimeout)
+	VerifyTimeout = 50 * time.Millisecond
 
 	h := newHarness(t, providertest.Manifest, providertest.Env)
 	h.fake("cicd").checks = []stack.Check{{Name: "pods", State: stack.Fail, Detail: "0/1 workloads ready"}}
@@ -228,44 +280,33 @@ func TestVerify(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "pods 0/1 workloads ready") {
 		t.Fatalf("err = %v", err)
 	}
-	if events := h.events(); !slices.Contains(events, "stage_failed verify") || events[len(events)-1] != "run_failed" {
+	if events := h.events(t); !slices.Contains(events, "stage_failed verify") || events[len(events)-1] != "run_failed" {
 		t.Errorf("events:\n%s", strings.Join(events, "\n"))
 	}
+}
 
-	// A check that recovers within the timeout passes.
-	VerifyTimeout = time.Minute
-	h = newHarness(t, providertest.Manifest, providertest.Env)
-	calls := 0
-	h.fake("cicd").checks = []stack.Check{{Name: "pods", State: stack.Fail}}
-	h.fake("cicd").apply = func(*stack.Runtime) error { return nil }
-	h.e.lookup = recoverAfter(h.e.lookup, &calls)
+// Verify re-polls only the stages that failed, then checks every stage once
+// more before it passes.
+func TestVerifyRepollsFailingStages(t *testing.T) {
+	h := newHarness(t, providertest.Manifest, providertest.Env)
+	h.fake("cicd").status = func(n int) []stack.Check {
+		if n == 1 {
+			return []stack.Check{{Name: "pods", State: stack.Fail}}
+		}
+		return []stack.Check{{Name: "pods", State: stack.OK}}
+	}
 	if err := h.e.Apply(context.Background(), fits); err != nil {
 		t.Fatalf("recovering stack failed verify: %v", err)
 	}
-}
-
-// recoverAfter wraps cicd's fake so its status turns healthy on the second poll.
-func recoverAfter(lookup Lookup, calls *int) Lookup {
-	return func(aspect, id string) (stack.Provider, bool) {
-		p, ok := lookup(aspect, id)
-		if aspect != "cicd" || !ok {
-			return p, ok
-		}
-		return recovering{p.(*fake), calls}, true
+	if got := h.fake("cicd").statusCalls(); got != 3 {
+		t.Errorf("cicd checked %d times, want 3 (first pass, re-poll, final pass)", got)
 	}
-}
-
-type recovering struct {
-	*fake
-	calls *int
-}
-
-func (r recovering) Status(context.Context, *stack.Runtime) []stack.Check {
-	*r.calls++
-	if *r.calls > 1 {
-		return []stack.Check{{Name: "pods", State: stack.OK}}
+	if got := h.fake("dns").statusCalls(); got != 2 {
+		t.Errorf("dns checked %d times, want 2 (first pass, final pass)", got)
 	}
-	return []stack.Check{{Name: "pods", State: stack.Fail}}
+	if !strings.Contains(h.out.String(), "waiting: health checks (1 failing, first: CI/CD · Jenkins: pods)") {
+		t.Errorf("output:\n%s", h.out.String())
+	}
 }
 
 func TestStatusTakesTheWorstState(t *testing.T) {
@@ -273,17 +314,22 @@ func TestStatusTakesTheWorstState(t *testing.T) {
 	h.fake("dns").checks = []stack.Check{{Name: "a", State: stack.OK}, {Name: "b", State: stack.Warn}}
 	h.fake("vcs").checks = []stack.Check{{Name: "c", State: stack.Unknown}}
 	st := h.e.Status(context.Background())
-	if st.State != stack.Warn {
-		t.Errorf("state = %s", st.State)
+	if st.State != stack.Warn || st.Domain != "example.com" {
+		t.Errorf("state = %s, domain %s", st.State, st.Domain)
 	}
 	h.fake("cicd").checks = []stack.Check{{Name: "d", State: stack.Fail}}
 	st = h.e.Status(context.Background())
+	var ids []string
 	states := map[string]string{}
 	for _, s := range st.Stages {
+		ids = append(ids, s.ID)
 		states[s.ID] = s.State
 	}
 	if st.State != stack.Fail || states["dns"] != stack.Warn || states["vcs"] != stack.Unknown || states["compute"] != stack.OK {
 		t.Errorf("status = %s %v", st.State, states)
+	}
+	if strings.Join(ids, ",") != "compute,dns,ingress,vcs,images,environments,cicd" {
+		t.Errorf("stages out of order: %v", ids)
 	}
 }
 
@@ -291,7 +337,7 @@ func TestPlanListsSecretsInCatalogOrder(t *testing.T) {
 	var first []string
 	for i := 0; i < 5; i++ {
 		h := newHarness(t, providertest.Manifest, nil)
-		h.store.Generate, h.store.Save = false, false
+		h.store.ReadOnly = true
 		plan := h.e.Plan(context.Background())
 		if len(plan.Missing) != 2 || len(plan.Generated) != 2 {
 			t.Fatalf("missing %v, generated %v", plan.Missing, plan.Generated)
@@ -308,30 +354,9 @@ func TestPlanListsSecretsInCatalogOrder(t *testing.T) {
 		} else if !slices.Equal(first, got) {
 			t.Fatalf("order changed between runs: %v vs %v", first, got)
 		}
-	}
-}
-
-func TestBootstrapChecksEverySecretBeforeTheRepo(t *testing.T) {
-	h := newHarness(t, providertest.Manifest, withoutEnv("CLOUDFLARE_API_TOKEN"))
-	h.fake("vcs").bootable = true
-	err := h.e.Bootstrap(context.Background(), []byte("manifest"), t.TempDir(), fits)
-	if err == nil || !strings.Contains(err.Error(), "CLOUDFLARE_API_TOKEN") {
-		t.Fatalf("err = %v", err)
-	}
-	if h.fake("vcs").booted || strings.Contains(h.out.String(), "stage_started") {
-		t.Error("the repo was bootstrapped before the missing secret was found")
-	}
-
-	h = newHarness(t, providertest.Manifest, providertest.Env)
-	h.fake("vcs").bootable = true
-	if err := h.e.Bootstrap(context.Background(), []byte("manifest"), t.TempDir(), ApplyOptions{MemTotalMiB: 1024}); err == nil || !strings.Contains(err.Error(), "memory") {
-		t.Fatalf("too small a server was not refused before the repo: %v", err)
-	}
-	if err := h.e.Bootstrap(context.Background(), []byte("manifest"), t.TempDir(), fits); err != nil {
-		t.Fatal(err)
-	}
-	if !h.fake("vcs").booted || !slices.Equal(h.events(), stageEvents("repo")) {
-		t.Errorf("booted %v, events %v", h.fake("vcs").booted, h.events())
+		if _, err := os.Stat(h.secret); !os.IsNotExist(err) {
+			t.Fatal("plan wrote the secrets file")
+		}
 	}
 }
 
@@ -345,17 +370,11 @@ func pullSecret(t *testing.T, h *harness, server, user, pass string) {
 	}
 }
 
-func registry(user, pass string) func(rt *stack.Runtime) {
-	return func(rt *stack.Runtime) {
-		rt.Out.Images = &stack.ImagesOutput{Host: "harbor.example.com", Project: "product", PushUsername: user, PushPassword: pass, PullSecretName: "harbor-robot"}
-	}
-}
-
 func TestEnvironmentsStatusDetectsStalePullSecret(t *testing.T) {
 	h := newHarness(t, providertest.Manifest, providertest.Env)
-	registry("robot$ci", "current-pw")(h.e.RT)
+	h.e.RT.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PushUsername: "robot$ci", PushPassword: "current-pw"}
 	env := environments{rt: h.e.RT}
-	pullSecret(t, h, "harbor.example.com", "robot$ci", "rotated-pw")
+	pullSecret(t, h, "harbor.admin.example.com", "robot$ci", "rotated-pw")
 	checks := env.status(context.Background())
 	if len(checks) == 0 || checks[0].State != stack.Fail || checks[0].Detail != "stale pull secret (different password); rerun apply" {
 		t.Fatalf("checks = %+v", checks)
@@ -365,7 +384,7 @@ func TestEnvironmentsStatusDetectsStalePullSecret(t *testing.T) {
 			t.Errorf("detail contains a password: %q", c.Detail)
 		}
 	}
-	pullSecret(t, h, "harbor.example.com", "robot$ci", "current-pw")
+	pullSecret(t, h, "harbor.admin.example.com", "robot$ci", "current-pw")
 	if checks := env.status(context.Background()); checks[0].State != stack.OK {
 		t.Errorf("current pull secret reported %+v", checks[0])
 	}
@@ -388,30 +407,5 @@ func TestParseRoutes(t *testing.T) {
 	}
 	if got := uniqueHosts(routes); !slices.Equal(got, want) {
 		t.Errorf("routes = %v", got)
-	}
-}
-
-func TestMemoryFits(t *testing.T) {
-	for _, tc := range []struct {
-		total, need int
-		fits        bool
-	}{
-		{3800, 3928, true}, // a 4 GB server and the Standard preset
-		{3143, 3928, true}, // 80% of the estimate
-		{3100, 3928, false},
-		{1642, 1028, true},
-		{0, 1, false},
-	} {
-		if got := MemoryFits(tc.total, tc.need); got != tc.fits {
-			t.Errorf("MemoryFits(%d, %d) = %v", tc.total, tc.need, got)
-		}
-	}
-	data, err := os.ReadFile("../../examples/standard.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	standard := newEngine(t, string(data))
-	if err := standard.memoryPreflight(ApplyOptions{MemTotalMiB: 3800}); err != nil {
-		t.Errorf("Standard refused on a 4 GB server: %v", err)
 	}
 }

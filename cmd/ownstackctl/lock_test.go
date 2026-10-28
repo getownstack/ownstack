@@ -15,11 +15,11 @@ import (
 
 // TestLockHelper holds the node lock in a child process until stdin closes.
 func TestLockHelper(t *testing.T) {
-	secretsFile := os.Getenv("OWNSTACK_LOCK_HELPER")
-	if secretsFile == "" {
+	dir := os.Getenv("OWNSTACK_LOCK_HELPER")
+	if dir == "" {
 		t.Skip("helper for TestLockNodeIsExclusive")
 	}
-	unlock, err := lockNode(secretsFile)
+	unlock, err := lockNode(dir)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -33,9 +33,9 @@ func TestLockHelper(t *testing.T) {
 }
 
 func TestLockNodeIsExclusive(t *testing.T) {
-	secretsFile := filepath.Join(t.TempDir(), "ownstack", "secrets.env")
+	dir := filepath.Join(t.TempDir(), "ownstack")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLockHelper$")
-	cmd.Env = append(os.Environ(), "OWNSTACK_LOCK_HELPER="+secretsFile)
+	cmd.Env = append(os.Environ(), "OWNSTACK_LOCK_HELPER="+dir)
 	stdin, _ := cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
 	if err := cmd.Start(); err != nil {
@@ -47,14 +47,14 @@ func TestLockNodeIsExclusive(t *testing.T) {
 		t.Fatalf("helper did not take the lock: %q", line)
 	}
 
-	_, err := lockNode(secretsFile)
+	_, err := lockNode(dir)
 	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("pid %d", cmd.Process.Pid)) {
 		t.Fatalf("second run was not refused with the holder's pid: %v", err)
 	}
 
 	stdin.Close()
 	cmd.Wait()
-	unlock, err := lockNode(secretsFile)
+	unlock, err := lockNode(dir)
 	if err != nil {
 		t.Fatalf("lock not released when the holder exited: %v", err)
 	}

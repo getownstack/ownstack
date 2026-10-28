@@ -147,8 +147,7 @@ func TestCheckRobotDoesNotRotateOnServerErrors(t *testing.T) {
 	}
 }
 
-// Every registry follows the same contract: the pull secret is
-// registry-credentials and images go to <host>/apps.
+// Every registry follows the same contract: images go to <host>/apps.
 func TestResolveOutputs(t *testing.T) {
 	rt, _ := providertest.Runtime(t, Spec)
 	rt.Exec.Env = append(rt.Exec.Env, "PATH=") // no kubectl: no stored robot
@@ -156,7 +155,7 @@ func TestResolveOutputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := rt.Out.Images
-	if out.Host != "harbor.admin.example.com" || out.Project != "apps" || out.PullSecretName != "registry-credentials" || out.PushUsername != "" {
+	if out.Host != "harbor.admin.example.com" || out.Project != "apps" || out.PushUsername != "" {
 		t.Errorf("images output = %+v", out)
 	}
 }

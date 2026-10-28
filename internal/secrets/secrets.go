@@ -1,16 +1,15 @@
-// Package secrets resolves the secret references in ownstack.yaml on the node.
+// Package secrets resolves provider secrets on the node.
 //
-// Resolution order for a secret:
+// A secret is read from, in order:
 //
-//  1. The manifest reference (env:NAME or file:/path), or the provider's
-//     conventional environment variable when none is given.
-//  2. The node's secrets file (/etc/ownstack/secrets.env by default).
-//  3. Generation, for secrets that may be generated (initial admin passwords).
-//  4. An interactive prompt, when stdin is a terminal and prompting is allowed.
+//  1. its environment variable (the catalog's Env, such as GITHUB_TOKEN);
+//  2. the node's secrets file ($OWNSTACK_DIR/secrets.env);
+//  3. generation, for secrets that may be generated (initial passwords);
+//  4. a hidden prompt, when stdin is a terminal.
 //
-// Values found through 3 or 4, or supplied only in the environment, are
-// written to the secrets file (mode 0600) so reruns and `ownstackctl status`
-// work without asking again. The secrets file never leaves the node.
+// Values found through 1, 3, or 4 are written to the secrets file (mode
+// 0600) by Flush, so reruns and `ownstackctl status` work without asking
+// again. The secrets file never leaves the node.
 package secrets
 
 import (
@@ -30,24 +29,20 @@ import (
 	"golang.org/x/term"
 )
 
-const DefaultFile = "/etc/ownstack/secrets.env"
-
 // Request describes one secret a provider needs.
 type Request struct {
-	Ref      string // env:NAME or file:/path
-	Label    string // human label used when prompting
+	Env      string // environment variable, also its name in the secrets file
+	Label    string // human label used in messages and prompts
 	Help     string
 	Generate bool
 }
 
 // Store resolves secrets and remembers every resolved value for redaction.
+// It is safe for concurrent use.
 type Store struct {
-	Path   string
-	Prompt bool
-	Save   bool
-	// Generate allows generating secrets marked generatable. Plan and status
-	// turn it off so they never invent values.
-	Generate bool
+	Path string
+	// ReadOnly never generates, prompts, or saves: plan and status.
+	ReadOnly bool
 	Getenv   func(string) string
 	In       io.Reader
 	Out      io.Writer
@@ -64,13 +59,8 @@ type Store struct {
 }
 
 func NewStore(path string) *Store {
-	if path == "" {
-		path = DefaultFile
-	}
 	return &Store{
 		Path:     path,
-		Save:     true,
-		Generate: true,
 		Getenv:   os.Getenv,
 		In:       os.Stdin,
 		Out:      os.Stderr,
@@ -91,7 +81,7 @@ func (s *Store) OnValue(fn func(string)) {
 
 var (
 	ErrMissing = errors.New("secret not provided")
-	// ErrWouldGenerate is returned instead of generating when Generate is off.
+	// ErrWouldGenerate is returned instead of generating when ReadOnly.
 	ErrWouldGenerate = errors.New("generated on first apply")
 )
 
@@ -101,47 +91,32 @@ func (s *Store) Get(req Request) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if v, ok := s.resolved[req.Ref]; ok {
+	if v, ok := s.resolved[req.Env]; ok {
 		return v, nil
 	}
-	kind, name, _ := strings.Cut(req.Ref, ":")
-
-	var value string
-	persist := false
-	switch kind {
-	case "file":
-		data, err := os.ReadFile(name)
+	value, persist := s.Getenv(req.Env), true
+	switch {
+	case value != "":
+	case s.fileValue(req.Env) != "":
+		value, persist = s.fileValue(req.Env), false
+	case req.Generate && s.ReadOnly:
+		return "", fmt.Errorf("%s (%s): %w", req.Label, req.Env, ErrWouldGenerate)
+	case req.Generate:
+		value = generatePassword(24)
+		s.generated = append(s.generated, fmt.Sprintf("Generated %s; stored as %s in %s", req.Label, req.Env, s.Path))
+	case !s.ReadOnly && isTerminal(s.In):
+		v, err := s.prompt(req)
 		if err != nil {
-			return "", fmt.Errorf("%s: read %s: %w", req.Label, name, err)
+			return "", err
 		}
-		value = strings.TrimRight(string(data), "\r\n")
-	case "env":
-		if v := s.Getenv(name); v != "" {
-			value, persist = v, true
-		} else if v := s.fileValue(name); v != "" {
-			value = v
-		} else if req.Generate && !s.Generate {
-			return "", fmt.Errorf("%s (%s): %w", req.Label, req.Ref, ErrWouldGenerate)
-		} else if req.Generate {
-			value, persist = generatePassword(24), true
-			s.generated = append(s.generated, fmt.Sprintf("Generated %s; stored as %s in %s", req.Label, name, s.Path))
-		} else if s.Prompt && isTerminal(s.In) {
-			v, err := s.prompt(req, name)
-			if err != nil {
-				return "", err
-			}
-			value, persist = v, true
-		}
-	default:
-		return "", fmt.Errorf("%s: unsupported secret reference %q", req.Label, req.Ref)
+		value = v
 	}
-
 	if value == "" {
-		return "", fmt.Errorf("%s (%s): %w", req.Label, req.Ref, ErrMissing)
+		return "", fmt.Errorf("%s (%s): %w", req.Label, req.Env, ErrMissing)
 	}
-	s.resolved[req.Ref] = value
-	if persist && kind == "env" && s.fileValue(name) != value {
-		s.file[name] = value
+	s.resolved[req.Env] = value
+	if persist && s.fileValue(req.Env) != value {
+		s.file[req.Env] = value
 		s.dirty = true
 	}
 	if s.onValue != nil {
@@ -154,7 +129,7 @@ func (s *Store) Get(req Request) (string, error) {
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.Save || !s.dirty {
+	if s.ReadOnly || !s.dirty {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
@@ -193,8 +168,8 @@ func (s *Store) fileValue(name string) string {
 	return s.file[name]
 }
 
-func (s *Store) prompt(req Request, name string) (string, error) {
-	fmt.Fprintf(s.Out, "\n%s (%s)\n", req.Label, name)
+func (s *Store) prompt(req Request) (string, error) {
+	fmt.Fprintf(s.Out, "\n%s (%s)\n", req.Label, req.Env)
 	if req.Help != "" {
 		fmt.Fprintf(s.Out, "  %s\n", req.Help)
 	}

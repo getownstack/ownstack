@@ -1,0 +1,13 @@
+apiVersion: ownstack.io/v2
+domain: example.com
+adminSubdomain: ops
+environments: [live=main, staging=develop, preview]
+compute: {host: 203.0.113.10, swapGiB: 4}
+ingress: {acmeEmail: ops@example.com, acmeStaging: true}
+vcs: {owner: acme, demoApp: false}
+images:
+  provider: harbor
+  values:
+    core:
+      replicas: 1
+cicd: {provider: jenkins, extraPlugins: 'build-timeout:1.41'}

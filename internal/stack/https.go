@@ -11,15 +11,17 @@ import (
 	"time"
 )
 
-// CheckHTTPS reports whether host serves HTTPS with an issued certificate and
+// checkHTTPS reports whether host serves HTTPS with an issued certificate and
 // what path answers. It connects to ip directly so it works before public
 // DNS has propagated, and it distinguishes Traefik's placeholder certificate
-// from an issued one.
-func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool) Check {
+// from an issued one. With a login, the request carries HTTP basic auth and
+// only HTTP 200 is OK, so one request proves the credential, the route and
+// the certificate.
+func checkHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool, login *login) Check {
 	name := "https://" + host
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	// One request per transport: no keep-alive, so polling loops (verify,
-	// WaitForCertificate) do not pile up idle connections.
+	// WaitFor) do not pile up idle connections.
 	transport := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
 		DisableKeepAlives: true,
@@ -39,6 +41,9 @@ func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool)
 	if err != nil {
 		return Check{Name: name, State: Fail, Detail: err.Error()}
 	}
+	if login != nil {
+		req.SetBasicAuth(login.user, login.password)
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		return Check{Name: name, State: Fail, Detail: "unreachable: " + shortErr(err)}
@@ -48,31 +53,56 @@ func CheckHTTPS(ctx context.Context, host, ip, path string, allowUntrusted bool)
 	if res.TLS == nil || len(res.TLS.PeerCertificates) == 0 {
 		return Check{Name: name, State: Fail, Detail: "no certificate"}
 	}
-	leaf := res.TLS.PeerCertificates[0]
+	answer, state := fmt.Sprintf("HTTP %d", res.StatusCode), OK
+	if login != nil {
+		answer += " as " + login.user
+	}
+	if res.StatusCode >= 500 || (login != nil && res.StatusCode != http.StatusOK) {
+		state = Fail
+	}
+	cert, accepted := certificate(res.TLS.PeerCertificates, host, allowUntrusted)
+	if !accepted && state == OK {
+		state = Warn
+	}
+	return Check{Name: name, State: state, Detail: answer + ", " + cert}
+}
+
+// certificate describes the certificate chain host served, and whether
+// checks accept it: publicly trusted, or issued by an untrusted CA when
+// allowUntrusted is set (Let's Encrypt staging).
+func certificate(chain []*x509.Certificate, host string, allowUntrusted bool) (string, bool) {
+	leaf := chain[0]
 	if strings.Contains(leaf.Subject.CommonName, "TRAEFIK DEFAULT CERT") {
-		return Check{Name: name, State: Warn, Detail: fmt.Sprintf("HTTP %d, certificate not issued yet", res.StatusCode)}
+		return "certificate not issued yet", false
 	}
 	intermediates := x509.NewCertPool()
-	for _, c := range res.TLS.PeerCertificates[1:] {
+	for _, c := range chain[1:] {
 		intermediates.AddCert(c)
 	}
-	_, verifyErr := leaf.Verify(x509.VerifyOptions{DNSName: host, Intermediates: intermediates})
 	expires := leaf.NotAfter.Format("2006-01-02")
+	_, err := leaf.Verify(x509.VerifyOptions{DNSName: host, Intermediates: intermediates})
 	switch {
-	case verifyErr == nil:
-		return Check{Name: name, State: stateForStatus(res.StatusCode), Detail: fmt.Sprintf("HTTP %d, certificate valid until %s", res.StatusCode, expires)}
+	case err == nil:
+		return "certificate valid until " + expires, true
 	case allowUntrusted:
-		return Check{Name: name, State: stateForStatus(res.StatusCode), Detail: fmt.Sprintf("HTTP %d, staging certificate until %s", res.StatusCode, expires)}
-	default:
-		return Check{Name: name, State: Warn, Detail: fmt.Sprintf("HTTP %d, untrusted certificate: %s", res.StatusCode, shortErr(verifyErr))}
+		return "staging certificate until " + expires, true
 	}
+	return "untrusted certificate: " + shortErr(err), false
 }
+
+type login struct{ user, password string }
 
 // CheckHTTPS checks host on this stack's node. It accepts certificates the
 // ingress marks as untrusted (Let's Encrypt staging), so staging stacks can
 // become healthy.
 func (rt *Runtime) CheckHTTPS(ctx context.Context, host, path string) Check {
-	return CheckHTTPS(ctx, host, rt.publicIP(), path, rt.untrustedCerts())
+	return checkHTTPS(ctx, host, rt.publicIP(), path, rt.untrustedCerts(), nil)
+}
+
+// CheckLogin is CheckHTTPS for a request with HTTP basic auth as user. It
+// is OK only when host answers HTTP 200 behind an issued certificate.
+func (rt *Runtime) CheckLogin(ctx context.Context, host, path, user, password string) Check {
+	return checkHTTPS(ctx, host, rt.publicIP(), path, rt.untrustedCerts(), &login{user, password})
 }
 
 func (rt *Runtime) publicIP() string {
@@ -84,13 +114,6 @@ func (rt *Runtime) publicIP() string {
 
 func (rt *Runtime) untrustedCerts() bool {
 	return rt.Out.Ingress != nil && rt.Out.Ingress.UntrustedCerts
-}
-
-func stateForStatus(code int) string {
-	if code >= 500 {
-		return Fail
-	}
-	return OK
 }
 
 func shortErr(err error) string {
@@ -126,33 +149,5 @@ func (rt *Runtime) ServiceClient() *http.Client {
 				return dialer.DialContext(ctx, network, addr)
 			},
 		},
-	}
-}
-
-// WaitForCertificate waits until host serves a publicly trusted certificate,
-// or any issued certificate when the ingress issues untrusted ones (Let's
-// Encrypt staging). Services other machines connect to (registries pushed to
-// from CI) are not usable before that, so their stages wait instead of
-// finishing early.
-func WaitForCertificate(ctx context.Context, rt *Runtime, host, path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		check := rt.CheckHTTPS(ctx, host, path)
-		if check.State == OK {
-			rt.Logf("%s: %s", host, check.Detail)
-			if rt.untrustedCerts() {
-				rt.Logf("  note: %s uses a staging certificate; clients outside this server (such as CI pushes) will not trust it", host)
-			}
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s has no trusted certificate after %s (%s); check DNS and the ACME email, then rerun apply", host, timeout, check.Detail)
-		}
-		rt.Logf("  waiting: certificate for %s (%s)", host, check.Detail)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(15 * time.Second):
-		}
 	}
 }

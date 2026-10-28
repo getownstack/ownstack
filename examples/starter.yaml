@@ -1,28 +1,10 @@
 # Starter: fits a 2 GB server. Zot registry on the server, builds on GitHub
 # Actions. Secrets: GITHUB_TOKEN and CLOUDFLARE_API_TOKEN (asked for on the
-# server); the Zot password is generated.
-apiVersion: ownstack.io/v1
-kind: Stack
-metadata:
-  name: acme-platform
-spec:
-  domain: example.com
-  # environments: [prod=main, dev=develop, qa=release/*]   # the default: <name>[=<branch>], the first is production
-  compute:
-    provider: own-vps
-    settings:
-      host: 203.0.113.10
-  dns:
-    provider: cloudflare
-  ingress:
-    provider: traefik
-    settings:
-      acmeEmail: ops@example.com
-  vcs:
-    provider: github
-    settings:
-      owner: acme
-  images:
-    provider: zot
-  cicd:
-    provider: gh-actions
+# server when not exported); the Zot password is generated.
+apiVersion: ownstack.io/v2
+domain: example.com
+# environments: [prod=main, dev=develop, qa=release/*]   # the default: <name>[=<branch>], the first is production
+compute: {host: 203.0.113.10}
+ingress: {acmeEmail: ops@example.com}
+vcs: {owner: acme}
+# cicd: {repos: api web}   # app repos that deploy here; the demo repo is always one

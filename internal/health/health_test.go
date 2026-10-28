@@ -40,9 +40,13 @@ func TestSend(t *testing.T) {
 }
 
 func TestServiceUnitQuotesPaths(t *testing.T) {
-	unit := serviceUnit("/usr/local/bin/ownstackctl", `/root/my stack/50%$"x".yaml`, "/etc/ownstack/secrets.env")
-	want := `ExecStart=/usr/local/bin/ownstackctl status -f "/root/my stack/50%%$$\"x\".yaml" --secrets-file "/etc/ownstack/secrets.env" --no-prompt --health-url ${OWNSTACK_HEALTH_URL}`
-	if !strings.Contains(unit, want+"\n") {
-		t.Errorf("unit:\n%s\nwant line:\n%s", unit, want)
+	unit := serviceUnit(`/opt/my bin/50%$"x"/ownstackctl`, "/etc/ownstack/health.env")
+	for _, want := range []string{
+		"EnvironmentFile=/etc/ownstack/health.env\n",
+		`ExecStart="/opt/my bin/50%%$$\"x\"/ownstackctl" status --health-url ${OWNSTACK_HEALTH_URL}` + "\n",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("unit:\n%s\nwant line:\n%s", unit, want)
+		}
 	}
 }

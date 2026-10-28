@@ -13,47 +13,6 @@ import (
 	"golang.org/x/crypto/nacl/box"
 )
 
-// Repos lists the repositories owned by owner. login is the authenticated
-// user: for them the private repos are listed too; any other owner is
-// treated as an organization.
-func (c *Client) Repos(ctx context.Context, owner, login string) ([]string, error) {
-	var names []string
-	for page := 1; page <= 20; page++ {
-		path := fmt.Sprintf("/orgs/%s/repos?per_page=100&page=%d", url.PathEscape(owner), page)
-		if strings.EqualFold(owner, login) {
-			path = fmt.Sprintf("/user/repos?affiliation=owner&per_page=100&page=%d", page)
-		}
-		var repos []struct {
-			Name  string `json:"name"`
-			Owner struct {
-				Login string `json:"login"`
-			} `json:"owner"`
-			Archived bool `json:"archived"`
-		}
-		if err := c.Do(ctx, http.MethodGet, path, nil, &repos); err != nil {
-			return nil, err
-		}
-		for _, r := range repos {
-			if !r.Archived && strings.EqualFold(r.Owner.Login, owner) {
-				names = append(names, r.Name)
-			}
-		}
-		if len(repos) < 100 {
-			break
-		}
-	}
-	return names, nil
-}
-
-// FileExists reports whether path exists on the repo's default branch.
-func (c *Client) FileExists(ctx context.Context, owner, repo, path string) (bool, error) {
-	err := c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+repo+"/contents/"+path, nil, nil)
-	if errors.Is(err, ErrNotFound) {
-		return false, nil
-	}
-	return err == nil, err
-}
-
 // FileContent returns a file on the repo's default branch; ErrNotFound when
 // it does not exist.
 func (c *Client) FileContent(ctx context.Context, owner, repo, path string) ([]byte, error) {
@@ -142,9 +101,4 @@ func (c *Client) LatestRun(ctx context.Context, owner, repo, workflow, branch st
 		return nil, err
 	}
 	return &body.Runs[0], nil
-}
-
-// Dispatch starts a workflow_dispatch run on ref.
-func (c *Client) Dispatch(ctx context.Context, owner, repo, workflow, ref string) error {
-	return c.Do(ctx, http.MethodPost, "/repos/"+owner+"/"+repo+"/actions/workflows/"+workflow+"/dispatches", map[string]string{"ref": ref}, nil)
 }

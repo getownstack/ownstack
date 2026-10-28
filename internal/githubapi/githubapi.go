@@ -80,12 +80,13 @@ func (c *Client) Login(ctx context.Context) (string, error) {
 	return user.Login, nil
 }
 
-// Repo returns a repository, or an error when it is missing or inaccessible.
+// Repo returns a repository, or an error when it is missing or inaccessible
+// (wrapping ErrNotFound).
 func (c *Client) Repo(ctx context.Context, owner, name string) (RepoInfo, error) {
 	var info RepoInfo
 	err := c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+name, nil, &info)
 	if errors.Is(err, ErrNotFound) {
-		return info, fmt.Errorf("%s/%s not found or not accessible", owner, name)
+		return info, fmt.Errorf("%s/%s not found or not accessible: %w", owner, name, err)
 	}
 	if info.DefaultBranch == "" {
 		info.DefaultBranch = "main"
@@ -108,14 +109,23 @@ func (c *Client) GenerateRepo(ctx context.Context, rt *stack.Runtime, owner, nam
 	if err != nil {
 		return err
 	}
-	// Generation is asynchronous; wait until the default branch has content.
-	return c.waitForBranch(ctx, rt, owner, name)
+	// Generation is asynchronous; wait until the default branch exists.
+	return stack.WaitFor(ctx, rt, owner+"/"+name+" contents", 2*time.Minute, func(ctx context.Context) (bool, string) {
+		info, err := c.Repo(ctx, owner, name)
+		if err == nil {
+			err = c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+name+"/branches/"+info.DefaultBranch, nil, nil)
+		}
+		if err != nil {
+			return false, err.Error()
+		}
+		return true, ""
+	})
 }
 
-// CreateRepo creates the private repo owner/name with an initial commit.
-// login is the authenticated user: their own repos are created through
-// /user/repos, any other owner must be an organization the token can create
-// repos in.
+// CreateRepo creates the private, empty repo owner/name; its first commit
+// (PutFile) creates its default branch. login is the authenticated user:
+// their own repos are created through /user/repos, any other owner must be
+// an organization the token can create repos in.
 func (c *Client) CreateRepo(ctx context.Context, rt *stack.Runtime, login, owner, name, description string) error {
 	endpoint := "/orgs/" + owner + "/repos"
 	if strings.EqualFold(owner, login) {
@@ -123,39 +133,26 @@ func (c *Client) CreateRepo(ctx context.Context, rt *stack.Runtime, login, owner
 	}
 	rt.Logf("GitHub: creating private %s/%s", owner, name)
 	err := c.Do(ctx, http.MethodPost, endpoint, map[string]any{
-		"name": name, "description": description, "private": true,
-		// An initial commit gives the repo its default branch, so files can
-		// be committed through the contents API.
-		"auto_init": true,
+		"name": name, "description": description, "private": true, "auto_init": false,
 	}, nil)
 	if errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("cannot create %s/%s: %s is neither the token's user (%s) nor an organization it can see", owner, name, owner, login)
 	}
-	if err != nil {
-		return err
-	}
-	return c.waitForBranch(ctx, rt, owner, name)
+	return err
 }
 
-// waitForBranch waits until a new repo's default branch exists.
-func (c *Client) waitForBranch(ctx context.Context, rt *stack.Runtime, owner, name string) error {
-	return stack.Retry(ctx, rt.Console, owner+"/"+name+" contents", 20, 3*time.Second, func() error {
-		info, err := c.Repo(ctx, owner, name)
-		if err != nil {
-			return err
-		}
-		return c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+name+"/branches/"+info.DefaultBranch, nil, nil)
-	})
-}
-
-// File returns the content of path on branch and its blob sha; sha is ""
-// when the file does not exist.
+// File returns the content of path on branch ("" for the default branch)
+// and its blob sha; sha is "" when the file does not exist.
 func (c *Client) File(ctx context.Context, owner, repo, branch, path string) (content []byte, sha string, err error) {
 	var existing struct {
 		SHA     string `json:"sha"`
 		Content string `json:"content"`
 	}
-	err = c.Do(ctx, http.MethodGet, "/repos/"+owner+"/"+repo+"/contents/"+path+"?ref="+branch, nil, &existing)
+	url := "/repos/" + owner + "/" + repo + "/contents/" + path
+	if branch != "" {
+		url += "?ref=" + branch
+	}
+	err = c.Do(ctx, http.MethodGet, url, nil, &existing)
 	if errors.Is(err, ErrNotFound) {
 		return nil, "", nil
 	}
@@ -169,13 +166,16 @@ func (c *Client) File(ctx context.Context, owner, repo, branch, path string) (co
 	return content, existing.SHA, nil
 }
 
-// PutFile commits content to path on branch. sha is the blob it replaces,
-// "" for a new file.
+// PutFile commits content to path on branch ("" for the default branch,
+// which the first commit to an empty repo creates). sha is the blob it
+// replaces, "" for a new file.
 func (c *Client) PutFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, sha, message string) error {
 	body := map[string]any{
 		"message": message,
 		"content": base64.StdEncoding.EncodeToString(content),
-		"branch":  branch,
+	}
+	if branch != "" {
+		body["branch"] = branch
 	}
 	if sha != "" {
 		body["sha"] = sha
@@ -185,7 +185,8 @@ func (c *Client) PutFile(ctx context.Context, rt *stack.Runtime, owner, repo, br
 	})
 }
 
-// UpsertFile commits content to path unless it is already identical.
+// UpsertFile commits content to path on branch ("" for the default branch)
+// unless it is already identical.
 func (c *Client) UpsertFile(ctx context.Context, rt *stack.Runtime, owner, repo, branch, path string, content []byte, message string) (bool, error) {
 	current, sha, err := c.File(ctx, owner, repo, branch, path)
 	if err != nil {

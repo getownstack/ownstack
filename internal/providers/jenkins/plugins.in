@@ -13,14 +13,15 @@ ws-cleanup
 # Pod agents.
 kubernetes
 docker-workflow
-# Credentials from Kubernetes secrets (github-pat, harbor-robot, slack-token).
+# Credentials from Kubernetes secrets (github-pat, registry).
 credentials
 kubernetes-credentials-provider
 # The organization folder and checkouts.
 git
 github
 github-branch-source
-# Pipeline notifications through the alerts aspect.
+# Unused since Slack notifications were removed: delete this line when the
+# lock is next regenerated.
 slack
 # Pipeline UI.
 blueocean

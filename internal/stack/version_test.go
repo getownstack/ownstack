@@ -19,16 +19,14 @@ func TestReleaseTag(t *testing.T) {
 }
 
 func TestLibraryRef(t *testing.T) {
-	for _, c := range []struct{ setting, version, want string }{
-		{"main", "ownstackctl-v0.3.0", "main"},
-		{"my-branch", "dev", "my-branch"},
-		{"", "ownstackctl-v0.3.0", "ownstackctl-v0.3.0"},
-		{"", "ownstackctl-v0.3.0-rc1", "ownstackctl-v0.3.0-rc1"},
-		{"", "dev", "main"},
-		{"", "v0.3.0", "main"},
+	for version, want := range map[string]string{
+		"ownstackctl-v0.3.0":      "ownstackctl-v0.3.0",
+		"ownstackctl-v0.4.0-rc.1": "ownstackctl-v0.4.0-rc.1",
+		"dev":                     "main",
+		"v0.3.0":                  "main",
 	} {
-		if got := LibraryRef(c.setting, c.version); got != c.want {
-			t.Errorf("LibraryRef(%q, %q) = %q, want %q", c.setting, c.version, got, c.want)
+		if got := LibraryRef(version); got != want {
+			t.Errorf("LibraryRef(%q) = %q, want %q", version, got, want)
 		}
 	}
 	if LibraryRepoURL != "https://github.com/getownstack/ownstack.git" {

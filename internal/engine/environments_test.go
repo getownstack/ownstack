@@ -2,26 +2,24 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/getownstack/ownstack/internal/providers/providertest"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-// envStub answers kubectl for the environments stage. Calls, applied
-// objects, and patches are written to the stub dir.
+// envStub answers kubectl for the environments stage. Calls and applied
+// input are written to the stub dir.
 const envStub = `#!/bin/sh
 echo "$*" >> "$OWNSTACK_STUB_DIR/calls"
 case "$*" in
-  "apply -f -") cat >> "$OWNSTACK_STUB_DIR/applied"; echo >> "$OWNSTACK_STUB_DIR/applied" ;;
-  "get serviceaccount default -n "*) echo '{"metadata":{"resourceVersion":"5"},"imagePullSecrets":[{"name":"mine"}]}' ;;
-  "patch serviceaccount default -n "*) echo "$*" >> "$OWNSTACK_STUB_DIR/patches" ;;
+  "apply "*) cat >> "$OWNSTACK_STUB_DIR/applied" ;;
   *) exit 1 ;;
 esac
 `
@@ -43,69 +41,85 @@ func envRuntime(t *testing.T, script string) (*stack.Runtime, *strings.Builder, 
 	out := &strings.Builder{}
 	rt.Console = stack.NewConsole(out)
 	rt.Exec.Console = rt.Console
-	rt.Out.Images = &stack.ImagesOutput{Host: "registry.example.com", Project: "apps", PushUsername: "ci", PushPassword: "registry-pw-value", PullSecretName: "registry-credentials"}
+	rt.Out.Images = &stack.ImagesOutput{Host: "registry.example.com", Project: "apps", PushUsername: "ci", PushPassword: "registry-pw-value"}
 	return rt, out, dir
 }
 
+// One kubectl call server-side applies every environment's namespace, pull
+// secret, and default service account (C8).
 func TestEnvironmentsApply(t *testing.T) {
 	rt, out, dir := envRuntime(t, envStub)
 	if err := (environments{rt: rt}).apply(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	// Every namespace is applied with the Pod Security labels, in order.
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	if string(calls) != "apply --server-side --force-conflicts --field-manager=ownstack -f -\n" {
+		t.Fatalf("kubectl calls:\n%s", calls)
+	}
 	applied, _ := os.ReadFile(filepath.Join(dir, "applied"))
-	var namespaces []string
-	dec := json.NewDecoder(strings.NewReader(string(applied)))
-	for dec.More() {
-		var obj struct {
+	var list struct {
+		Kind  string
+		Items []struct {
 			Kind     string
+			Type     string
+			Data     map[string]string
 			Metadata struct {
-				Name   string
-				Labels map[string]string
+				Name, Namespace string
+				Labels          map[string]string
+			}
+			ImagePullSecrets []struct{ Name string }
+		}
+	}
+	if err := json.Unmarshal(applied, &list); err != nil || list.Kind != "List" {
+		t.Fatalf("applied %s: %v", applied, err)
+	}
+	var got []string
+	for _, item := range list.Items {
+		got = append(got, item.Kind+" "+item.Metadata.Namespace+"/"+item.Metadata.Name)
+		switch item.Kind {
+		case "Namespace":
+			if item.Metadata.Labels[podSecurityEnforce] != "baseline" || item.Metadata.Labels[podSecurityWarn] != "baseline" {
+				t.Errorf("namespace %s labels = %v", item.Metadata.Name, item.Metadata.Labels)
+			}
+		case "Secret":
+			config, _ := base64.StdEncoding.DecodeString(item.Data[".dockerconfigjson"])
+			if item.Type != "kubernetes.io/dockerconfigjson" || stack.PullSecretMismatch(string(config), "registry.example.com", "ci", "registry-pw-value") != "" {
+				t.Errorf("pull secret in %s: %s %s", item.Metadata.Namespace, item.Type, config)
+			}
+		case "ServiceAccount":
+			if len(item.ImagePullSecrets) != 1 || item.ImagePullSecrets[0].Name != "registry-credentials" {
+				t.Errorf("service account in %s pulls with %v", item.Metadata.Namespace, item.ImagePullSecrets)
 			}
 		}
-		if err := dec.Decode(&obj); err != nil {
-			t.Fatal(err)
-		}
-		if obj.Kind != "Namespace" {
-			continue
-		}
-		namespaces = append(namespaces, obj.Metadata.Name)
-		if obj.Metadata.Labels[podSecurityEnforce] != "baseline" || obj.Metadata.Labels[podSecurityWarn] != "baseline" {
-			t.Errorf("namespace %s labels = %v", obj.Metadata.Name, obj.Metadata.Labels)
-		}
 	}
-	if strings.Join(namespaces, ",") != "prod,dev,qa" {
-		t.Errorf("applied namespaces %v, want prod,dev,qa", namespaces)
+	want := []string{
+		"Namespace /prod", "Secret prod/registry-credentials", "ServiceAccount prod/default",
+		"Namespace /dev", "Secret dev/registry-credentials", "ServiceAccount dev/default",
+		"Namespace /qa", "Secret qa/registry-credentials", "ServiceAccount qa/default",
 	}
-
-	// The default service accounts pull with the secret, keeping their own.
-	patches, _ := os.ReadFile(filepath.Join(dir, "patches"))
-	if strings.Count(string(patches), `{"name":"mine"},{"name":"registry-credentials"}`) != 3 {
-		t.Errorf("patches:\n%s", patches)
+	if strings.Join(got, ", ") != strings.Join(want, ", ") {
+		t.Errorf("applied:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if strings.Contains(out.String(), "registry-pw-value") || strings.Contains(string(patches), "registry-pw-value") {
-		t.Errorf("a credential leaked:\n%s\n%s", out.String(), patches)
+	if strings.Contains(out.String(), "registry-pw-value") || !strings.Contains(out.String(), "Environments ready: prod, dev, qa") {
+		t.Errorf("output:\n%s", out.String())
 	}
 }
 
-// A default service account that never appears costs a warning, not the run.
-func TestDefaultServiceAccountMissing(t *testing.T) {
-	defer func(a int, d time.Duration) { serviceAccountAttempts, serviceAccountDelay = a, d }(serviceAccountAttempts, serviceAccountDelay)
-	serviceAccountAttempts, serviceAccountDelay = 3, 0
-	stub := strings.Replace(envStub, `echo '{"metadata":{"resourceVersion":"5"},"imagePullSecrets":[{"name":"mine"}]}' ;;`,
-		`echo 'Error from server (NotFound): serviceaccounts "default" not found' >&2; exit 1 ;;`, 1)
-	rt, out, dir := envRuntime(t, stub)
-	if err := (environments{rt: rt}).apply(context.Background()); err != nil {
-		t.Fatal(err)
+// A failing apply fails the stage; a registry without a credential fails it
+// before anything is applied.
+func TestEnvironmentsApplyFails(t *testing.T) {
+	rt, _, _ := envRuntime(t, "#!/bin/sh\necho 'error: the server could not find the requested resource' >&2\nexit 1\n")
+	if err := (environments{rt: rt}).apply(context.Background()); err == nil || !strings.Contains(err.Error(), "could not find the requested resource") {
+		t.Errorf("err = %v", err)
 	}
-	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
-	if n := strings.Count(string(calls), "get serviceaccount default -n prod"); n != 3 {
-		t.Errorf("asked %d times for the prod account, want 3", n)
+
+	rt, _, dir := envRuntime(t, envStub)
+	rt.Out.Images.PushUsername = ""
+	if err := (environments{rt: rt}).apply(context.Background()); err == nil || !strings.Contains(err.Error(), "no credential") {
+		t.Errorf("err = %v", err)
 	}
-	if !strings.Contains(out.String(), "warning: the default service account in prod does not pull with registry-credentials") {
-		t.Errorf("output:\n%s", out.String())
+	if _, err := os.Stat(filepath.Join(dir, "calls")); err == nil {
+		t.Error("applied without a credential")
 	}
 }
 

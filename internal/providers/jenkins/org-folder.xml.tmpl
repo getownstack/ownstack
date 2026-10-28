@@ -57,7 +57,7 @@
       <enableAvatar>false</enableAvatar>
       <traits>
         <jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait plugin="scm-api">
-          <includes>{{ xml .RepoFilter }}</includes>
+          <includes>{{ xml .Repos }}</includes>
           <excludes></excludes>
         </jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait>
         <org.jenkinsci.plugins.github__branch__source.BranchDiscoveryTrait>

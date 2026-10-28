@@ -22,9 +22,8 @@ const goldenPath = "testdata/values.golden.yaml"
 
 // goldenHeader starts the golden values; helm reads them as values.
 const goldenHeader = `# Helm values the jenkins provider renders for a representative Standard
-# stack (Harbor, default settings), with fake secrets. CI
-# installs the locked chart with them. Regenerate after changing the values
-# template or the lock:
+# stack (Harbor, default settings), with fake secrets. CI installs the locked
+# chart with them. Regenerate after changing the values template or the lock:
 #   go test ./internal/providers/jenkins -run TestValuesGolden -update
 `
 
@@ -59,14 +58,10 @@ func TestLockCoversPluginsIn(t *testing.T) {
 	}
 }
 
-// The default chart is the one the plugins are locked for.
+// Jenkins installs the chart the plugins are locked for.
 func TestChartMatchesLock(t *testing.T) {
-	param, ok := Spec.Param("chartVersion")
-	if !ok || param.Default != pluginLock.Chart || ChartVersion != pluginLock.Chart {
-		t.Errorf("chartVersion default %q (ChartVersion %q), plugins.lock chart %s; run lockgen", param.Default, ChartVersion, pluginLock.Chart)
-	}
-	if got := jenkinsRuntime(t, "").Setting("chartVersion"); got != pluginLock.Chart {
-		t.Errorf("default chartVersion setting = %q", got)
+	if ChartVersion != pluginLock.Chart {
+		t.Errorf("ChartVersion %q, plugins.lock chart %s; run lockgen", ChartVersion, pluginLock.Chart)
 	}
 }
 
@@ -98,7 +93,7 @@ func renderValues(t *testing.T, rt *stack.Runtime) (string, renderedValues) {
 // Jenkins installs exactly the locked plugins on the locked core: no latest
 // versions, every dependency pinned, and the image tag from the lock.
 func TestValuesInstallLockedPlugins(t *testing.T) {
-	_, v := renderValues(t, jenkinsRuntime(t, ""))
+	_, v := renderValues(t, jenkinsRuntime(t, nil))
 	c := v.Controller
 	if c.InstallLatestPlugins == nil || *c.InstallLatestPlugins || c.InstallLatestSpecifiedPlugins == nil || *c.InstallLatestSpecifiedPlugins {
 		t.Errorf("installLatestPlugins %v, installLatestSpecifiedPlugins %v; both must be false", c.InstallLatestPlugins, c.InstallLatestSpecifiedPlugins)
@@ -121,7 +116,7 @@ func TestValuesInstallLockedPlugins(t *testing.T) {
 // extraPlugins adds plugins, and replaces a locked plugin's version.
 func TestValuesExtraPlugins(t *testing.T) {
 	locked := pluginLock.Plugins[0]
-	rt := jenkinsRuntime(t, "      extraPlugins: zz-extra:1.2.3 "+locked.Name+":999.v1\n")
+	rt := jenkinsRuntime(t, map[string]string{"extraPlugins": "zz-extra:1.2.3 " + locked.Name + ":999.v1"})
 	if err := (Provider{}).Resolve(context.Background(), rt); err != nil {
 		t.Fatal(err)
 	}
@@ -137,28 +132,14 @@ func TestValuesExtraPlugins(t *testing.T) {
 
 	// The manifest's pattern rejects malformed values; resolving rejects
 	// them too, before anything is installed.
-	if err := (Provider{}).Resolve(context.Background(), jenkinsRuntime(t, "      extraPlugins: git\n")); err == nil || !strings.Contains(err.Error(), "extraPlugins") {
+	if err := (Provider{}).Resolve(context.Background(), jenkinsRuntime(t, map[string]string{"extraPlugins": "git"})); err == nil || !strings.Contains(err.Error(), "extraPlugins") {
 		t.Errorf("resolve with extraPlugins git = %v", err)
-	}
-}
-
-// A chartVersion other than the locked chart keeps working, with a warning.
-func TestChartMismatch(t *testing.T) {
-	if got := chartMismatch(jenkinsRuntime(t, "")); got != "" {
-		t.Errorf("default chart warns: %q", got)
-	}
-	want := "plugins are locked for chart " + pluginLock.Chart + " / Jenkins " + pluginLock.Jenkins + "; a different chart may not start"
-	if got := chartMismatch(jenkinsRuntime(t, "      chartVersion: 5.0.0\n")); got != want {
-		t.Errorf("another chart: %q", got)
 	}
 }
 
 // The golden values are what CI installs the locked chart with.
 func TestValuesGolden(t *testing.T) {
-	rt, _ := providertest.Runtime(t, Spec)
-	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", APIURL: "https://api.github.com", ClusterRepoURL: "https://github.com/acme/ownstack-cluster.git"}
-	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PullSecretName: "registry-credentials"}
-	jrt := rt.For("cicd")
+	jrt := jenkinsRuntime(t, nil)
 	password, err := jrt.Secret("adminPassword")
 	if err != nil {
 		t.Fatal(err)

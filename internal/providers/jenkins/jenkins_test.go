@@ -1,31 +1,54 @@
 package jenkins
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/getownstack/ownstack/internal/manifest"
 	"github.com/getownstack/ownstack/internal/providers/providertest"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-func TestValuesRender(t *testing.T) {
-	values, err := stack.Render(valuesTmpl, valuesData(jenkinsRuntime(t, ""), "pw"))
-	if err != nil {
-		t.Fatal(err)
-	}
+// jenkinsRuntime is the test stack with Jenkins CI, the given cicd settings,
+// and the given environments (the defaults when none), on Harbor.
+func jenkinsRuntime(t *testing.T, settings map[string]string, environments ...string) *stack.Runtime {
+	t.Helper()
+	rt, _ := jenkinsRuntimeOut(t, settings, environments...)
+	return rt
+}
+
+// jenkinsRuntimeOut is jenkinsRuntime with its console output.
+func jenkinsRuntimeOut(t *testing.T, settings map[string]string, environments ...string) (*stack.Runtime, *bytes.Buffer) {
+	t.Helper()
+	rt, out := providertest.Runtime(t, Spec)
+	providertest.Set(rt, "cicd", "jenkins", settings)
+	rt.Manifest.Environments = environments
+	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", APIURL: "https://api.github.com", Username: "acme", Token: "gh-token-value", DemoRepo: "lumen-yard"}
+	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PushUsername: "robot$ownstack-ci", PushPassword: "robot-pw"}
+	return rt.For("cicd"), out
+}
+
+// jcasc is the main JCasC script of rendered values.
+func jcasc(t *testing.T, values string) string {
+	t.Helper()
 	var parsed struct {
 		Controller struct {
 			JCasC struct {
@@ -42,123 +65,14 @@ func TestValuesRender(t *testing.T) {
 	if parsed.Controller.Ingress.HostName != "jenkins.admin.example.com" {
 		t.Errorf("host = %q", parsed.Controller.Ingress.HostName)
 	}
-	casc := parsed.Controller.JCasC.ConfigScripts["main"]
-	var cascDoc map[string]any
-	if err := yaml.Unmarshal([]byte(casc), &cascDoc); err != nil {
-		t.Fatalf("invalid JCasC YAML: %v\n%s", err, casc)
-	}
-	for _, want := range []string{"IMAGE_REGISTRY", "harbor.admin.example.com", stack.LibraryRepoURL} {
-		if !strings.Contains(casc, want) {
-			t.Errorf("JCasC missing %q", want)
-		}
-	}
-	if strings.Contains(strings.ToLower(casc), "slack") {
-		t.Error("JCasC configures Slack")
-	}
+	return parsed.Controller.JCasC.ConfigScripts["main"]
 }
 
-func TestOrgFolderXML(t *testing.T) {
-	out, err := stack.Render(orgFolderTmpl, map[string]string{
-		"Owner": "acme", "APIURL": "https://api.github.com", "CredentialID": "github-pat", "RepoFilter": "app-* <&>",
-		"JenkinsfilePath": "infrastructure/Jenkinsfile", "TriggerBranches": "main",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Jenkins writes XML 1.1, which encoding/xml refuses; the body is 1.0-compatible.
-	body := out[strings.Index(out, "?>")+2:]
-	dec := xml.NewDecoder(strings.NewReader(body))
-	for {
-		if _, err := dec.Token(); err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
-			t.Fatalf("invalid XML: %v", err)
-		}
-	}
-	if !strings.Contains(out, "<repoOwner>acme</repoOwner>") || !strings.Contains(out, "app-* &lt;&amp;&gt;") {
-		t.Errorf("unexpected XML:\n%s", out)
-	}
-	// Fork pull requests run outside code on agents with the host Docker
-	// socket and a cluster-admin service account; they must not be discovered.
-	if strings.Contains(out, "ForkPullRequestDiscoveryTrait") {
-		t.Error("org folder must not discover fork pull requests")
-	}
-}
-
-// jenkinsRuntime is the test stack (Jenkins CI) with extra cicd settings,
-// given as indented YAML, and spec.environments when any are given.
-func jenkinsRuntime(t *testing.T, settings string, environments ...string) *stack.Runtime {
+// globalEnv is the Jenkins global env of rendered values, in order.
+func globalEnv(t *testing.T, rt *stack.Runtime) [][2]string {
 	t.Helper()
-	rt, _ := providertest.Runtime(t, Spec)
-	if settings != "" {
-		m, err := manifest.Parse([]byte(strings.Replace(providertest.Manifest, "    provider: jenkins\n", "    provider: jenkins\n    settings:\n"+settings, 1)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		rt.Manifest = m
-	}
-	rt.Manifest.Spec.Environments = environments
-	rt.Out.VCS = &stack.VCSOutput{Kind: "github", Owner: "acme", APIURL: "https://api.github.com", ClusterRepoURL: "https://github.com/acme/ownstack-cluster.git"}
-	rt.Out.Images = &stack.ImagesOutput{Host: "harbor.admin.example.com", Project: "apps", PullSecretName: "registry-credentials"}
-	return rt.For("cicd")
-}
-
-func folderTriggerBranches(t *testing.T, xmlConfig string) string {
-	t.Helper()
-	m := regexp.MustCompile(`(?s)<jenkins\.branch\.NoTriggerOrganizationFolderProperty>\s*<branches>([^<]*)</branches>`).FindStringSubmatch(xmlConfig)
-	if m == nil {
-		t.Fatal("org folder has no NoTriggerOrganizationFolderProperty branches")
-	}
-	return m[1]
-}
-
-// Jenkins global env carries the production environment, its branch, and
-// the mapping, the first match winning; the earlier variables keep their
-// meaning for older libraries.
-func TestValuesExportBranchMappings(t *testing.T) {
-	for _, c := range []struct {
-		environments                                 []string
-		branches, deployBranch, production, triggers string
-	}{
-		{nil, "main=prod develop=dev release/*=qa", "main", "prod", `main|develop|release/.*`},
-		{[]string{"prod=main"}, "main=prod", "main", "prod", "main"},
-		{[]string{"qa=trunk", "dev=develop", "hotfix=hotfix/*"}, "trunk=qa develop=dev hotfix/*=hotfix", "trunk", "qa", `trunk|develop|hotfix/.*`},
-		// NoTrigger takes a regular expression: release/1.0 must not also
-		// match release/1x0.
-		{[]string{"prod=release/1.0", "preview"}, "release/1.0=prod", "release/1.0", "prod", `release/1\.0`},
-	} {
-		rt := jenkinsRuntime(t, "", c.environments...)
-		env := map[string]string{}
-		for _, v := range valuesData(rt, "pw")["GlobalEnv"].([]envVar) {
-			env[v.Key] = v.Value
-		}
-		if env["OWNSTACK_BRANCHES"] != c.branches || env["OWNSTACK_DEPLOY_BRANCH"] != c.deployBranch ||
-			env["OWNSTACK_PRODUCTION_ENVIRONMENT"] != c.production || env["OWNSTACK_NAMESPACE"] != c.production {
-			t.Errorf("environments %q: env %v", c.environments, env)
-		}
-		out, err := stack.Render(orgFolderTmpl, orgFolderData(rt))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := folderTriggerBranches(t, out); got != c.triggers {
-			t.Errorf("environments %q: org folder triggers %q, want %q", c.environments, got, c.triggers)
-		}
-	}
-
-	// The values reach JCasC intact.
-	values, err := stack.Render(valuesTmpl, valuesData(jenkinsRuntime(t, ""), "pw"))
+	values, err := stack.Render(valuesTmpl, valuesData(rt, "pw"))
 	if err != nil {
-		t.Fatal(err)
-	}
-	var parsed struct {
-		Controller struct {
-			JCasC struct {
-				ConfigScripts map[string]string `yaml:"configScripts"`
-			} `yaml:"JCasC"`
-		}
-	}
-	if err := yaml.Unmarshal([]byte(values), &parsed); err != nil {
 		t.Fatal(err)
 	}
 	var casc struct {
@@ -170,52 +84,49 @@ func TestValuesExportBranchMappings(t *testing.T) {
 			} `yaml:"globalNodeProperties"`
 		}
 	}
-	if err := yaml.Unmarshal([]byte(parsed.Controller.JCasC.ConfigScripts["main"]), &casc); err != nil || len(casc.Jenkins.GlobalNodeProperties) != 1 {
+	if err := yaml.Unmarshal([]byte(jcasc(t, values)), &casc); err != nil || len(casc.Jenkins.GlobalNodeProperties) != 1 {
 		t.Fatalf("JCasC: %v", err)
 	}
-	found := map[string]string{}
+	var out [][2]string
 	for _, e := range casc.Jenkins.GlobalNodeProperties[0].EnvVars.Env {
-		found[e.Key] = e.Value
+		out = append(out, [2]string{e.Key, e.Value})
 	}
-	if found["OWNSTACK_BRANCHES"] != "main=prod develop=dev release/*=qa" || found["OWNSTACK_PRODUCTION_ENVIRONMENT"] != "prod" {
-		t.Errorf("JCasC env = %v", found)
-	}
+	return out
 }
 
-// The org folder builds every mapped branch automatically. Java matches the
-// expression against the whole branch name, so it is checked anchored here.
-func TestOrgFolderTriggersEveryMappedBranch(t *testing.T) {
-	out, err := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "", "prod=main", "dev=develop", "qa=release/*", "rc=v1.*-rc")))
+// Jenkins global env is exactly the five C7 variables.
+func TestGlobalEnv(t *testing.T) {
+	for _, c := range []struct {
+		environments []string
+		want         string
+	}{
+		{nil, "prod=main dev=develop qa=release/*"},
+		{[]string{"qa=trunk", "preview", "hotfix=hotfix/*"}, "qa=trunk preview hotfix=hotfix/*"},
+	} {
+		got := globalEnv(t, jenkinsRuntime(t, nil, c.environments...))
+		want := [][2]string{
+			{"OWNSTACK_DOMAIN", "example.com"},
+			{"OWNSTACK_REGISTRY", "harbor.admin.example.com/apps"},
+			{"OWNSTACK_ENVIRONMENTS", c.want},
+			{"OWNSTACK_LIBRARY_REPO", "https://github.com/getownstack/ownstack.git"},
+			{"OWNSTACK_LIBRARY_REF", "main"},
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("environments %q: global env\n%v\nwant\n%v", c.environments, got, want)
+		}
+	}
+	values, err := stack.Render(valuesTmpl, valuesData(jenkinsRuntime(t, nil), "pw"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := folderTriggerBranches(t, out)
-	if got != `main|develop|release/.*|v1\..*-rc` {
-		t.Fatalf("branches = %q", got)
-	}
-	re := regexp.MustCompile(`^(?:` + got + `)$`)
-	for branch, want := range map[string]bool{
-		"main": true, "develop": true, "release/1.0": true, "release/a/b": true, "release/": true, "v1.2-rc": true, "v1.2/x-rc": true,
-		"mainx": false, "xmain": false, "develop2": false, "release": false, "feature/x": false, "v1x2-rc": false, "PR-1": false,
-	} {
-		if re.MatchString(branch) != want {
-			t.Errorf("trigger expression %q matches %q: %v, want %v", got, branch, !want, want)
-		}
-	}
-	if g := globRegexp("*"); g != ".*" {
-		t.Errorf("globRegexp(*) = %q", g)
-	}
-
-	// Adding mappings to an existing folder rewrites it once.
-	changes, ok, err := folderChanges(jenkinsStored, out)
-	if err != nil || !ok || !strings.Contains(strings.Join(changes, ", "), `auto-build branches "main" → "main|develop|release/.*|v1\\..*-rc"`) {
-		t.Errorf("changes = %v %v %v", changes, ok, err)
+	if strings.Contains(strings.ToLower(jcasc(t, values)), "slack") {
+		t.Error("JCasC configures Slack")
 	}
 }
 
-// Every variable ownstackctl puts in Jenkins global env is one the shared
-// library reads.
-func TestLibraryReadsGlobalEnv(t *testing.T) {
+// librarySource is every step of the shared pipeline library, concatenated.
+func librarySource(t *testing.T) string {
+	t.Helper()
 	files, err := filepath.Glob("../../../jenkins_pipeline_library/vars/*.groovy")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no library sources: %v", err)
@@ -228,47 +139,63 @@ func TestLibraryReadsGlobalEnv(t *testing.T) {
 		}
 		lib.Write(data)
 	}
-	for _, v := range valuesData(jenkinsRuntime(t, ""), "pw")["GlobalEnv"].([]envVar) {
-		if !strings.Contains(lib.String(), "env."+v.Key) {
-			t.Errorf("Jenkins global env sets %s, which the library never reads", v.Key)
+	return lib.String()
+}
+
+// Every variable in Jenkins global env is one the shared library reads, as
+// env.KEY in Groovy or $KEY in a shell step.
+func TestLibraryReadsGlobalEnv(t *testing.T) {
+	lib := librarySource(t)
+	for _, v := range globalEnv(t, jenkinsRuntime(t, nil)) {
+		if !regexp.MustCompile(`(env\.|\$\{?)` + v[0] + `\b`).MatchString(lib) {
+			t.Errorf("Jenkins global env sets %s, which the library never reads", v[0])
+		}
+	}
+}
+
+// Every credential the shared library uses is one the provider creates (C7).
+func TestLibraryUsesProviderCredentials(t *testing.T) {
+	created := map[string]bool{}
+	for _, obj := range clusterObjects(jenkinsRuntime(t, nil)) {
+		if obj["kind"] == "Secret" {
+			created[obj["metadata"].(map[string]any)["name"].(string)] = true
+		}
+	}
+	used := regexp.MustCompile(`credentialsId:\s*['"]([^'"]+)['"]`).FindAllStringSubmatch(librarySource(t), -1)
+	if len(used) == 0 {
+		t.Fatal("the library uses no credentialsId; the registry push needs one")
+	}
+	for _, m := range used {
+		if !created[m[1]] {
+			t.Errorf("the library uses credential %q, which the provider does not create (it creates %v)", m[1], created)
 		}
 	}
 }
 
 // Jenkins loads the pipeline library from the Ownstack repository at the
-// stack's library ref, and global env names the same repository and ref, so
-// helmDeploy fetches common_helm_library from where the library came from.
-// Cluster repos are not involved.
+// running release's tag (main for development builds), and global env names
+// the same repository and ref, so the Deploy stage clones common_helm_library
+// from where the pipeline library came from.
 func TestLibrariesComeFromTheOwnstackRepoAtOneRef(t *testing.T) {
 	saved := stack.EngineVersion
 	t.Cleanup(func() { stack.EngineVersion = saved })
-	for _, c := range []struct{ version, settings, want string }{
-		{"dev", "", "main"},
-		{"ownstackctl-v0.4.0", "", "ownstackctl-v0.4.0"},
-		{"ownstackctl-v0.4.0", "      libraryRef: my-branch\n", "my-branch"},
-	} {
-		stack.EngineVersion = c.version
-		rt := jenkinsRuntime(t, c.settings)
-		data := valuesData(rt, "pw")
+	for version, want := range map[string]string{"dev": "main", "ownstackctl-v0.4.0-rc.1": "ownstackctl-v0.4.0-rc.1"} {
+		stack.EngineVersion = version
+		rt := jenkinsRuntime(t, nil)
 		env := map[string]string{}
-		for _, v := range data["GlobalEnv"].([]envVar) {
-			env[v.Key] = v.Value
+		for _, v := range globalEnv(t, rt) {
+			env[v[0]] = v[1]
 		}
-		if env["OWNSTACK_LIBRARY_REPO"] != "https://github.com/getownstack/ownstack.git" || env["OWNSTACK_LIBRARY_REF"] != c.want {
-			t.Errorf("%s %q: library env = %q @ %q, want %s", c.version, c.settings, env["OWNSTACK_LIBRARY_REPO"], env["OWNSTACK_LIBRARY_REF"], c.want)
+		if env["OWNSTACK_LIBRARY_REPO"] != stack.LibraryRepoURL || env["OWNSTACK_LIBRARY_REF"] != want {
+			t.Errorf("%s: library env = %q @ %q, want %s", version, env["OWNSTACK_LIBRARY_REPO"], env["OWNSTACK_LIBRARY_REF"], want)
 		}
-		// Older pipeline libraries (a libraryRef naming an earlier release)
-		// read the Helm library from here.
-		if env["COMMON_HELM_LIBRARY_GITHUB_REPO"] != stack.LibraryRepoURL {
-			t.Errorf("COMMON_HELM_LIBRARY_GITHUB_REPO = %q", env["COMMON_HELM_LIBRARY_GITHUB_REPO"])
-		}
-		values, err := stack.Render(valuesTmpl, data)
+		values, err := stack.Render(valuesTmpl, valuesData(rt, "pw"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		library := globalLibrary(t, values)
-		if library.DefaultVersion != c.want || library.Name != "jenkins_pipeline_library" || !library.Implicit {
-			t.Errorf("%s %q: global library = %+v", c.version, c.settings, library)
+		if library.DefaultVersion != want || library.Name != "jenkins_pipeline_library" || !library.Implicit {
+			t.Errorf("%s: global library = %+v", version, library)
 		}
 		git := library.Retriever.ModernSCM.SCM.Git
 		if library.Retriever.ModernSCM.LibraryPath != "jenkins_pipeline_library/" || git.Remote != stack.LibraryRepoURL {
@@ -282,26 +209,14 @@ func TestLibrariesComeFromTheOwnstackRepoAtOneRef(t *testing.T) {
 		if git.CredentialsID != "" {
 			t.Errorf("library uses credential %q", git.CredentialsID)
 		}
-		if !strings.Contains(libraryDetail(rt), "getownstack/ownstack@"+c.want) {
-			t.Errorf("library detail = %q", libraryDetail(rt))
-		}
 	}
 
-	deploy, err := os.ReadFile("../../../jenkins_pipeline_library/vars/helmDeploy.groovy")
+	pipeline, err := os.ReadFile("../../../jenkins_pipeline_library/vars/runPipeline.groovy")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		"if (env.OWNSTACK_LIBRARY_REPO) {",
-		"def ref = env.OWNSTACK_LIBRARY_REF ?: 'main'",
-		// Release refs are tags; stack.ReleaseTag accepts only ownstackctl-v*.
-		"ref.startsWith('ownstackctl-v') ? 'refs/tags/' + ref : '*/' + ref",
-		"remote = [url: env.OWNSTACK_LIBRARY_REPO]",
-		"branches: [[name: branch]]",
-	} {
-		if !strings.Contains(string(deploy), want) {
-			t.Errorf("helmDeploy.groovy does not contain %q", want)
-		}
+	if !regexp.MustCompile(`git clone( --quiet)? --depth 1 --branch "\$OWNSTACK_LIBRARY_REF" "\$OWNSTACK_LIBRARY_REPO"`).Match(pipeline) {
+		t.Error(`runPipeline.groovy does not clone common_helm_library with --branch "$OWNSTACK_LIBRARY_REF" "$OWNSTACK_LIBRARY_REPO"`)
 	}
 }
 
@@ -326,16 +241,6 @@ type jcascLibrary struct {
 // globalLibrary is the one global library of rendered values' JCasC.
 func globalLibrary(t *testing.T, values string) jcascLibrary {
 	t.Helper()
-	var parsed struct {
-		Controller struct {
-			JCasC struct {
-				ConfigScripts map[string]string `yaml:"configScripts"`
-			} `yaml:"JCasC"`
-		}
-	}
-	if err := yaml.Unmarshal([]byte(values), &parsed); err != nil {
-		t.Fatalf("invalid values YAML: %v", err)
-	}
 	var casc struct {
 		Unclassified struct {
 			GlobalLibraries struct {
@@ -343,13 +248,114 @@ func globalLibrary(t *testing.T, values string) jcascLibrary {
 			} `yaml:"globalLibraries"`
 		} `yaml:"unclassified"`
 	}
-	if err := yaml.Unmarshal([]byte(parsed.Controller.JCasC.ConfigScripts["main"]), &casc); err != nil {
+	if err := yaml.Unmarshal([]byte(jcasc(t, values)), &casc); err != nil {
 		t.Fatalf("invalid JCasC YAML: %v", err)
 	}
 	if n := len(casc.Unclassified.GlobalLibraries.Libraries); n != 1 {
 		t.Fatalf("JCasC has %d global libraries", n)
 	}
 	return casc.Unclassified.GlobalLibraries.Libraries[0]
+}
+
+// The credentials are the VCS token and the registry push credential,
+// stored as they are: the library never passes them through a shell.
+func TestClusterObjects(t *testing.T) {
+	objects := clusterObjects(jenkinsRuntime(t, nil))
+	if objects[0]["kind"] != "Namespace" {
+		t.Errorf("first object is %v, want the namespace", objects[0]["kind"])
+	}
+	credentials := map[string]map[string]string{}
+	for _, obj := range objects {
+		if obj["kind"] != "Secret" {
+			continue
+		}
+		meta := obj["metadata"].(map[string]any)
+		if meta["namespace"] != namespace || meta["labels"].(map[string]string)["jenkins.io/credentials-type"] != "usernamePassword" {
+			t.Errorf("credential metadata %v", meta)
+		}
+		data := map[string]string{}
+		if plain, ok := obj["stringData"].(map[string]string); ok {
+			data = plain
+		}
+		if encoded, ok := obj["data"].(map[string]string); ok {
+			for k, v := range encoded {
+				raw, _ := base64.StdEncoding.DecodeString(v)
+				data[k] = string(raw)
+			}
+		}
+		credentials[meta["name"].(string)] = data
+	}
+	if len(credentials) != 2 ||
+		credentials["github-pat"]["username"] != "acme" || credentials["github-pat"]["password"] != "gh-token-value" ||
+		credentials["registry"]["username"] != "robot$ownstack-ci" || credentials["registry"]["password"] != "robot-pw" {
+		t.Errorf("credentials = %v", credentials)
+	}
+}
+
+func TestOrgFolderXML(t *testing.T) {
+	out, err := stack.Render(orgFolderTmpl, map[string]string{
+		"Owner": "acme", "APIURL": "https://api.github.com", "CredentialID": "github-pat", "Repos": "app <&>",
+		"JenkinsfilePath": "infrastructure/Jenkinsfile", "TriggerBranches": "main",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Jenkins writes XML 1.1, which encoding/xml refuses; the body is 1.0-compatible.
+	body := out[strings.Index(out, "?>")+2:]
+	dec := xml.NewDecoder(strings.NewReader(body))
+	for {
+		if _, err := dec.Token(); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("invalid XML: %v", err)
+		}
+	}
+	if !strings.Contains(out, "<repoOwner>acme</repoOwner>") || !strings.Contains(out, "<includes>app &lt;&amp;&gt;</includes>") {
+		t.Errorf("unexpected XML:\n%s", out)
+	}
+	// Fork pull requests run outside code on agents with the host Docker
+	// socket and a cluster-admin service account; they must not be discovered.
+	if strings.Contains(out, "ForkPullRequestDiscoveryTrait") {
+		t.Error("org folder must not discover fork pull requests")
+	}
+}
+
+// The organization folder builds the demo repo and the listed repos, and
+// builds every environment's branch automatically. Java matches the trigger
+// expression against the whole branch name, so it is checked anchored here.
+func TestOrgFolderData(t *testing.T) {
+	data := orgFolderData(jenkinsRuntime(t, map[string]string{"repos": " api  web Lumen-Yard api "}, "prod=main", "dev=develop", "qa=release/*", "preview", "rc=v1.*-rc"))
+	if data["Repos"] != "lumen-yard api web" || data["JenkinsfilePath"] != "infrastructure/Jenkinsfile" || data["CredentialID"] != "github-pat" {
+		t.Errorf("folder data = %v", data)
+	}
+	got := data["TriggerBranches"]
+	if got != `main|develop|release/.*|v1\..*-rc` {
+		t.Fatalf("branches = %q", got)
+	}
+	re := regexp.MustCompile(`^(?:` + got + `)$`)
+	for branch, want := range map[string]bool{
+		"main": true, "develop": true, "release/1.0": true, "release/a/b": true, "release/": true, "v1.2-rc": true, "v1.2/x-rc": true,
+		"mainx": false, "xmain": false, "develop2": false, "release": false, "feature/x": false, "v1x2-rc": false, "PR-1": false, "preview": false,
+	} {
+		if re.MatchString(branch) != want {
+			t.Errorf("trigger expression %q matches %q: %v, want %v", got, branch, !want, want)
+		}
+	}
+	if g := globRegexp("*"); g != ".*" {
+		t.Errorf("globRegexp(*) = %q", g)
+	}
+	rt := jenkinsRuntime(t, nil, "prod=release/1.0")
+	rt.Out.VCS.DemoRepo = ""
+	if data := orgFolderData(rt); data["Repos"] != "" || data["TriggerBranches"] != `release/1\.0` {
+		t.Errorf("without repos: %v", data)
+	}
+	param, _ := Spec.Param("repos")
+	for value, ok := range map[string]bool{"api": true, " api web ": true, "my.app_x": true, "acme/api": false, "app-*": false, "a,b": false} {
+		if param.MatchesPattern(value) != ok {
+			t.Errorf("repos %q accepted: %v", value, !ok)
+		}
+	}
 }
 
 // jenkinsStored is how Jenkins keeps a folder ownstackctl created: XML 1.1,
@@ -369,7 +375,7 @@ const jenkinsStored = `<?xml version='1.1' encoding='UTF-8'?>
       <credentialsId>github-pat</credentialsId>
       <traits>
         <jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait plugin="scm-api@704.v3ce5c542825a_">
-          <includes>app-*   api-*
+          <includes>lumen-yard   api
           </includes>
           <excludes></excludes>
         </jenkins.scm.impl.trait.WildcardSCMSourceFilterTrait>
@@ -386,23 +392,25 @@ const jenkinsStored = `<?xml version='1.1' encoding='UTF-8'?>
   </projectFactories>
 </jenkins.branch.OrganizationFolder>`
 
-func TestFolderChanges(t *testing.T) {
-	desired := func(settings string, environments ...string) string {
-		out, err := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, settings, environments...)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return out
+func renderFolder(t *testing.T, repos string, environments ...string) string {
+	t.Helper()
+	out, err := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, map[string]string{"repos": repos}, environments...)))
+	if err != nil {
+		t.Fatal(err)
 	}
-	same := desired("      repoFilter: app-* api-*\n", "prod=main")
+	return out
+}
+
+func TestFolderChanges(t *testing.T) {
+	same := renderFolder(t, "api", "prod=main")
 	if changes, ok, err := folderChanges(same, same); err != nil || !ok || len(changes) != 0 {
 		t.Errorf("rendered folder against itself: %v %v %v", changes, ok, err)
 	}
 	if changes, ok, err := folderChanges(jenkinsStored, same); err != nil || !ok || len(changes) != 0 {
 		t.Errorf("stored folder with the same managed fields: %v %v %v", changes, ok, err)
 	}
-	changes, ok, err := folderChanges(jenkinsStored, desired("      repoFilter: \"*\"\n", "prod=trunk"))
-	if err != nil || !ok || strings.Join(changes, ", ") != `repository filter "app-* api-*" → "*", auto-build branches "main" → "trunk"` {
+	changes, ok, err := folderChanges(jenkinsStored, renderFolder(t, "", "prod=trunk"))
+	if err != nil || !ok || strings.Join(changes, ", ") != `repositories "lumen-yard api" → "lumen-yard", auto-build branches "main" → "trunk"` {
 		t.Errorf("changes = %v %v %v", changes, ok, err)
 	}
 	if _, ok, err := folderChanges(`<?xml version='1.1' encoding='UTF-8'?><com.cloudbees.hudson.plugins.folder.Folder/>`, same); ok || err != nil {
@@ -413,8 +421,8 @@ func TestFolderChanges(t *testing.T) {
 	}
 }
 
-// fakeJenkins answers the crumb issuer and one folder's config.xml, and
-// records posts.
+// fakeJenkins answers the API, the crumb issuer, and one folder's
+// config.xml, and records posts.
 type fakeJenkins struct {
 	mu     sync.Mutex
 	config string
@@ -425,6 +433,8 @@ func (f *fakeJenkins) handler(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch {
+	case r.URL.Path == "/api/json":
+		w.Write([]byte(`{}`))
 	case r.URL.Path == "/crumbIssuer/api/json":
 		w.Write([]byte(`{"crumb":"c","crumbRequestField":"Jenkins-Crumb"}`))
 	case r.URL.Path == "/job/Repositories/config.xml" && r.Method == http.MethodGet:
@@ -439,42 +449,158 @@ func (f *fakeJenkins) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
-		f.posts = append(f.posts, r.URL.Path+" "+string(body))
+		f.posts = append(f.posts, r.URL.RequestURI()+" "+string(body))
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func TestConvergeFolderPostsOnlyOnDrift(t *testing.T) {
+func TestApplyFolderPostsOnlyOnDrift(t *testing.T) {
 	jenkins := &fakeJenkins{config: jenkinsStored}
 	srv := httptest.NewServer(http.HandlerFunc(jenkins.handler))
 	defer srv.Close()
 	api := &client{base: srv.URL, password: "pw", http: srv.Client()}
-	rt, out := providertest.Runtime(t, Spec)
 	ctx := context.Background()
 
-	unchanged, _ := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "      repoFilter: app-* api-*\n", "prod=main")))
-	if err := convergeFolder(ctx, rt, api, "Repositories", jenkins.config, unchanged); err != nil {
+	rt := jenkinsRuntime(t, map[string]string{"repos": "api"}, "prod=main")
+	if err := applyFolder(ctx, rt, api); err != nil {
 		t.Fatal(err)
 	}
 	if len(jenkins.posts) != 0 {
 		t.Errorf("posted without drift: %v", jenkins.posts)
 	}
 
-	changed, _ := stack.Render(orgFolderTmpl, orgFolderData(jenkinsRuntime(t, "", "prod=main")))
-	if err := convergeFolder(ctx, rt, api, "Repositories", jenkins.config, changed); err != nil {
+	rt, out := jenkinsRuntimeOut(t, map[string]string{"repos": "api web"}, "prod=main")
+	if err := applyFolder(ctx, rt, api); err != nil {
 		t.Fatal(err)
 	}
-	if len(jenkins.posts) != 1 || !strings.HasPrefix(jenkins.posts[0], "/job/Repositories/config.xml <?xml") || !strings.Contains(jenkins.posts[0], "<includes>*</includes>") {
+	if len(jenkins.posts) != 1 || !strings.HasPrefix(jenkins.posts[0], "/job/Repositories/config.xml <?xml") || !strings.Contains(jenkins.posts[0], "<includes>lumen-yard api web</includes>") {
 		t.Errorf("posts = %v", jenkins.posts)
 	}
-	if !strings.Contains(out.String(), `Repositories updated: repository filter "app-* api-*" → "*"`) {
-		t.Errorf("log:\n%s", out.String())
+	if !strings.Contains(out.String(), `Repositories updated: repositories "lumen-yard api" → "lumen-yard api web"`) {
+		t.Errorf("log:\n%s", out)
+	}
+
+	jenkins.config, jenkins.posts = "", nil
+	if err := applyFolder(ctx, rt, api); err != nil {
+		t.Fatal(err)
+	}
+	if len(jenkins.posts) != 1 || !strings.HasPrefix(jenkins.posts[0], "/createItem?name=Repositories <?xml") {
+		t.Errorf("posts = %v", jenkins.posts)
 	}
 }
 
-func TestRegistryCredentialEscapesDollar(t *testing.T) {
-	if got := shellEscapeDollar("robot$ownstack-ci"); got != `robot\$ownstack-ci` {
-		t.Errorf("escaped = %q", got)
+// The stubs record events in $STUB/events. Docker's install (bash, since
+// docker is not on PATH) and the Helm release each start, then wait for the
+// other to have started before they finish: run one after the other, the
+// first gives up after 3 seconds. With $HELM_FAIL the release fails as soon
+// as it starts, and the install takes a moment longer to finish.
+const (
+	waitForStub = `wait_for() {
+  i=0
+  while [ ! -f "$STUB/$1" ]; do
+    i=$((i + 1)); [ $i -lt 300 ] || exit 1
+    /bin/sleep 0.01
+  done
+}
+`
+	kubectlStub = `#!/bin/sh
+echo "kubectl $*" >> "$STUB/events"
+case "$1" in
+  apply) while read -r line; do :; done ;;
+  *) exit 1 ;;
+esac
+`
+	helmStub = `#!/bin/sh
+` + waitForStub + `case "$1" in
+  upgrade) echo "helm upgrade started" >> "$STUB/events"; : > "$STUB/helm-started"
+    [ -z "$HELM_FAIL" ] || exit 1
+    wait_for docker-started; echo "helm upgrade done" >> "$STUB/events" ;;
+  pull) while [ $# -gt 0 ]; do if [ "$1" = --destination ]; then : > "$2/jenkins.tgz"; fi; shift; done ;;
+  *) exit 1 ;;
+esac
+`
+	bashStub = `#!/bin/sh
+` + waitForStub + `while read -r line; do :; done
+echo "docker install started" >> "$STUB/events"; : > "$STUB/docker-started"
+wait_for helm-started; [ -z "$HELM_FAIL" ] || /bin/sleep 0.5
+echo "docker install done" >> "$STUB/events"
+`
+)
+
+// applyWithStubs runs Apply against the kubectl, helm, and bash stubs and a
+// fake Jenkins API, and returns the stubs' events, the API's posts, the
+// log, and Apply's error.
+func applyWithStubs(t *testing.T, helmFail bool) (events, posts []string, out *bytes.Buffer, err error) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stubs")
+	}
+	stub := t.TempDir()
+	for name, script := range map[string]string{"kubectl": kubectlStub, "helm": helmStub, "bash": bashStub} {
+		if err := os.WriteFile(filepath.Join(stub, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the stubs: a docker binary on the test machine must not skip the
+	// install.
+	t.Setenv("PATH", stub)
+	t.Setenv("STUB", stub)
+	t.Setenv("OWNSTACK_DIR", t.TempDir())
+	t.Setenv("HELM_FAIL", "")
+	if helmFail {
+		t.Setenv("HELM_FAIL", "1")
+	}
+
+	jenkins := &fakeJenkins{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(jenkins.handler))
+	defer srv.Close()
+	rt, out := jenkinsRuntimeOut(t, map[string]string{"repos": "api"})
+	// Every Jenkins request reaches the fake, whatever its host.
+	transport := srv.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	rt.ServiceHTTP = &http.Client{Transport: transport}
+
+	err = (Provider{}).Apply(context.Background(), rt)
+	data, readErr := os.ReadFile(filepath.Join(stub, "events"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	jenkins.mu.Lock()
+	defer jenkins.mu.Unlock()
+	return strings.Split(strings.TrimSpace(string(data)), "\n"), jenkins.posts, out, err
+}
+
+func TestApplyInstallsDockerAlongsideTheRelease(t *testing.T) {
+	events, posts, out, err := applyWithStubs(t, false)
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	if !strings.HasPrefix(events[0], "kubectl apply") || !slices.Contains(events, "helm upgrade done") || !slices.Contains(events, "docker install done") {
+		t.Errorf("events:\n%s", strings.Join(events, "\n"))
+	}
+	if len(posts) != 2 || !strings.HasPrefix(posts[0], "/createItem?name=Repositories ") || !strings.HasPrefix(posts[1], "/job/Repositories/build ") {
+		t.Errorf("posts = %v", posts)
+	}
+	if !strings.Contains(out.String(), "Jenkins scanning acme/{lumen-yard,api}") {
+		t.Errorf("log:\n%s", out)
+	}
+}
+
+// A failed release fails apply, but only after the Docker install finished:
+// killing apt halfway would leave dpkg broken on the server.
+func TestFailedReleaseLetsDockerInstallFinish(t *testing.T) {
+	events, posts, out, err := applyWithStubs(t, true)
+	if err == nil || !strings.Contains(err.Error(), "helm") {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	if !slices.Contains(events, "docker install done") {
+		t.Errorf("the Docker install was cut short:\n%s", strings.Join(events, "\n"))
+	}
+	if len(posts) != 0 {
+		t.Errorf("configured Jenkins after a failed release: %v", posts)
 	}
 }

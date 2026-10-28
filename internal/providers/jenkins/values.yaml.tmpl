@@ -45,8 +45,8 @@ controller:
         unclassified:
           globalLibraries:
             libraries:
-              # The public Ownstack repository at the stack's library ref: a
-              # release tag (ownstackctl-v*), or a branch.
+              # The public Ownstack repository at the tag of the release that
+              # applied the stack (ownstackctl-v*), or main for development builds.
               - defaultVersion: {{ printf "%q" .LibraryRef }}
                 implicit: true
                 name: "jenkins_pipeline_library"

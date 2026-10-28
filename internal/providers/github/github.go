@@ -1,35 +1,29 @@
-// Package github implements the VCS contract with GitHub. It also bootstraps
-// the customer-owned cluster repo: a private repo that holds ownstack.yaml
-// (and a short README.md), created when missing.
+// Package github implements the VCS contract with GitHub. It also keeps the
+// customer's cluster repo: a private repo that mirrors the applied
+// ownstack.yaml, with a short README.md.
 package github
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/githubapi"
+	"github.com/getownstack/ownstack/internal/manifest"
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // Spec is the github provider's catalog entry.
 var Spec = catalog.Provider{
 	ID: "github", Aspect: "vcs", Name: "GitHub", Mono: "GH", Hosting: catalog.External,
-	Summary: "Repositories on GitHub. ownstackctl creates a private cluster repo for ownstack.yaml in your account.",
+	Summary: "Repositories on GitHub. ownstackctl keeps a private ownstack-cluster repo in your account with the applied ownstack.yaml.",
 	Params: []catalog.Param{
 		{Key: "owner", Label: "Owner", Kind: catalog.KindString, Required: true, Placeholder: "your-user-or-org",
 			Help: "GitHub user or organization that owns the cluster and application repos."},
 		{Key: "token", Label: "Access token", Kind: catalog.KindSecret, Required: true, Env: "GITHUB_TOKEN",
 			Help:    "Classic token with the repo and workflow scopes (pre-selected by the link).",
 			HelpURL: "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Ownstack"},
-		{Key: "clusterRepo", Label: "Cluster repo", Kind: catalog.KindString, Default: "ownstack-cluster",
-			Help: "Private repo that holds ownstack.yaml, created when missing. An existing repo is reused."},
 		{Key: "demoApp", Label: "Create demo app repo", Kind: catalog.KindBool, Default: "true", Advanced: true,
 			Help: "Generate the Lumen Yard demo app so the first pipeline run has something to deploy."},
 	},
@@ -40,6 +34,8 @@ const (
 	demoTemplate = "getownstack/lumen-yard"
 	demoRepo     = "lumen-yard"
 
+	// clusterRepo mirrors the applied ownstack.yaml.
+	clusterRepo        = "ownstack-cluster"
 	clusterDescription = "Ownstack stack definition (ownstack.yaml)"
 	readmePath         = "README.md"
 )
@@ -57,13 +53,12 @@ func (p Provider) api() string {
 }
 
 func (p Provider) Resolve(_ context.Context, rt *stack.Runtime) error {
-	owner, repo := rt.Setting("owner"), rt.Setting("clusterRepo")
+	owner := rt.Setting("owner")
 	out := &stack.VCSOutput{
 		Kind:           "github",
 		Owner:          owner,
 		APIURL:         p.api(),
-		ClusterRepo:    repo,
-		ClusterRepoURL: fmt.Sprintf("https://github.com/%s/%s.git", owner, repo),
+		ClusterRepoURL: fmt.Sprintf("https://github.com/%s/%s", owner, clusterRepo),
 		Username:       owner,
 	}
 	if rt.SettingBool("demoApp") {
@@ -90,7 +85,7 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}
 	rt.Out.VCS.Username = login
 	rt.Logf("GitHub: authenticated as %s", login)
-	if err := ensureClusterRepo(ctx, rt, c, login); err != nil {
+	if err := mirror(ctx, rt, c, login); err != nil {
 		return err
 	}
 	if demo := rt.Out.VCS.DemoRepo; demo != "" {
@@ -99,59 +94,52 @@ func (p Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	return nil
 }
 
-// ensureClusterRepo makes the cluster repo exist: a private plain repo with
-// README.md, created when missing. An existing repo is reused, including
-// ones generated from the former cluster template.
-func ensureClusterRepo(ctx context.Context, rt *stack.Runtime, c *githubapi.Client, login string) error {
-	owner, name := rt.Out.VCS.Owner, rt.Out.VCS.ClusterRepo
-	created := false
-	info, err := c.Repo(ctx, owner, name)
-	if err == nil {
-		rt.Logf("GitHub: %s/%s exists", owner, name)
-	} else {
-		if err := c.CreateRepo(ctx, rt, login, owner, name, clusterDescription); err != nil {
-			return err
-		}
-		created = true
-		if info, err = c.Repo(ctx, owner, name); err != nil {
-			return err
-		}
+// mirror commits the applied ownstack.yaml to the cluster repo, creating the
+// repo (private, with a README.md) when it is missing. The server holds the
+// stack; the repo keeps its history. A README the repo has stays.
+func mirror(ctx context.Context, rt *stack.Runtime, c *githubapi.Client, login string) error {
+	owner := rt.Out.VCS.Owner
+	_, err := c.Repo(ctx, owner, clusterRepo)
+	created := errors.Is(err, githubapi.ErrNotFound)
+	if created {
+		err = c.CreateRepo(ctx, rt, login, owner, clusterRepo, clusterDescription)
 	}
-	current, sha, err := c.File(ctx, owner, name, info.DefaultBranch, readmePath)
 	if err != nil {
 		return err
 	}
-	// A README the repo already has (the former template's, or the
-	// customer's own) stays. GitHub's placeholder from creation is replaced,
-	// also when an earlier run stopped before replacing it.
-	if sha != "" && !created && !placeholderReadme(current, name) {
-		return nil
+	// A new repo is empty: this first commit creates its default branch.
+	sha := ""
+	if !created {
+		if _, sha, err = c.File(ctx, owner, clusterRepo, "", readmePath); err != nil {
+			return err
+		}
 	}
-	if err := c.PutFile(ctx, rt, owner, name, info.DefaultBranch, readmePath, clusterReadme(name), sha, "Add README.md"); err != nil {
+	if sha == "" {
+		if err := c.PutFile(ctx, rt, owner, clusterRepo, "", readmePath, clusterReadme(), "", "Add README.md"); err != nil {
+			return err
+		}
+	}
+	changed, err := c.UpsertFile(ctx, rt, owner, clusterRepo, "", manifest.FileName, rt.ManifestFile(), "Update ownstack.yaml")
+	if err != nil {
 		return err
 	}
-	rt.Logf("GitHub: committed %s to %s/%s", readmePath, owner, name)
+	if changed {
+		rt.Logf("GitHub: committed ownstack.yaml to %s/%s", owner, clusterRepo)
+	} else {
+		rt.Logf("GitHub: ownstack.yaml in %s/%s is up to date", owner, clusterRepo)
+	}
 	return nil
 }
 
 // clusterReadme is the README.md of a new cluster repo.
-func clusterReadme(name string) []byte {
-	return []byte("# " + name + "\n\n" +
+func clusterReadme() []byte {
+	return []byte("# " + clusterRepo + "\n\n" +
 		"The stack definition of an Ownstack server. `ownstack.yaml` describes the stack: its domain, registry, CI, and environments. " +
 		"Secrets are not stored here; they stay on the server.\n\n" +
-		"To change the stack, edit `ownstack.yaml`, commit it, and run `ownstackctl apply` in `/root/ownstack-cluster` on the server " +
-		"(`git pull` there first when you committed elsewhere).\n\n" +
+		"The server keeps the applied manifest at `/etc/ownstack/ownstack.yaml`, and every `ownstackctl apply` commits it here, " +
+		"so this history is the stack's history. To change the stack, edit the file on the server (or copy your edit there) and run " +
+		"`ownstackctl apply`; an edit made only here is replaced by the next apply.\n\n" +
 		"Documentation: https://github.com/getownstack/ownstack\n")
-}
-
-// placeholderReadme reports whether content is the README GitHub writes for
-// a repo it initializes: a "# <name>" heading, perhaps with the description.
-func placeholderReadme(content []byte, name string) bool {
-	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-	if strings.TrimSpace(lines[0]) != "# "+name || len(lines) > 2 {
-		return false
-	}
-	return len(lines) == 1 || strings.TrimSpace(lines[1]) == clusterDescription
 }
 
 func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
@@ -164,65 +152,12 @@ func (p Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 		return []stack.Check{{Name: "token", State: stack.Fail, Detail: err.Error()}}
 	}
 	checks := []stack.Check{{Name: "token", State: stack.OK, Detail: "authenticated as " + login}}
-	repo := rt.Setting("clusterRepo")
-	if info, err := c.Repo(ctx, rt.Out.VCS.Owner, repo); err != nil {
+	if info, err := c.Repo(ctx, rt.Out.VCS.Owner, clusterRepo); err != nil {
 		checks = append(checks, stack.Check{Name: "cluster repo", State: stack.Fail, Detail: err.Error()})
 	} else {
 		checks = append(checks, stack.Check{Name: "cluster repo", State: stack.OK, Detail: info.FullName + visibility(info.Private)})
 	}
 	return checks
-}
-
-// Bootstrap makes the cluster repo exist, commits the manifest to it, and
-// checks it out in dir. It is the first half of `ownstackctl up`.
-func (p Provider) Bootstrap(ctx context.Context, rt *stack.Runtime, manifestYAML []byte, dir string) error {
-	if err := p.Apply(ctx, rt); err != nil {
-		return err
-	}
-	c := p.client(rt)
-	owner, repo := rt.Out.VCS.Owner, rt.Setting("clusterRepo")
-	info, err := c.Repo(ctx, owner, repo)
-	if err != nil {
-		return err
-	}
-	changed, err := c.UpsertFile(ctx, rt, owner, repo, info.DefaultBranch, "ownstack.yaml", manifestYAML, "Update ownstack.yaml")
-	if err != nil {
-		return err
-	}
-	if changed {
-		rt.Logf("GitHub: committed ownstack.yaml to %s/%s", owner, repo)
-	} else {
-		rt.Logf("GitHub: ownstack.yaml in %s/%s is up to date", owner, repo)
-	}
-	return p.checkout(ctx, rt, info.DefaultBranch, dir, manifestYAML)
-}
-
-func (p Provider) checkout(ctx context.Context, rt *stack.Runtime, branch, dir string, manifestYAML []byte) error {
-	auth := base64.StdEncoding.EncodeToString([]byte(rt.Out.VCS.Username + ":" + rt.Out.VCS.Token))
-	git := &stack.Exec{Console: rt.Console, Env: []string{
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Basic " + auth,
-	}}
-	rt.Console.Redact(auth)
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		// `up -f` on the checkout's own ownstack.yaml has just committed that
-		// edit; the identical local copy would otherwise block the pull.
-		local := filepath.Join(dir, "ownstack.yaml")
-		if data, err := os.ReadFile(local); err == nil && bytes.Equal(data, manifestYAML) {
-			_ = git.Run(ctx, "git", "-C", dir, "checkout", "--", "ownstack.yaml")
-		}
-		rt.Logf("Updating %s", dir)
-		return stack.Retry(ctx, rt.Console, "git pull", 3, 10*time.Second, func() error {
-			return git.Run(ctx, "git", "-C", dir, "pull", "--ff-only", "origin", branch)
-		})
-	}
-	rt.Logf("Cloning %s into %s", rt.Out.VCS.ClusterRepoURL, dir)
-	return stack.Retry(ctx, rt.Console, "git clone", 5, 10*time.Second, func() error {
-		_ = os.RemoveAll(dir)
-		return git.Run(ctx, "git", "clone", "--branch", branch, rt.Out.VCS.ClusterRepoURL, dir)
-	})
 }
 
 func visibility(private bool) string {

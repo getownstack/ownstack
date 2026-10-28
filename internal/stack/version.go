@@ -28,21 +28,11 @@ func ReleaseTag(version string) string {
 }
 
 // LibraryRef is the LibraryRepo ref app pipelines take the libraries from:
-// setting (a CI provider's libraryRef) when it is set, else the tag of the
-// ownstackctl release version, so a stack's libraries only change when a
-// newer release applies it. Development builds use main.
-func LibraryRef(setting, version string) string {
-	if setting != "" {
-		return setting
-	}
+// the tag of the ownstackctl release version, so a stack's libraries only
+// change when a newer release applies it. Development builds use main.
+func LibraryRef(version string) string {
 	if tag := ReleaseTag(version); tag != "" {
 		return tag
 	}
 	return "main"
-}
-
-// LibraryRef is the effective library ref of the running ownstackctl for
-// this aspect's libraryRef setting.
-func (rt *Runtime) LibraryRef() string {
-	return LibraryRef(rt.Setting("libraryRef"), EngineVersion)
 }

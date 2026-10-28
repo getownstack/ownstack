@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -19,7 +16,7 @@ import (
 )
 
 func TestUpsertFileSkipsIdenticalContent(t *testing.T) {
-	stored := []byte("apiVersion: ownstack.io/v1\n")
+	stored := []byte("apiVersion: ownstack.io/v2\n")
 	puts := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer gh-token-value" {
@@ -49,7 +46,7 @@ func TestUpsertFileSkipsIdenticalContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := p.client(rt)
-	changed, err := c.UpsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("apiVersion: ownstack.io/v1\n"), "msg")
+	changed, err := c.UpsertFile(context.Background(), rt, "acme", "ownstack-cluster", "main", "ownstack.yaml", []byte("apiVersion: ownstack.io/v2\n"), "msg")
 	if err != nil || changed || puts != 0 {
 		t.Fatalf("identical content: changed=%v puts=%d err=%v", changed, puts, err)
 	}
@@ -65,7 +62,7 @@ func TestResolveOutputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	vcs := rt.Out.VCS
-	if vcs.ClusterRepoURL != "https://github.com/acme/ownstack-cluster.git" || vcs.Token != "gh-token-value" {
+	if vcs.ClusterRepoURL != "https://github.com/acme/ownstack-cluster" || vcs.Token != "gh-token-value" || vcs.DemoRepo != "lumen-yard" {
 		t.Errorf("outputs = %+v", vcs)
 	}
 }
@@ -119,10 +116,6 @@ func (g *fakeGitHub) serve(t *testing.T) *httptest.Server {
 				return
 			}
 			repo := &fakeRepo{private: body["private"] == true, files: map[string]string{}}
-			if body["auto_init"] == true {
-				// GitHub's own README for an initialized repo.
-				repo.files["README.md"] = "# " + name + "\n" + body["description"].(string)
-			}
 			g.repos[key] = repo
 			w.WriteHeader(http.StatusCreated)
 		}
@@ -156,7 +149,7 @@ func (g *fakeGitHub) serve(t *testing.T) *httptest.Server {
 				path := parts[4]
 				content, ok := repo.files[path]
 				if r.Method == http.MethodGet {
-					if !ok || r.URL.Query().Get("ref") != "main" {
+					if ref := r.URL.Query().Get("ref"); !ok || (ref != "" && ref != "main") {
 						http.NotFound(w, r)
 						return
 					}
@@ -164,7 +157,8 @@ func (g *fakeGitHub) serve(t *testing.T) *httptest.Server {
 					return
 				}
 				// PUT replaces a file only with its current sha.
-				if sha, _ := body["sha"].(string); (ok && sha != "sha-"+content) || (!ok && sha != "") || body["branch"] != "main" {
+				branch, _ := body["branch"].(string)
+				if sha, _ := body["sha"].(string); (ok && sha != "sha-"+content) || (!ok && sha != "") || (branch != "" && branch != "main") {
 					w.WriteHeader(http.StatusConflict)
 					return
 				}
@@ -188,48 +182,29 @@ func (g *fakeGitHub) got() []string {
 	return slices.Clone(g.requests)
 }
 
-// stubGit puts a git on PATH that records its arguments, so Bootstrap's
-// checkout runs without the network.
-func stubGit(t *testing.T) (calls func() []string) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("shell stubs")
-	}
-	dir := t.TempDir()
-	log := filepath.Join(dir, "calls")
-	stub := "#!/bin/sh\necho \"$*\" >> " + log + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	return func() []string {
-		data, _ := os.ReadFile(log)
-		return strings.Split(strings.TrimSpace(string(data)), "\n")
-	}
-}
-
-// bootstrap runs Bootstrap against gh for the test stack (owner acme).
-func bootstrap(t *testing.T, gh *fakeGitHub, manifestYAML string) (*stack.Runtime, error) {
+// apply runs the vcs stage against gh for the test stack (owner acme),
+// whose applied manifest is manifestYAML.
+func apply(t *testing.T, gh *fakeGitHub, manifestYAML string) (*stack.Runtime, error) {
 	t.Helper()
 	srv := gh.serve(t)
 	rt, _ := providertest.Runtime(t, Spec)
+	rt.Manifest.Source = []byte(manifestYAML)
 	rt = rt.For("vcs")
 	p := Provider{APIURL: srv.URL}
 	if err := p.Resolve(context.Background(), rt); err != nil {
 		t.Fatal(err)
 	}
-	return rt, p.Bootstrap(context.Background(), rt, []byte(manifestYAML), filepath.Join(t.TempDir(), "ownstack-cluster"))
+	return rt, p.Apply(context.Background(), rt)
 }
 
-const testManifest = "apiVersion: ownstack.io/v1\nkind: Stack\n"
+const testManifest = "apiVersion: ownstack.io/v2\ndomain: example.com\n"
 
-// A missing cluster repo is created as a private plain repo of the
-// authenticated user, then gets README.md and ownstack.yaml, and is cloned.
-// Nothing is generated from a template except the demo app.
-func TestBootstrapCreatesUserClusterRepo(t *testing.T) {
-	calls := stubGit(t)
+// A missing cluster repo is created empty and private for the authenticated
+// user; its first commit is README.md, then the applied ownstack.yaml is
+// committed. Nothing is generated from a template except the demo app.
+func TestApplyCreatesUserClusterRepo(t *testing.T) {
 	gh := newFakeGitHub("Acme") // logins are case-insensitive
-	if _, err := bootstrap(t, gh, testManifest); err != nil {
+	if _, err := apply(t, gh, testManifest); err != nil {
 		t.Fatal(err)
 	}
 	requests := gh.got()
@@ -237,8 +212,16 @@ func TestBootstrapCreatesUserClusterRepo(t *testing.T) {
 		t.Fatalf("requests: %v", requests)
 	}
 	body := gh.bodies["POST /user/repos"]
-	if body["name"] != "ownstack-cluster" || body["private"] != true || body["auto_init"] != true {
+	if body["name"] != "ownstack-cluster" || body["private"] != true || body["auto_init"] != false {
 		t.Errorf("create body = %v", body)
+	}
+	if put := gh.bodies["PUT /repos/acme/ownstack-cluster/contents/README.md"]; put["branch"] != nil {
+		t.Errorf("the first commit to an empty repo names a branch: %v", put)
+	}
+	for _, r := range requests {
+		if strings.HasPrefix(r, "GET /repos/acme/ownstack-cluster/contents/README.md") {
+			t.Errorf("read README.md of a repo it just created: %v", requests)
+		}
 	}
 	repo := gh.repos["acme/ownstack-cluster"]
 	if repo == nil || !repo.private {
@@ -248,7 +231,7 @@ func TestBootstrapCreatesUserClusterRepo(t *testing.T) {
 		t.Errorf("ownstack.yaml = %q", repo.files["ownstack.yaml"])
 	}
 	readme := repo.files["README.md"]
-	for _, want := range []string{"# ownstack-cluster\n", "`ownstack.yaml`", "`ownstackctl apply`", "/root/ownstack-cluster", "https://github.com/getownstack/ownstack"} {
+	for _, want := range []string{"# ownstack-cluster\n", "`ownstack.yaml`", "`ownstackctl apply`", "/etc/ownstack/ownstack.yaml", "https://github.com/getownstack/ownstack"} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README.md does not contain %q:\n%s", want, readme)
 		}
@@ -266,18 +249,13 @@ func TestBootstrapCreatesUserClusterRepo(t *testing.T) {
 	if demo := gh.bodies["POST /repos/getownstack/lumen-yard/generate"]; demo["owner"] != "acme" || demo["name"] != "lumen-yard" || demo["private"] != true {
 		t.Errorf("demo generate body = %v", demo)
 	}
-	git := calls()
-	if len(git) != 1 || !strings.HasPrefix(git[0], "clone --branch main https://github.com/acme/ownstack-cluster.git ") {
-		t.Errorf("git calls: %v", git)
-	}
 }
 
 // An owner other than the token's user is an organization.
-func TestBootstrapCreatesOrgClusterRepo(t *testing.T) {
-	stubGit(t)
+func TestApplyCreatesOrgClusterRepo(t *testing.T) {
 	gh := newFakeGitHub("someone")
 	gh.orgs["acme"] = true
-	if _, err := bootstrap(t, gh, testManifest); err != nil {
+	if _, err := apply(t, gh, testManifest); err != nil {
 		t.Fatal(err)
 	}
 	if requests := gh.got(); !slices.Contains(requests, "POST /orgs/acme/repos") || slices.Contains(requests, "POST /user/repos") {
@@ -289,10 +267,9 @@ func TestBootstrapCreatesOrgClusterRepo(t *testing.T) {
 	}
 }
 
-func TestBootstrapExplainsAnOwnerItCannotCreateIn(t *testing.T) {
-	stubGit(t)
+func TestApplyExplainsAnOwnerItCannotCreateIn(t *testing.T) {
 	gh := newFakeGitHub("someone")
-	_, err := bootstrap(t, gh, testManifest)
+	_, err := apply(t, gh, testManifest)
 	if err == nil || !strings.Contains(err.Error(), "neither the token's user (someone) nor an organization") {
 		t.Fatalf("err = %v", err)
 	}
@@ -301,18 +278,16 @@ func TestBootstrapExplainsAnOwnerItCannotCreateIn(t *testing.T) {
 	}
 }
 
-// An existing cluster repo, such as one generated from the former cluster
-// template, is reused: its README stays, and an unchanged ownstack.yaml is
-// not committed again.
-func TestBootstrapReusesExistingClusterRepo(t *testing.T) {
-	stubGit(t)
+// An existing cluster repo is reused: its README stays, an unchanged
+// ownstack.yaml is not committed again, and a changed one is.
+func TestApplyReusesExistingClusterRepo(t *testing.T) {
 	gh := newFakeGitHub("acme")
 	gh.repos["acme/ownstack-cluster"] = &fakeRepo{private: true, files: map[string]string{
-		"README.md":     "# Ownstack cluster template\n\nThe customer's own notes.\n",
+		"README.md":     "# Our stack\n\nThe customer's own notes.\n",
 		"ownstack.yaml": testManifest,
 	}}
 	gh.repos["acme/lumen-yard"] = &fakeRepo{private: true, files: map[string]string{"README.md": "demo"}}
-	if _, err := bootstrap(t, gh, testManifest); err != nil {
+	if _, err := apply(t, gh, testManifest); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range gh.got() {
@@ -324,54 +299,28 @@ func TestBootstrapReusesExistingClusterRepo(t *testing.T) {
 		t.Errorf("README.md replaced: %q", got)
 	}
 
-	// A changed manifest is committed.
-	if _, err := bootstrap(t, gh, testManifest+"metadata: {name: acme}\n"); err != nil {
+	changed := testManifest + "vcs: {owner: acme}\n"
+	if _, err := apply(t, gh, changed); err != nil {
 		t.Fatal(err)
 	}
-	if got := gh.repos["acme/ownstack-cluster"].files["ownstack.yaml"]; got != testManifest+"metadata: {name: acme}\n" {
+	if got := gh.repos["acme/ownstack-cluster"].files["ownstack.yaml"]; got != changed {
 		t.Errorf("ownstack.yaml = %q", got)
 	}
 }
 
-// A run that stopped after creating the repo left GitHub's placeholder
-// README; the next run replaces it. A repo without a README gets one.
-func TestBootstrapCompletesClusterRepoReadme(t *testing.T) {
-	for name, files := range map[string]map[string]string{
-		"placeholder": {"README.md": "# ownstack-cluster\n" + clusterDescription},
-		"missing":     {".gitignore": "*.env\n"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			stubGit(t)
-			gh := newFakeGitHub("acme")
-			gh.repos["acme/ownstack-cluster"] = &fakeRepo{private: true, files: files}
-			if _, err := bootstrap(t, gh, testManifest); err != nil {
-				t.Fatal(err)
-			}
-			if slices.Contains(gh.got(), "POST /user/repos") {
-				t.Error("recreated an existing repo")
-			}
-			if got := gh.repos["acme/ownstack-cluster"].files["README.md"]; got != string(clusterReadme("ownstack-cluster")) {
-				t.Errorf("README.md = %q", got)
-			}
-		})
+// A repo without a README gets one, such as one an earlier run created
+// before it could commit.
+func TestApplyAddsMissingReadme(t *testing.T) {
+	gh := newFakeGitHub("acme")
+	gh.repos["acme/ownstack-cluster"] = &fakeRepo{private: true, files: map[string]string{}}
+	if _, err := apply(t, gh, testManifest); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestPlaceholderReadme(t *testing.T) {
-	for content, want := range map[string]bool{
-		"# ownstack-cluster":   true,
-		"# ownstack-cluster\n": true,
-		"# ownstack-cluster\r\n" + clusterDescription + "\r\n": true,
-		"# ownstack-cluster\n" + clusterDescription:            true,
-		"# ownstack-cluster\nOther description":                false,
-		"# ownstack-cluster\n\nMore text.\n":                   false,
-		"# Ownstack cluster template\n":                        false,
-		"":                                                     false,
-		string(clusterReadme("ownstack-cluster")):              false,
-		"# ownstack-cluster\n" + clusterDescription + "\nmore": false,
-	} {
-		if got := placeholderReadme([]byte(content), "ownstack-cluster"); got != want {
-			t.Errorf("placeholderReadme(%q) = %v, want %v", content, got, want)
-		}
+	if slices.Contains(gh.got(), "POST /user/repos") {
+		t.Error("recreated an existing repo")
+	}
+	files := gh.repos["acme/ownstack-cluster"].files
+	if files["README.md"] != string(clusterReadme()) || files["ownstack.yaml"] != testManifest {
+		t.Errorf("files = %v", files)
 	}
 }

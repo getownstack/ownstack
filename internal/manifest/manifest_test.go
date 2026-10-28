@@ -1,8 +1,10 @@
 package manifest_test
 
 import (
+	"flag"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,36 +12,14 @@ import (
 	"github.com/getownstack/ownstack/internal/providers"
 )
 
-const valid = `
-apiVersion: ownstack.io/v1
-kind: Stack
-metadata:
-  name: acme
-spec:
-  domain: example.com
-  compute:
-    provider: own-vps
-    settings:
-      host: 203.0.113.10
-  dns:
-    provider: cloudflare
-    secrets:
-      apiToken: env:CF_TOKEN
-  ingress:
-    provider: traefik
-    settings:
-      acmeEmail: ops@example.com
-  vcs:
-    provider: github
-    settings:
-      owner: acme
-      demoApp: false
-  images:
-    provider: harbor
-  cicd:
-    provider: jenkins
-    settings:
-      repoFilter: "*"
+var update = flag.Bool("update", false, "rewrite testdata/marshal.golden.yaml")
+
+// starter is a complete Starter stack: everything else is a default.
+const starter = `apiVersion: ownstack.io/v2
+domain: example.com
+compute: {host: 203.0.113.10}
+ingress: {acmeEmail: ops@example.com}
+vcs: {owner: acme}
 `
 
 func parse(t *testing.T, src string) *manifest.Manifest {
@@ -51,24 +31,40 @@ func parse(t *testing.T, src string) *manifest.Manifest {
 	return m
 }
 
-func TestValidManifest(t *testing.T) {
+func paths(issues []manifest.Issue) []string {
+	var out []string
+	for _, issue := range issues {
+		out = append(out, issue.Path)
+	}
+	return out
+}
+
+func TestStarterDefaults(t *testing.T) {
 	cat := providers.Catalog()
-	m := parse(t, valid)
+	m := parse(t, starter)
 	if issues := m.Validate(cat); len(issues) > 0 {
 		t.Fatalf("unexpected issues: %v", issues)
 	}
-	settings := m.Settings(cat, "cicd")
-	if settings["host"] != "jenkins.admin.example.com" || settings["orgFolder"] != "Repositories" || settings["repoFilter"] != "*" {
-		t.Errorf("defaults not applied: %v", settings)
+	for aspect, want := range map[string]string{"compute": "own-vps", "dns": "cloudflare", "ingress": "traefik", "vcs": "github", "images": "zot", "cicd": "gh-actions"} {
+		if got := m.Provider(cat, aspect); got != want {
+			t.Errorf("%s provider = %s, want %s", aspect, got, want)
+		}
 	}
-	if got := m.SecretRef(cat, "dns", "apiToken"); got != "env:CF_TOKEN" {
-		t.Errorf("explicit ref = %q", got)
+	if got := m.Settings(cat, "compute"); got["host"] != "203.0.113.10" || got["swapGiB"] != "2" {
+		t.Errorf("compute settings = %v", got)
 	}
-	if got := m.SecretRef(cat, "vcs", "token"); got != "env:GITHUB_TOKEN" {
-		t.Errorf("conventional ref = %q", got)
+	if m.AdminDomain() != "admin.example.com" || len(m.EnvironmentList()) != 3 {
+		t.Errorf("admin domain %s, environments %v", m.AdminDomain(), m.EnvironmentList())
 	}
-	if m.Settings(cat, "vcs")["demoApp"] != "false" {
-		t.Errorf("bool setting not read as string")
+	if string(m.Source) != starter {
+		t.Errorf("source = %q", m.Source)
+	}
+}
+
+func TestAdminSubdomainEmpty(t *testing.T) {
+	m := parse(t, starter+"adminSubdomain: \"\"\n")
+	if m.AdminDomain() != "example.com" {
+		t.Errorf("admin domain = %s", m.AdminDomain())
 	}
 }
 
@@ -78,81 +74,100 @@ func TestExampleManifestsAreValid(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m := parse(t, string(data))
-		if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
+		if issues := parse(t, string(data)).Validate(providers.Catalog()); len(issues) > 0 {
 			t.Errorf("examples/%s.yaml: %v", name, issues)
 		}
 		// The commented-out environments are the defaults, and valid.
-		uncommented := strings.Replace(string(data), "  # environments:", "  environments:", 1)
+		uncommented := strings.Replace(string(data), "# environments:", "environments:", 1)
 		if uncommented == string(data) {
 			t.Errorf("examples/%s.yaml does not show the environments", name)
 			continue
 		}
-		m = parse(t, uncommented)
+		m := parse(t, uncommented)
 		if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
 			t.Errorf("examples/%s.yaml uncommented: %v", name, issues)
 		}
-		if !reflect.DeepEqual(m.Spec.Environments, manifest.DefaultEnvironments) {
-			t.Errorf("examples/%s.yaml uncommented: environments = %v", name, m.Spec.Environments)
+		if !slices.Equal(m.Environments, manifest.DefaultEnvironments) {
+			t.Errorf("examples/%s.yaml uncommented: environments = %v", name, m.Environments)
 		}
 	}
 }
 
-func TestAdminSubdomainEmpty(t *testing.T) {
-	m := parse(t, strings.Replace(valid, "  domain: example.com", "  domain: example.com\n  adminSubdomain: \"\"", 1))
-	if got := m.Settings(providers.Catalog(), "cicd")["host"]; got != "jenkins.example.com" {
-		t.Errorf("host = %q", got)
+// The designer sends JSON; an empty stack names what it still needs.
+func TestJSONInput(t *testing.T) {
+	m := parse(t, `{"apiVersion":"ownstack.io/v2","domain":"example.com"}`)
+	issues := m.Validate(providers.Catalog())
+	if got := paths(issues); !slices.Equal(got, []string{"compute.host", "ingress.acmeEmail", "vcs.owner"}) {
+		t.Fatalf("issues = %v", issues)
+	}
+	if issues[0].Message != "Own VPS public IP is required" {
+		t.Errorf("message = %q", issues[0].Message)
+	}
+	m = parse(t, `{"apiVersion":"ownstack.io/v2","domain":"example.com","compute":{"host":"203.0.113.10","swapGiB":0},`+
+		`"ingress":{"acmeEmail":"ops@example.com"},"vcs":{"owner":"acme","demoApp":false},"images":{"provider":"harbor","values":{"a":1}}}`)
+	if issues := m.Validate(providers.Catalog()); len(issues) > 0 {
+		t.Fatalf("unexpected issues: %v", issues)
+	}
+	if s := m.Settings(providers.Catalog(), "vcs"); s["demoApp"] != "false" || m.Values("images")["a"] != 1 {
+		t.Errorf("vcs settings %v, images values %v", s, m.Values("images"))
 	}
 }
 
 func TestValidationIssues(t *testing.T) {
 	cases := map[string]struct {
-		from, to string
-		path     string
+		add     string // appended to starter, or a replacement "from=>to"
+		path    string
+		message string
 	}{
-		"unknown provider":   {"provider: harbor", "provider: nope", "spec.images.provider"},
-		"bad ip":             {"host: 203.0.113.10", "host: not-an-ip", "spec.compute.settings.host"},
-		"unknown setting":    {"owner: acme", "owner: acme\n      colour: blue", "spec.vcs.settings.colour"},
-		"secret in settings": {"owner: acme", "owner: acme\n      token: ghp_x", "spec.vcs.settings.token"},
-		"bad secret ref":     {"apiToken: env:CF_TOKEN", "apiToken: literal-token", "spec.dns.secrets.apiToken"},
-		"missing required":   {"acmeEmail: ops@example.com", "dashboardHost: t.example.com", "spec.ingress.settings.acmeEmail"},
-		"unknown aspect":     {"  images:", "  storage:\n    provider: x\n  images:", "spec.storage"},
-		"bad domain":         {"domain: example.com", "domain: Example", "spec.domain"},
-		"empty pull secret":  {"provider: harbor", "provider: zot\n    settings:\n      pullSecretName: \"\"", "spec.images.settings.pullSecretName"},
-		"bad pull secret":    {"provider: harbor", "provider: zot\n    settings:\n      pullSecretName: Harbor_Robot", "spec.images.settings.pullSecretName"},
-		"uppercase project":  {"provider: harbor", "provider: zot\n    settings:\n      project: Product", "spec.images.settings.project"},
-		"harbor project":     {"provider: harbor", "provider: harbor\n    settings:\n      project: apps", "spec.images.settings.project"},
-		"bad k3s version":    {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: latest", "spec.compute.settings.k3sVersion"},
-		"removed setting":    {`repoFilter: "*"`, "branches: develop=dev", "spec.cicd.settings.branches"},
-		"duplicate env":      {"domain: example.com", "domain: example.com\n  environments: [dev, prod, dev]", "spec.environments[2]"},
-		"reserved env":       {"domain: example.com", "domain: example.com\n  environments: [dev, kube-system]", "spec.environments[1]"},
-		"missing aspect":     {"  cicd:\n    provider: jenkins\n", "", "spec.cicd"},
+		"unknown provider":  {add: "cicd: {provider: woodpecker}", path: "cicd.provider", message: `unknown cicd provider "woodpecker"; use one of gh-actions, jenkins`},
+		"bad ip":            {add: "compute: {host: 203.0.113.10}=>compute: {host: not-an-ip}", path: "compute.host", message: "Own VPS public IP must be an IPv4 address"},
+		"unknown setting":   {add: "vcs: {owner: acme}=>vcs: {owner: acme, colour: blue}", path: "vcs.colour", message: `GitHub has no setting "colour"`},
+		"secret":            {add: "vcs: {owner: acme}=>vcs: {owner: acme, token: ghp_x}", path: "vcs.token", message: "GitHub access token is a secret and never goes in ownstack.yaml; set GITHUB_TOKEN on the server instead"},
+		"unknown key":       {add: "kind: Stack", path: "kind"},
+		"bad domain":        {add: "domain: example.com=>domain: Example", path: "domain"},
+		"v1":                {add: "ownstack.io/v2=>ownstack.io/v1", path: "apiVersion", message: "ownstack.io/v1 manifests are no longer read; download the manifest again from the designer"},
+		"no api version":    {add: "apiVersion: ownstack.io/v2\n=>", path: "apiVersion"},
+		"not a value":       {add: "compute: {host: 203.0.113.10}=>compute: {host: [203.0.113.10]}", path: "compute.host", message: "Own VPS host must be a single value"},
+		"not a mapping":     {add: "dns: cloudflare", path: "dns", message: "dns must be a mapping of settings, such as {provider: ...}"},
+		"values":            {add: "images: {values: [a]}", path: "images.values"},
+		"listed twice":      {add: "compute: {host: 203.0.113.10}=>compute: {host: 203.0.113.10, host: 203.0.113.11}", path: "compute.host"},
+		"bool":              {add: "vcs: {owner: acme}=>vcs: {owner: acme, demoApp: maybe}", path: "vcs.demoApp", message: "GitHub create demo app repo must be true or false"},
+		"int":               {add: "compute: {host: 203.0.113.10}=>compute: {host: 203.0.113.10, swapGiB: two}", path: "compute.swapGiB"},
+		"pattern":           {add: "images: {keepTags: -1}", path: "images.keepTags"},
+		"email":             {add: "ops@example.com=>Ops <ops@example.com>", path: "ingress.acmeEmail"},
+		"admin subdomain":   {add: "adminSubdomain: Admin", path: "adminSubdomain"},
+		"duplicate env":     {add: "environments: [dev, prod, dev]", path: "environments[2]"},
+		"reserved env":      {add: "environments: [dev, kube-system]", path: "environments[1]"},
+		"provider settings": {add: "cicd: {provider: jenkins, repos: other-org/site}", path: "cicd.repos"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			m := parse(t, strings.Replace(valid, tc.from, tc.to, 1))
-			issues := m.Validate(providers.Catalog())
+			src := starter + tc.add + "\n"
+			if from, to, ok := strings.Cut(tc.add, "=>"); ok {
+				src = strings.Replace(starter, from, to, 1)
+			}
+			issues := parse(t, src).Validate(providers.Catalog())
 			for _, issue := range issues {
-				if issue.Path == tc.path {
+				if issue.Path == tc.path && (tc.message == "" || issue.Message == tc.message) {
 					return
 				}
 			}
-			t.Fatalf("expected issue at %s, got %v", tc.path, issues)
+			t.Fatalf("expected issue at %s (%q), got %v", tc.path, tc.message, issues)
 		})
 	}
 }
 
-func TestPatternsAccept(t *testing.T) {
-	for name, tc := range map[string]struct{ from, to string }{
-		"k3s version without v": {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: 1.33.4+k3s1"},
-		"k3s release candidate": {"host: 203.0.113.10", "host: 203.0.113.10\n      k3sVersion: v1.34.0-rc1+k3s1"},
-		"project path":          {"provider: harbor", "provider: zot\n    settings:\n      project: team/my--app\n      pullSecretName: harbor-robot"},
+// One problem is one issue: a v1 file is only told it is v1, and a wrongly
+// shaped setting is not also reported as missing.
+func TestOneIssuePerProblem(t *testing.T) {
+	for src, want := range map[string][]string{
+		"apiVersion: ownstack.io/v1\nkind: Stack\nspec: {domain: example.com}\n":                           {"apiVersion"},
+		strings.Replace(starter, "{host: 203.0.113.10}", "{host: [203.0.113.10]}", 1):                      {"compute.host"},
+		strings.Replace(starter, "{acmeEmail: ops@example.com}", "{acmeEmail: {a: b}, acmeStaging: x}", 1): {"ingress.acmeEmail", "ingress.acmeStaging"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			if issues := parse(t, strings.Replace(valid, tc.from, tc.to, 1)).Validate(providers.Catalog()); len(issues) > 0 {
-				t.Fatalf("unexpected issues: %v", issues)
-			}
-		})
+		if got := paths(parse(t, src).Validate(providers.Catalog())); !slices.Equal(got, want) {
+			t.Errorf("issues at %v, want %v, for:\n%s", got, want, src)
+		}
 	}
 }
 
@@ -163,9 +178,8 @@ func TestReservedEnvironments(t *testing.T) {
 		if !manifest.ReservedEnvironment(ns) {
 			t.Errorf("%s is not reserved", ns)
 		}
-		src := strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: [prod, "+ns+"]", 1)
-		issues := parse(t, src).Validate(providers.Catalog())
-		if len(issues) != 1 || issues[0].Path != "spec.environments[1]" || !strings.Contains(issues[0].Message, "reserved") {
+		issues := parse(t, starter+"environments: [prod, "+ns+"]\n").Validate(providers.Catalog())
+		if len(issues) != 1 || issues[0].Path != "environments[1]" || !strings.Contains(issues[0].Message, "reserved") {
 			t.Errorf("%s: issues = %v", ns, issues)
 		}
 	}
@@ -176,17 +190,17 @@ func TestReservedEnvironments(t *testing.T) {
 	}
 }
 
-// spec.environments lists <name>[=<branch glob>]: the first is production,
-// and a branch deploys into the first environment whose glob matches it.
+// environments lists <name>[=<branch glob>]: the first is production, and a
+// branch deploys into the first environment whose glob matches it.
 func TestEnvironments(t *testing.T) {
-	m := parse(t, valid)
+	m := parse(t, starter)
 	want := []manifest.Environment{{Name: "prod", Branch: "main"}, {Name: "dev", Branch: "develop"}, {Name: "qa", Branch: "release/*"}}
-	if got := m.Environments(); !reflect.DeepEqual(got, want) {
+	if got := m.EnvironmentList(); !reflect.DeepEqual(got, want) {
 		t.Errorf("default environments = %v", got)
 	}
-	m = parse(t, strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: [live=trunk, staging, preview=*]", 1))
+	m = parse(t, starter+"environments: [live=trunk, staging, preview=*]\n")
 	want = []manifest.Environment{{Name: "live", Branch: "trunk"}, {Name: "staging"}, {Name: "preview", Branch: "*"}}
-	if got := m.Environments(); !reflect.DeepEqual(got, want) {
+	if got := m.EnvironmentList(); !reflect.DeepEqual(got, want) {
 		t.Errorf("environments = %v", got)
 	}
 
@@ -194,82 +208,91 @@ func TestEnvironments(t *testing.T) {
 		environments string
 		issues       []string // paths, in order
 	}{
-		"defaults":           {"", nil},
 		"names only":         {"[prod, dev]", nil},
 		"globs":              {"[prod=main, dev=feature/**, qa=release/1.*, x=Team_x-1]", nil},
 		"catch-all last":     {"[prod=main, dev=*]", nil},
-		"empty branch":       {"[prod=]", []string{"spec.environments[0]"}},
-		"two equals":         {"[prod=main=x]", []string{"spec.environments[0]"}},
-		"bad name":           {"[Prod=main]", []string{"spec.environments[0]"}},
-		"no name":            {"[=main]", []string{"spec.environments[0]"}},
-		"bad branch":         {`[prod=main, dev="feature;rm"]`, []string{"spec.environments[1]"}},
-		"question mark":      {`[prod=main, "qa=release/?"]`, []string{"spec.environments[1]"}},
-		"leading dash":       {"[prod=-x]", []string{"spec.environments[0]"}},
-		"duplicate glob":     {"[prod=main, dev=main]", []string{"spec.environments[1]"}},
-		"duplicate name":     {"[prod=main, prod=develop]", []string{"spec.environments[1]"}},
-		"reserved with glob": {"[jenkins=main]", []string{"spec.environments[0]"}},
-		"several problems":   {"[prod=main, Dev=main, qa=a;b]", []string{"spec.environments[1]", "spec.environments[1]", "spec.environments[2]"}},
+		"empty branch":       {"[prod=]", []string{"environments[0]"}},
+		"two equals":         {"[prod=main=x]", []string{"environments[0]"}},
+		"bad name":           {"[Prod=main]", []string{"environments[0]"}},
+		"no name":            {"[=main]", []string{"environments[0]"}},
+		"bad branch":         {`[prod=main, dev="feature;rm"]`, []string{"environments[1]"}},
+		"question mark":      {`[prod=main, "qa=release/?"]`, []string{"environments[1]"}},
+		"leading dash":       {"[prod=-x]", []string{"environments[0]"}},
+		"duplicate glob":     {"[prod=main, dev=main]", []string{"environments[1]"}},
+		"duplicate name":     {"[prod=main, prod=develop]", []string{"environments[1]"}},
+		"reserved with glob": {"[jenkins=main]", []string{"environments[0]"}},
+		"several problems":   {"[prod=main, Dev=main, qa=a;b]", []string{"environments[1]", "environments[1]", "environments[2]"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			src := valid
-			if tc.environments != "" {
-				src = strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: "+tc.environments, 1)
-			}
-			var got []string
-			for _, issue := range parse(t, src).Validate(providers.Catalog()) {
-				got = append(got, issue.Path)
-			}
-			if !reflect.DeepEqual(got, tc.issues) {
+			got := paths(parse(t, starter+"environments: "+tc.environments+"\n").Validate(providers.Catalog()))
+			if !slices.Equal(got, tc.issues) {
 				t.Fatalf("issues at %v, want %v", got, tc.issues)
 			}
 		})
 	}
 }
 
-// Environments are written back the way they were read.
-func TestEnvironmentsRoundTrip(t *testing.T) {
+// Marshal writes only what differs from the defaults, in catalog order, and
+// reading it back gives the same stack.
+func TestMarshalGolden(t *testing.T) {
 	cat := providers.Catalog()
-	m := parse(t, strings.Replace(valid, "domain: example.com", "domain: example.com\n  environments: [prod=main, dev=*, preview]", 1))
-	out, err := m.Marshal(cat)
+	src, err := os.ReadFile("testdata/full.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	back := parse(t, string(out))
-	if got := back.Spec.Environments; !reflect.DeepEqual(got, []string{"prod=main", "dev=*", "preview"}) {
-		t.Fatalf("environments = %q after a round trip:\n%s", got, out)
-	}
-	if issues := back.Validate(cat); len(issues) > 0 {
+	m := parse(t, string(src))
+	if issues := m.Validate(cat); len(issues) > 0 {
 		t.Fatalf("unexpected issues: %v", issues)
 	}
-}
-
-func TestZotUsername(t *testing.T) {
-	zot := strings.Replace(valid, "provider: harbor", "provider: zot\n    settings:\n      username: USER", 1)
-	for user, ok := range map[string]bool{"ownstack": true, "me@example.com": true, `"a:b"`: false, `"a b"`: false} {
-		issues := parse(t, strings.Replace(zot, "USER", user, 1)).Validate(providers.Catalog())
-		if ok != (len(issues) == 0) {
-			t.Errorf("username %s: issues = %v", user, issues)
-		}
-	}
-}
-
-func TestMarshalRoundTrip(t *testing.T) {
-	cat := providers.Catalog()
-	m := parse(t, valid)
 	out, err := m.Marshal(cat)
 	if err != nil {
 		t.Fatal(err)
 	}
+	const golden = "testdata/marshal.golden.yaml"
+	if *update {
+		if err := os.WriteFile(golden, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(want) {
+		t.Errorf("Marshal:\n%s\nwant (go test -update):\n%s", out, want)
+	}
+
 	back := parse(t, string(out))
-	if !reflect.DeepEqual(m, back) {
-		t.Fatalf("round trip changed the manifest:\n%s", out)
+	if issues := back.Validate(cat); len(issues) > 0 {
+		t.Fatalf("round trip issues: %v", issues)
 	}
-	text := string(out)
-	if strings.Index(text, "compute:") > strings.Index(text, "cicd:") {
-		t.Errorf("aspects not in catalog order:\n%s", text)
+	for _, a := range cat.Aspects {
+		if back.Provider(cat, a.ID) != m.Provider(cat, a.ID) || !reflect.DeepEqual(back.Settings(cat, a.ID), m.Settings(cat, a.ID)) ||
+			!reflect.DeepEqual(back.Values(a.ID), m.Values(a.ID)) {
+			t.Errorf("%s changed in the round trip", a.ID)
+		}
 	}
-	if !strings.Contains(text, `repoFilter: '*'`) && !strings.Contains(text, `repoFilter: "*"`) {
-		t.Errorf("wildcard not quoted:\n%s", text)
+	if back.AdminDomain() != m.AdminDomain() || !reflect.DeepEqual(back.EnvironmentList(), m.EnvironmentList()) {
+		t.Errorf("stack settings changed in the round trip")
+	}
+	again, _ := back.Marshal(cat)
+	if string(again) != string(out) {
+		t.Errorf("Marshal is not stable:\n%s", again)
+	}
+}
+
+func TestMarshalDropsDefaults(t *testing.T) {
+	cat := providers.Catalog()
+	// A secret is an issue, and never written back.
+	verbose := strings.Replace(starter, "vcs: {owner: acme}", "vcs: {owner: acme, token: ghp_example}", 1) +
+		"adminSubdomain: admin\nenvironments: [prod=main, dev=develop, qa=release/*]\n" +
+		"dns: {provider: cloudflare}\nimages: {provider: zot, keepTags: 0}\ncicd: {repos: \"\"}\n"
+	out, err := parse(t, verbose).Marshal(cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != starter {
+		t.Errorf("Marshal:\n%s\nwant:\n%s", out, starter)
 	}
 }
 
@@ -278,5 +301,8 @@ func TestOtherFilesAreNotManifests(t *testing.T) {
 	issues := m.Validate(providers.Catalog())
 	if len(issues) == 0 || issues[0].Path != "apiVersion" {
 		t.Fatalf("issues = %v", issues)
+	}
+	if _, err := manifest.Parse([]byte("environments: prod\n")); err == nil {
+		t.Error("a wrongly typed field parsed")
 	}
 }

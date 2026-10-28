@@ -3,8 +3,6 @@
 package providers
 
 import (
-	"context"
-
 	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/providers/cloudflare"
 	"github.com/getownstack/ownstack/internal/providers/ghactions"
@@ -52,10 +50,4 @@ func Catalog() *catalog.Catalog {
 		cat.Providers = append(cat.Providers, p.spec)
 	}
 	return cat
-}
-
-// RepoBootstrapper is implemented by VCS providers that can create the
-// cluster repo, commit the manifest, and check it out on the node.
-type RepoBootstrapper interface {
-	Bootstrap(ctx context.Context, rt *stack.Runtime, manifestYAML []byte, dir string) error
 }

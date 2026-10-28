@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/getownstack/ownstack/internal/providers/providertest"
 	"github.com/getownstack/ownstack/internal/stack"
@@ -141,5 +142,26 @@ func TestLookupStopsWhenCancelled(t *testing.T) {
 	}
 	if len(f.asked) != 1 {
 		t.Errorf("asked %v after the context ended", f.asked)
+	}
+}
+
+func TestWaitForRecords(t *testing.T) {
+	f := &fakeDNS{records: map[string][]string{"ip4 example.com": {"198.51.100.1"}}}
+	f.install(t)
+	rt, out := providertest.Runtime(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := WaitForRecords(ctx, rt, time.Minute); err != context.DeadlineExceeded {
+		t.Errorf("err = %v", err)
+	}
+	if want := "  waiting: example.com and *.example.com to resolve to 203.0.113.10 (example.com resolves to 198.51.100.1; *.example.com does not resolve)\n"; out.String() != want {
+		t.Errorf("logged %q, want %q", out.String(), want)
+	}
+
+	f.records["ip4 example.com"] = []string{"203.0.113.10"}
+	f.records["ip4 "+wildcard] = []string{"203.0.113.10"}
+	out.Reset()
+	if err := WaitForRecords(context.Background(), rt, time.Minute); err != nil || out.String() != "DNS: example.com and *.example.com resolve to 203.0.113.10\n" {
+		t.Errorf("err = %v, logged %q", err, out.String())
 	}
 }

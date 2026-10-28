@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getownstack/ownstack/internal/catalog"
@@ -21,6 +23,9 @@ import (
 // EnvironmentsStage prepares the deployment namespaces. It is not an aspect;
 // it runs once the registry has delivered its pull credential.
 const EnvironmentsStage = "environments"
+
+// VerifyStage is apply's final health check.
+const VerifyStage = "verify"
 
 type Engine struct {
 	Manifest *manifest.Manifest
@@ -52,23 +57,54 @@ type unit struct {
 	rt     *stack.Runtime
 }
 
-func (u unit) title() string { return u.aspect.Name + " · " + u.spec.Name }
-
+// units are the stack's providers in catalog order; an unknown provider
+// (an invalid manifest) is left out.
 func (e *Engine) units() []unit {
 	var units []unit
 	for _, aspect := range e.Catalog.Aspects {
-		c, ok := e.Manifest.Component(aspect.ID)
-		if !ok {
-			continue
-		}
-		spec, _ := e.Catalog.Provider(aspect.ID, c.Provider)
-		impl, ok := e.lookup(aspect.ID, c.Provider)
-		if !ok {
+		id := e.Manifest.Provider(e.Catalog, aspect.ID)
+		spec, ok := e.Catalog.Provider(aspect.ID, id)
+		impl, found := e.lookup(aspect.ID, id)
+		if !ok || !found {
 			continue
 		}
 		units = append(units, unit{aspect: aspect, spec: spec, impl: impl, rt: e.RT.For(aspect.ID)})
 	}
 	return units
+}
+
+// Resources adds up the stack's providers' estimates.
+func (e *Engine) Resources() catalog.Resources {
+	var r catalog.Resources
+	for _, u := range e.units() {
+		r.MemoryMiB += u.spec.Resources.MemoryMiB
+		r.DiskGiB += u.spec.Resources.DiskGiB
+	}
+	return r
+}
+
+// Secret is a secret the stack's providers need: what the designer and plan
+// list.
+type Secret struct {
+	Aspect   string `json:"aspect"`
+	Key      string `json:"key"`
+	Env      string `json:"env"`
+	Label    string `json:"label"`
+	HelpURL  string `json:"helpURL"`
+	Generate bool   `json:"generate"`
+}
+
+// Secrets lists the stack's secrets in catalog order.
+func (e *Engine) Secrets() []Secret {
+	out := []Secret{}
+	for _, u := range e.units() {
+		for _, param := range u.spec.Params {
+			if param.IsSecret() {
+				out = append(out, Secret{Aspect: u.aspect.ID, Key: param.Key, Env: param.Env, Label: param.Label, HelpURL: param.HelpURL, Generate: param.Generate})
+			}
+		}
+	}
+	return out
 }
 
 // Validate returns manifest issues as a single error.
@@ -121,12 +157,12 @@ func (e *Engine) resolve(ctx context.Context) []resolveIssue {
 type ApplyOptions struct {
 	// AllowLowMemory skips the memory preflight.
 	AllowLowMemory bool
-	// SkipVerify skips the final health check.
-	SkipVerify bool
 	// MemTotalMiB overrides the detected server memory (tests).
 	MemTotalMiB int
 }
 
+// Apply converges the server to the manifest: preflight, secrets, every
+// stage in order, then verify.
 func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 	console := e.RT.Console
 	if err := e.Validate(); err != nil {
@@ -135,14 +171,13 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 
 	start := time.Now()
 	stages := e.stages()
-	ids := make([]string, len(stages))
-	for i, s := range stages {
-		ids[i] = s.id
+	ids := make([]string, 0, len(stages)+1)
+	for _, s := range stages {
+		ids = append(ids, s.id)
 	}
 	console.Event("run_started", map[string]string{
-		"stack":  e.Manifest.Metadata.Name,
-		"domain": e.Manifest.Spec.Domain,
-		"stages": strings.Join(ids, ","),
+		"domain": e.Manifest.Domain,
+		"stages": strings.Join(append(ids, VerifyStage), ","),
 	})
 	defer func() {
 		fields := map[string]string{"duration": time.Since(start).Round(time.Second).String()}
@@ -157,7 +192,6 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 	if err := e.prepare(ctx, opts); err != nil {
 		return err
 	}
-
 	for _, stage := range stages {
 		console.Event("stage_started", map[string]string{"id": stage.id, "title": stage.title, "provider": stage.provider})
 		stageStart := time.Now()
@@ -167,14 +201,12 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (err error) {
 		}
 		console.Event("stage_completed", map[string]string{"id": stage.id, "duration": time.Since(stageStart).Round(time.Second).String()})
 	}
-	if opts.SkipVerify {
-		return nil
-	}
 	return e.verify(ctx, stages)
 }
 
-// prepare runs what apply and up need before changing anything: the memory
-// preflight, then every provider's outputs and secrets, which it saves.
+// prepare runs what apply needs before changing anything: the memory
+// preflight, every provider's outputs and secrets, which it saves, and the
+// node's copy of the manifest.
 func (e *Engine) prepare(ctx context.Context, opts ApplyOptions) error {
 	if err := e.memoryPreflight(opts); err != nil {
 		return err
@@ -187,57 +219,101 @@ func (e *Engine) prepare(ctx context.Context, opts ApplyOptions) error {
 	if err := e.RT.Secrets.Flush(); err != nil {
 		return fmt.Errorf("save secrets: %w", err)
 	}
+	// The node's copy is what later commands read by default (status, the
+	// health timer, the next apply).
+	if err := writeFile(stack.StateFile(manifest.FileName), e.Manifest.Source); err != nil {
+		return fmt.Errorf("save the manifest: %w", err)
+	}
 	return nil
 }
 
-// VerifyTimeout bounds the final health check; verifyInterval is how often
-// it polls.
-var (
-	VerifyTimeout  = 5 * time.Minute
-	verifyInterval = 15 * time.Second
-)
+// writeFile replaces path with data atomically, unless it already holds it.
+func writeFile(path string, data []byte) error {
+	if current, err := os.ReadFile(path); err == nil && string(current) == string(data) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// VerifyTimeout bounds the final health check.
+var VerifyTimeout = 5 * time.Minute
 
 // verify waits until every applied stage reports no failing checks. A stack
 // whose services fall over once everything runs together (for example on a
 // server that is too small) fails here instead of being reported as ready.
+// Between polls it re-checks only the stages that failed, then makes one
+// full pass before it reports success.
 func (e *Engine) verify(ctx context.Context, applied []stage) error {
 	console := e.RT.Console
-	console.Event("stage_started", map[string]string{"id": "verify", "title": "Health check", "provider": "ownstack"})
+	console.Event("stage_started", map[string]string{"id": VerifyStage, "title": "Health check", "provider": "ownstack"})
 	start := time.Now()
-	deadline := start.Add(VerifyTimeout)
-	for {
-		var failing []string
-		for _, s := range applied {
-			for _, c := range s.status(ctx) {
-				if c.State == stack.Fail {
-					failing = append(failing, fmt.Sprintf("%s: %s %s", s.title, c.Name, c.Detail))
-				}
-			}
+	pending, full := applied, true
+	var failing []string
+	err := stack.WaitFor(ctx, e.RT, "health checks", VerifyTimeout, func(ctx context.Context) (bool, string) {
+		var still []stage
+		still, failing = failingStages(ctx, pending)
+		if len(still) == 0 && !full {
+			still, failing = failingStages(ctx, applied)
 		}
-		if len(failing) == 0 {
-			console.Printf("All %d stages report healthy", len(applied))
-			console.Event("stage_completed", map[string]string{"id": "verify", "duration": time.Since(start).Round(time.Second).String()})
-			return nil
+		if len(still) == 0 {
+			return true, ""
 		}
-		if time.Now().After(deadline) {
-			msg := "applied, but not healthy after " + VerifyTimeout.String() + ":\n  " + strings.Join(failing, "\n  ")
-			console.Event("stage_failed", map[string]string{"id": "verify", "error": strings.Join(failing, "; ")})
-			return errors.New(msg)
-		}
-		console.Printf("  waiting: %d check(s) failing, first: %s", len(failing), failing[0])
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(verifyInterval):
-		}
+		pending, full = still, false
+		return false, fmt.Sprintf("%d failing, first: %s", len(failing), failing[0])
+	})
+	if err == nil {
+		console.Printf("All %d stages report healthy", len(applied))
+		console.Event("stage_completed", map[string]string{"id": VerifyStage, "duration": time.Since(start).Round(time.Second).String()})
+		return nil
 	}
+	if len(failing) > 0 && ctx.Err() == nil {
+		err = errors.New("applied, but not healthy after " + VerifyTimeout.String() + ":\n  " + strings.Join(failing, "\n  "))
+	}
+	console.Event("stage_failed", map[string]string{"id": VerifyStage, "error": strings.Join(failing, "; ")})
+	return err
 }
 
-// MemoryFits reports whether a stack that needs about need MiB fits a server
-// with total MiB. The catalog estimates are generous, so 80% is enough. Apply
-// and plan share this rule.
-func MemoryFits(total, need int) bool {
-	return float64(total) >= float64(need)*0.8
+// failingStages checks stages concurrently and returns those with failing
+// checks, and the failing checks.
+func failingStages(ctx context.Context, stages []stage) ([]stage, []string) {
+	results := checkAll(ctx, stages)
+	var still []stage
+	var failing []string
+	for i, s := range stages {
+		failed := false
+		for _, c := range results[i] {
+			if c.State == stack.Fail {
+				failing = append(failing, strings.TrimSpace(fmt.Sprintf("%s: %s %s", s.title, c.Name, c.Detail)))
+				failed = true
+			}
+		}
+		if failed {
+			still = append(still, s)
+		}
+	}
+	return still, failing
+}
+
+// checkAll runs every stage's status checks at once; they only read.
+func checkAll(ctx context.Context, stages []stage) [][]stack.Check {
+	results := make([][]stack.Check, len(stages))
+	var wg sync.WaitGroup
+	for i, s := range stages {
+		wg.Add(1)
+		go func(i int, s stage) {
+			defer wg.Done()
+			results[i] = s.status(ctx)
+		}(i, s)
+	}
+	wg.Wait()
+	return results
 }
 
 // memoryPreflight refuses stacks that clearly do not fit the server. The
@@ -253,16 +329,15 @@ func (e *Engine) memoryPreflight(opts ApplyOptions) error {
 	if total == 0 {
 		return nil
 	}
-	need := 0
+	need := e.Resources().MemoryMiB
+	if catalog.MemoryFits(total, need) {
+		return nil
+	}
 	var heavy []string
 	for _, u := range e.units() {
-		need += u.spec.Resources.MemoryMiB
 		if u.spec.Resources.MemoryMiB >= 1000 {
 			heavy = append(heavy, fmt.Sprintf("%s (~%.1f GB)", u.spec.Name, float64(u.spec.Resources.MemoryMiB)/1024))
 		}
-	}
-	if MemoryFits(total, need) {
-		return nil
 	}
 	msg := fmt.Sprintf("this stack needs about %.1f GB of memory but the server has %.1f GB", float64(need)/1024, float64(total)/1024)
 	if len(heavy) > 0 {
@@ -294,7 +369,7 @@ func (e *Engine) stages() []stage {
 	for _, u := range e.units() {
 		u := u
 		out = append(out, stage{
-			id: u.aspect.ID, title: u.title(), provider: u.spec.ID,
+			id: u.aspect.ID, title: u.aspect.Name + " · " + u.spec.Name, provider: u.spec.ID,
 			apply:  func(ctx context.Context) error { return u.impl.Apply(ctx, u.rt) },
 			status: func(ctx context.Context) []stack.Check { return u.impl.Status(ctx, u.rt) },
 		})
@@ -324,7 +399,7 @@ func resolveError(issues []resolveIssue) error {
 	}
 	msg := ""
 	if len(missing) > 0 {
-		msg += "missing secrets (export them, add them to the secrets file, or run in a terminal to be prompted):\n" + strings.Join(missing, "\n")
+		msg += "missing secrets (export them, add them to " + stack.StateFile("secrets.env") + ", or run in a terminal to be prompted):\n" + strings.Join(missing, "\n")
 	}
 	if len(other) > 0 {
 		if msg != "" {
@@ -341,7 +416,7 @@ func resolveError(issues []resolveIssue) error {
 // server can take the stack, which secrets apply would ask for or generate,
 // and the stages it would run. It changes nothing.
 type Plan struct {
-	Stack     string            `json:"stack"`
+	Domain    string            `json:"domain"`
 	Valid     bool              `json:"valid"`
 	Issues    []manifest.Issue  `json:"issues,omitempty"`
 	Server    []stack.Check     `json:"server"`
@@ -371,14 +446,11 @@ func (p Plan) Problems() int {
 	return n
 }
 
+// Plan runs the preflight. The engine's secrets store should be read-only.
 func (e *Engine) Plan(ctx context.Context) Plan {
-	plan := Plan{Stack: e.Manifest.Metadata.Name}
+	plan := Plan{Domain: e.Manifest.Domain, Resources: e.Resources()}
 	plan.Issues = e.Manifest.Validate(e.Catalog)
 	plan.Valid = len(plan.Issues) == 0
-	for _, u := range e.units() {
-		plan.Resources.MemoryMiB += u.spec.Resources.MemoryMiB
-		plan.Resources.DiskGiB += u.spec.Resources.DiskGiB
-	}
 	plan.MemTotalMiB = memTotalMiB()
 	plan.Server = serverChecks(plan.MemTotalMiB, plan.Resources.MemoryMiB)
 	if !plan.Valid {
@@ -391,7 +463,7 @@ func (e *Engine) Plan(ctx context.Context) Plan {
 		case errors.Is(err, secrets.ErrWouldGenerate):
 			plan.Generated = append(plan.Generated, err.Error())
 		default:
-			plan.Issues = append(plan.Issues, manifest.Issue{Path: "spec." + issue.aspect, Message: err.Error()})
+			plan.Issues = append(plan.Issues, manifest.Issue{Path: issue.aspect, Message: err.Error()})
 		}
 	}
 	for _, s := range e.stages() {
@@ -427,7 +499,7 @@ func serverChecks(memTotal, need int) []stack.Check {
 		checks = append(checks, check((&stack.Exec{}).Has(tool), tool, "required"))
 	}
 	if memTotal > 0 {
-		checks = append(checks, check(MemoryFits(memTotal, need), "memory",
+		checks = append(checks, check(catalog.MemoryFits(memTotal, need), "memory",
 			fmt.Sprintf("%d MiB on this server, the stack needs about %d MiB", memTotal, need)))
 	}
 	return checks
@@ -436,7 +508,7 @@ func serverChecks(memTotal, need int) []stack.Check {
 // ── Status ───────────────────────────────────────────────────────────────────
 
 type Status struct {
-	Stack     string        `json:"stack"`
+	Domain    string        `json:"domain"`
 	CheckedAt time.Time     `json:"checkedAt"`
 	State     string        `json:"state"`
 	Stages    []StageStatus `json:"stages"`
@@ -450,11 +522,14 @@ type StageStatus struct {
 	Checks   []stack.Check `json:"checks"`
 }
 
+// Status checks every stage at once. The engine's secrets store should be
+// read-only.
 func (e *Engine) Status(ctx context.Context) Status {
-	st := Status{Stack: e.Manifest.Metadata.Name, CheckedAt: time.Now().UTC(), State: stack.OK}
+	st := Status{Domain: e.Manifest.Domain, CheckedAt: time.Now().UTC(), State: stack.OK}
 	_ = e.resolve(ctx) // missing secrets surface as unknown checks
-	for _, s := range e.stages() {
-		checks := s.status(ctx)
+	stages := e.stages()
+	for i, checks := range checkAll(ctx, stages) {
+		s := stages[i]
 		state := worst(checks)
 		st.Stages = append(st.Stages, StageStatus{ID: s.id, Title: s.title, Provider: s.provider, State: state, Checks: checks})
 		st.State = worse(st.State, state)
@@ -477,38 +552,4 @@ func worst(checks []stack.Check) string {
 		state = worse(state, c.State)
 	}
 	return state
-}
-
-// ── Bootstrap ────────────────────────────────────────────────────────────────
-
-// Bootstrap creates the cluster repo, commits the manifest, and checks the
-// repo out in dir, using the stack's VCS provider. It first runs the checks
-// apply would (memory, every provider's secrets), so a run that cannot
-// succeed fails before the repo is touched.
-func (e *Engine) Bootstrap(ctx context.Context, manifestYAML []byte, dir string, opts ApplyOptions) error {
-	if err := e.Validate(); err != nil {
-		return err
-	}
-	c, ok := e.Manifest.Component("vcs")
-	if !ok {
-		return fmt.Errorf("spec.vcs is required to bootstrap a cluster repo")
-	}
-	impl, _ := e.lookup("vcs", c.Provider)
-	boot, ok := impl.(providers.RepoBootstrapper)
-	if !ok {
-		return fmt.Errorf("vcs provider %s cannot bootstrap a cluster repo", c.Provider)
-	}
-	if err := e.prepare(ctx, opts); err != nil {
-		return err
-	}
-	rt := e.RT.For("vcs")
-	console := e.RT.Console
-	console.Event("stage_started", map[string]string{"id": "repo", "title": "Cluster repo", "provider": c.Provider})
-	start := time.Now()
-	if err := boot.Bootstrap(ctx, rt, manifestYAML, dir); err != nil {
-		console.Event("stage_failed", map[string]string{"id": "repo", "error": err.Error()})
-		return err
-	}
-	console.Event("stage_completed", map[string]string{"id": "repo", "duration": time.Since(start).Round(time.Second).String()})
-	return nil
 }

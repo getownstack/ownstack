@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,6 @@ import (
 )
 
 const (
-	envFile     = "/etc/ownstack/health.env"
 	serviceFile = "/etc/systemd/system/ownstack-health.service"
 	timerFile   = "/etc/systemd/system/ownstack-health.timer"
 	// Interval between health reports.
@@ -64,22 +64,24 @@ func Send(ctx context.Context, url, token string, status any) error {
 	return nil
 }
 
-// Install writes the timer that reports status every Interval. manifest and
-// secretsFile are the absolute paths of ownstack.yaml and of the secrets file
-// the run used on this server.
-func Install(ctx context.Context, exec *stack.Exec, url, token, manifest, secretsFile string) error {
+// Install writes the timer that reports status every Interval, and starts
+// the first report in the background. The reports run `ownstackctl status`
+// on the state directory's manifest, the one apply saved there.
+func Install(ctx context.Context, exec *stack.Exec, url, token string) error {
 	binary, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll("/etc/ownstack", 0o700); err != nil {
+	dir, err := filepath.Abs(stack.StateDir())
+	if err != nil {
 		return err
 	}
-	env := "OWNSTACK_HEALTH_URL=" + strconv.Quote(url) + "\nOWNSTACK_REPORT_TOKEN=" + strconv.Quote(token) + "\n"
+	envFile := filepath.Join(dir, "health.env")
+	env := "OWNSTACK_HEALTH_URL=" + strconv.Quote(url) + "\nOWNSTACK_REPORT_TOKEN=" + strconv.Quote(token) + "\nOWNSTACK_DIR=" + strconv.Quote(dir) + "\n"
 	if err := os.WriteFile(envFile, []byte(env), 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(serviceFile, []byte(serviceUnit(binary, manifest, secretsFile)), 0o644); err != nil {
+	if err := os.WriteFile(serviceFile, []byte(serviceUnit(binary, envFile)), 0o644); err != nil {
 		return err
 	}
 	timer := fmt.Sprintf(`# Managed by ownstackctl.
@@ -97,13 +99,19 @@ WantedBy=timers.target
 	if err := os.WriteFile(timerFile, []byte(timer), 0o644); err != nil {
 		return err
 	}
-	if err := exec.Run(ctx, "systemctl", "daemon-reload"); err != nil {
-		return err
+	for _, args := range [][]string{
+		{"daemon-reload"},
+		{"enable", "--now", "ownstack-health.timer"},
+		{"start", "--no-block", "ownstack-health.service"},
+	} {
+		if err := exec.Run(ctx, "systemctl", args...); err != nil {
+			return err
+		}
 	}
-	return exec.Run(ctx, "systemctl", "enable", "--now", "ownstack-health.timer")
+	return nil
 }
 
-func serviceUnit(binary, manifest, secretsFile string) string {
+func serviceUnit(binary, envFile string) string {
 	return fmt.Sprintf(`# Managed by ownstackctl: reports stack health to Ownstack.
 # Disable with: systemctl disable --now ownstack-health.timer
 [Unit]
@@ -113,10 +121,10 @@ After=network-online.target k3s.service
 [Service]
 Type=oneshot
 EnvironmentFile=%s
-ExecStart=%s status -f %s --secrets-file %s --no-prompt --health-url ${OWNSTACK_HEALTH_URL}
+ExecStart=%s status --health-url ${OWNSTACK_HEALTH_URL}
 # status exits 2 when something is failing; that is a report, not an error.
 SuccessExitStatus=2
-`, envFile, binary, systemdQuote(manifest), systemdQuote(secretsFile))
+`, envFile, systemdQuote(binary))
 }
 
 // systemdQuote makes s one ExecStart argument: double-quoted, with quotes and

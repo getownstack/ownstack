@@ -12,31 +12,14 @@ import (
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
-const Manifest = `
-apiVersion: ownstack.io/v1
-kind: Stack
-metadata:
-  name: acme
-spec:
-  domain: example.com
-  compute:
-    provider: own-vps
-    settings:
-      host: 203.0.113.10
-  dns:
-    provider: cloudflare
-  ingress:
-    provider: traefik
-    settings:
-      acmeEmail: ops@example.com
-  vcs:
-    provider: github
-    settings:
-      owner: acme
-  images:
-    provider: harbor
-  cicd:
-    provider: jenkins
+// Manifest is the test stack: the Standard preset.
+const Manifest = `apiVersion: ownstack.io/v2
+domain: example.com
+compute: {host: 203.0.113.10}
+ingress: {acmeEmail: ops@example.com}
+vcs: {owner: acme}
+images: {provider: harbor}
+cicd: {provider: jenkins}
 `
 
 // Env holds the secret values every test runtime resolves.
@@ -49,7 +32,8 @@ var Env = map[string]string{
 
 // Runtime returns a runtime for the test manifest and the console buffer.
 // Its catalog holds specs, the providers under test: the full catalog
-// (providers.Catalog) would import the packages that use this one.
+// (providers.Catalog) would import the packages that use this one. Change
+// the stack with Set, or set rt.Manifest.Environments.
 func Runtime(t *testing.T, specs ...catalog.Provider) (*stack.Runtime, *bytes.Buffer) {
 	t.Helper()
 	m, err := manifest.Parse([]byte(Manifest))
@@ -71,4 +55,13 @@ func Runtime(t *testing.T, specs ...catalog.Provider) (*stack.Runtime, *bytes.Bu
 		"traefik.ingress.kubernetes.io/router.tls.certresolver": "main",
 	}}
 	return rt, &out
+}
+
+// Set replaces an aspect's entry in rt's manifest: its provider ("" for the
+// aspect's default) and its settings, as ownstack.yaml would give them.
+func Set(rt *stack.Runtime, aspect, provider string, settings map[string]string) {
+	if settings == nil {
+		settings = map[string]string{}
+	}
+	rt.Manifest.Components[aspect] = &manifest.Component{Provider: provider, Settings: settings}
 }

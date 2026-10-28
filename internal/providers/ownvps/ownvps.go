@@ -29,10 +29,6 @@ var Spec = catalog.Provider{
 			Help: "Public IPv4 address of the server. DNS records point here."},
 		{Key: "swapGiB", Label: "Swap (GiB)", Kind: catalog.KindInt, Default: "2", Advanced: true,
 			Help: "Swapfile created when the server has no swap, so a build spike does not take services down. 0 disables."},
-		{Key: "k3sChannel", Label: "k3s channel", Kind: catalog.KindString, Default: "stable", Advanced: true},
-		{Key: "k3sVersion", Label: "k3s version", Kind: catalog.KindString, Advanced: true,
-			Help:    "Pin an exact k3s release, for example v1.33.4+k3s1. Overrides the channel.",
-			Pattern: `^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+k3s[0-9]+)?$`, PatternHelp: "must be a k3s release such as v1.33.4+k3s1"},
 	},
 }
 
@@ -61,6 +57,11 @@ var k3sConfig = "/etc/rancher/k3s/config.yaml"
 // helmVersion is the Helm release installed on servers that have none. The
 // official install script verifies its checksum.
 const helmVersion = "v3.22.0"
+
+// k3sVersion is the k3s release a node runs: the stable channel's release
+// when this version of ownstackctl was cut. New nodes install it, and apply
+// upgrades older nodes to it one minor version at a time.
+const k3sVersion = "v1.36.5+k3s1"
 
 // ensureK3sConfig merges Ownstack's settings into the k3s config file: the
 // bundled Traefik is disabled (Ownstack installs its own) and the public IP is
@@ -126,10 +127,11 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 		return fmt.Errorf("own-vps must be applied as root on the server itself")
 	}
 
-	if missing := missingTools(rt); len(missing) > 0 {
-		rt.Logf("Installing base packages: %s", strings.Join(missing, ", "))
+	// curl downloads k3s and Helm. Stock Ubuntu has it, so apt rarely runs.
+	if !rt.Exec.Has("curl") {
+		rt.Logf("Installing curl")
 		err := stack.Retry(ctx, rt.Console, "apt install", 5, 15*time.Second, func() error {
-			return rt.Exec.Shell(ctx, "export DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq ca-certificates curl git jq")
+			return rt.Exec.Shell(ctx, "export DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y -qq ca-certificates curl")
 		})
 		if err != nil {
 			return err
@@ -141,12 +143,12 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	}
 
 	// Decide about the running k3s before touching its config, so a refused
-	// k3sVersion leaves the node as it was.
-	version, running := k3sVersion(ctx, rt)
+	// upgrade leaves the node as it was.
+	version, running := runningK3s(ctx, rt)
 	action := k3sNone
 	if running {
 		var err error
-		if action, err = k3sAction(version, rt.Setting("k3sVersion")); err != nil {
+		if action, err = k3sAction(version, k3sVersion); err != nil {
 			return fmt.Errorf("k3s %s is running: %w", version, err)
 		}
 	}
@@ -157,7 +159,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 	switch {
 	case running && action == k3sUpgrade:
 		// The install script restarts k3s, which also loads a changed config.
-		rt.Logf("Upgrading k3s %s -> %s; the API server restarts briefly", version, normalizeK3sVersion(rt.Setting("k3sVersion")))
+		rt.Logf("Upgrading k3s %s -> %s; the API server restarts briefly", version, k3sVersion)
 		if err := installK3s(ctx, rt); err != nil {
 			return err
 		}
@@ -170,7 +172,7 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 			}
 		}
 	default:
-		rt.Logf("Installing k3s (%s)", k3sTarget(rt))
+		rt.Logf("Installing k3s %s", k3sVersion)
 		if err := installK3s(ctx, rt); err != nil {
 			return err
 		}
@@ -196,30 +198,35 @@ func (Provider) Apply(ctx context.Context, rt *stack.Runtime) error {
 			rt.Out.Compute.CACert = string(ca)
 		}
 	}()
-	return stack.Retry(ctx, rt.Console, "node ready", 40, 5*time.Second, func() error {
-		nodes, err := rt.Kube.Nodes(ctx)
-		if err != nil {
-			return err
-		}
-		for _, n := range nodes {
-			if n.Ready {
-				rt.Logf("Node %s is ready (%s)", n.Name, n.Version)
-				return nil
-			}
-		}
-		return fmt.Errorf("no ready node yet")
+	return stack.WaitFor(ctx, rt, "node ready", 5*time.Minute, func(ctx context.Context) (bool, string) {
+		return nodeReady(ctx, rt)
 	})
+}
+
+// nodeReady reports whether a node is Ready, logging it when one is, or
+// why not.
+func nodeReady(ctx context.Context, rt *stack.Runtime) (bool, string) {
+	nodes, err := rt.Kube.Nodes(ctx)
+	if err != nil {
+		return false, err.Error()
+	}
+	for _, n := range nodes {
+		if n.Ready {
+			rt.Logf("Node %s is ready (%s)", n.Name, n.Version)
+			return true, ""
+		}
+	}
+	return false, "no ready node yet"
 }
 
 func (Provider) Status(ctx context.Context, rt *stack.Runtime) []stack.Check {
 	var checks []stack.Check
-	if version, ok := k3sVersion(ctx, rt); ok {
+	if version, ok := runningK3s(ctx, rt); ok {
 		check := stack.Check{Name: "k3s", State: stack.OK, Detail: version}
-		want := rt.Setting("k3sVersion")
-		if action, err := k3sAction(version, want); err != nil {
+		if action, err := k3sAction(version, k3sVersion); err != nil {
 			check.State, check.Detail = stack.Warn, version+"; apply refuses: "+err.Error()
 		} else if action == k3sUpgrade {
-			check.State, check.Detail = stack.Warn, version+"; k3sVersion pins "+normalizeK3sVersion(want)+", rerun apply to upgrade"
+			check.State, check.Detail = stack.Warn, version+"; rerun apply to upgrade to "+k3sVersion
 		}
 		checks = append(checks, check)
 	} else {
@@ -295,17 +302,8 @@ func swapTotalKiB() int {
 	return parseMeminfo(string(data))["SwapTotal"]
 }
 
-func missingTools(rt *stack.Runtime) []string {
-	var missing []string
-	for _, tool := range []string{"curl", "git", "jq"} {
-		if !rt.Exec.Has(tool) {
-			missing = append(missing, tool)
-		}
-	}
-	return missing
-}
-
-func k3sVersion(ctx context.Context, rt *stack.Runtime) (string, bool) {
+// runningK3s returns the version of the k3s running on the node.
+func runningK3s(ctx context.Context, rt *stack.Runtime) (string, bool) {
 	if _, err := rt.Exec.Output(ctx, "systemctl", "is-active", "--quiet", "k3s"); err != nil {
 		return "", false
 	}
@@ -320,26 +318,13 @@ func k3sVersion(ctx context.Context, rt *stack.Runtime) (string, bool) {
 	return out, true
 }
 
-func k3sTarget(rt *stack.Runtime) string {
-	if v := rt.Setting("k3sVersion"); v != "" {
-		return "version " + normalizeK3sVersion(v)
-	}
-	return "channel " + rt.Setting("k3sChannel")
-}
+// k3sInstallScript runs the official install script for k3sVersion, which
+// installs k3s or upgrades it in place and (re)starts it.
+const k3sInstallScript = "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION='" + k3sVersion + "' sh -s -"
 
-func k3sInstallEnv(rt *stack.Runtime) string {
-	if v := rt.Setting("k3sVersion"); v != "" {
-		return "INSTALL_K3S_VERSION=" + shellQuote(normalizeK3sVersion(v))
-	}
-	return "INSTALL_K3S_CHANNEL=" + shellQuote(rt.Setting("k3sChannel"))
-}
-
-// installK3s runs the official install script, which installs k3s or
-// upgrades it in place and (re)starts it.
 func installK3s(ctx context.Context, rt *stack.Runtime) error {
-	script := "curl -sfL https://get.k3s.io | " + k3sInstallEnv(rt) + " sh -s -"
 	return stack.Retry(ctx, rt.Console, "k3s install", 5, 15*time.Second, func() error {
-		return rt.Exec.Shell(ctx, script)
+		return rt.Exec.Shell(ctx, k3sInstallScript)
 	})
 }
 
@@ -374,32 +359,20 @@ func parseK3sVersion(v string) (k3sRel, bool) {
 	return r, true
 }
 
-// normalizeK3sVersion adds the leading v that k3s release tags have.
-func normalizeK3sVersion(v string) string {
-	if v != "" && !strings.HasPrefix(v, "v") {
-		return "v" + v
-	}
-	return v
-}
-
 // k3sAction decides what apply does when k3s is running installed and the
-// manifest pins want. Without a pin nothing changes: a channel only applies
-// to new installs. Upgrades go one minor version at a time, as Kubernetes
-// supports; downgrades are refused. A pin without +k3sN matches any build.
+// node should run want (k3sVersion). Upgrades go one minor version at a
+// time, as Kubernetes supports; downgrades are refused.
 func k3sAction(installed, want string) (string, error) {
-	if want == "" {
-		return k3sNone, nil
-	}
 	w, ok := parseK3sVersion(want)
 	if !ok {
-		return "", fmt.Errorf("k3sVersion %q is not a k3s release such as v1.33.4+k3s1", want)
+		return "", fmt.Errorf("%q is not a k3s release", want)
 	}
 	have, ok := parseK3sVersion(installed)
 	if !ok {
 		return "", fmt.Errorf("cannot read the installed k3s version %q", installed)
 	}
 	if w.major != have.major {
-		return "", fmt.Errorf("k3sVersion %s changes the major version of %s; k3s does not support that", normalizeK3sVersion(want), installed)
+		return "", fmt.Errorf("this ownstackctl runs k3s %s, another major version; k3s does not support that upgrade", want)
 	}
 	cmp := func(a, b int) int {
 		switch {
@@ -414,7 +387,7 @@ func k3sAction(installed, want string) (string, error) {
 	if order == 0 {
 		order = cmp(w.patch, have.patch)
 	}
-	if order == 0 && w.build >= 0 && have.build >= 0 {
+	if order == 0 && have.build >= 0 {
 		order = cmp(w.build, have.build)
 	}
 	if order == 0 && have.pre && !w.pre {
@@ -424,16 +397,12 @@ func k3sAction(installed, want string) (string, error) {
 	case order == 0:
 		return k3sNone, nil
 	case order < 0:
-		return "", fmt.Errorf("k3sVersion %s is older than the running %s; k3s does not support downgrades", normalizeK3sVersion(want), installed)
+		return "", fmt.Errorf("this ownstackctl runs k3s %s, which is older; k3s does not support downgrades", want)
 	case w.minor > have.minor+1:
-		return "", fmt.Errorf("k3sVersion %s skips a minor version from %s; upgrade one minor version at a time: pin v%d.%d first", normalizeK3sVersion(want), installed, have.major, have.minor+1)
-	case w.build < 0:
-		return "", fmt.Errorf("k3sVersion %s names no build; k3s releases are tagged like v%d.%d.%d+k3s1", normalizeK3sVersion(want), w.major, w.minor, w.patch)
+		return "", fmt.Errorf("this ownstackctl runs k3s %s, more than one minor version newer; upgrade one minor version at a time: run curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL=v%d.%d sh -s - and apply again", want, have.major, have.minor+1)
 	}
 	return k3sUpgrade, nil
 }
-
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 func readyWord(ready bool) string {
 	if ready {

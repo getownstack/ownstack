@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"reflect"
@@ -74,9 +75,13 @@ func (c *Console) Printf(format string, args ...any) {
 	}
 }
 
-// Event emits a structured progress line:
+// EventPrefix starts every structured progress line.
+const EventPrefix = "ownstack.event "
+
+// Event emits a structured progress line: the prefix, then one JSON object
+// with the event name and its string fields.
 //
-//	ownstack.event=stage_started aspect="images" id="images" provider="harbor"
+//	ownstack.event {"event":"stage_started","id":"images","provider":"zot","title":"Image registry · Zot"}
 //
 // UIs parse these; humans can read them.
 func (c *Console) Event(name string, fields map[string]string) {
@@ -85,13 +90,24 @@ func (c *Console) Event(name string, fields map[string]string) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	parts := []string{"ownstack.event=" + name}
+	var b strings.Builder
+	b.WriteString(EventPrefix + `{"event":`)
+	b.Write(jsonString(name))
 	for _, k := range keys {
-		// Redact before quoting: %q escapes quotes and backslashes, after
+		b.WriteByte(',')
+		b.Write(jsonString(k))
+		b.WriteByte(':')
+		// Redact before marshalling: JSON escapes quotes and backslashes, after
 		// which a registered secret would no longer match.
-		parts = append(parts, fmt.Sprintf("%s=%q", k, c.Redacted(fields[k])))
+		b.Write(jsonString(c.Redacted(fields[k])))
 	}
-	c.Line(strings.Join(parts, " "))
+	b.WriteByte('}')
+	c.Line(b.String())
+}
+
+func jsonString(s string) []byte {
+	data, _ := json.Marshal(s) // a string always marshals
+	return data
 }
 
 // RedactAll masks every registered secret in every exported string reachable

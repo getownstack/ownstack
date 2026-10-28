@@ -12,13 +12,12 @@ import (
 	"syscall"
 )
 
-// lockNode makes apply and up exclusive on this server. Two runs would
-// otherwise each generate passwords into the same secrets file (the last
-// writer wins) and race on the same Helm releases. The lock file lives next
-// to the secrets file; the kernel releases the lock when the process exits,
+// lockNode makes apply exclusive on this server. Two runs would otherwise
+// each generate passwords into the same secrets file (the last writer wins)
+// and race on the same Helm releases. The lock file is apply.lock in the
+// state directory dir; the kernel releases the lock when the process exits,
 // so it never goes stale.
-func lockNode(secretsFile string) (unlock func(), err error) {
-	dir := filepath.Dir(secretsFile)
+func lockNode(dir string) (unlock func(), err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -34,7 +33,7 @@ func lockNode(secretsFile string) (unlock func(), err error) {
 			if data, _ := os.ReadFile(path); len(strings.TrimSpace(string(data))) > 0 {
 				holder = strings.TrimSpace(string(data))
 			}
-			return nil, fmt.Errorf("another ownstackctl apply or up is running on this server (pid %s); wait for it to finish", holder)
+			return nil, fmt.Errorf("another ownstackctl apply is running on this server (pid %s); wait for it to finish", holder)
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}

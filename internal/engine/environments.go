@@ -3,19 +3,22 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/getownstack/ownstack/internal/stack"
 )
 
 // environments creates one namespace per environment, enforces Pod Security
-// on it, and gives it the registry's pull secret, so application charts can
-// pull private images.
+// on it, and makes its default service account pull from the registry, so
+// application charts carry no pull secret.
 type environments struct {
 	rt *stack.Runtime
 }
+
+// registryCredentials is the registry's image pull secret in every environment.
+const registryCredentials = "registry-credentials"
 
 // Pod Security Admission labels. Environment namespaces enforce the
 // baseline level: no privileged containers, host namespaces, or hostPath
@@ -27,70 +30,66 @@ const (
 	podSecurityLevel   = "baseline"
 )
 
-// namespaceObject is an environment namespace with its Pod Security labels.
-// The environments stage is the only code that applies these namespaces: an
-// apply without the labels would remove them.
-func namespaceObject(env string) map[string]any {
-	return map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Namespace",
-		"metadata": map[string]any{
-			"name": env,
-			"labels": map[string]string{
-				podSecurityEnforce: podSecurityLevel,
-				podSecurityWarn:    podSecurityLevel,
-			},
-		},
-	}
-}
-
-func (e environments) apply(ctx context.Context) error {
+// objects are every environment's namespace with its Pod Security labels,
+// its pull secret for the registry, and its default service account, which
+// pulls with that secret: Kubernetes adds a service account's pull secrets
+// to the pods that run as it.
+func (e environments) objects() ([]map[string]any, error) {
 	images := e.rt.Out.Images
-	if images != nil && images.PushUsername == "" {
-		e.rt.Logf("warning: the registry has no credential yet, so the environments get no pull secret %s; apply the images aspect", images.PullSecretName)
+	var config string
+	if images != nil {
+		if images.PushUsername == "" {
+			return nil, fmt.Errorf("the registry at %s has no credential yet; apply its stage first", images.Host)
+		}
+		var err error
+		if config, err = stack.DockerConfigJSON(images.Host, images.PushUsername, images.PushPassword); err != nil {
+			return nil, err
+		}
 	}
+	var objects []map[string]any
 	for _, environment := range e.rt.Environments() {
 		env := environment.Name
-		if err := e.rt.Kube.Apply(ctx, namespaceObject(env)); err != nil {
-			return err
+		objects = append(objects, map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Namespace",
+			"metadata": map[string]any{
+				"name": env,
+				"labels": map[string]string{
+					podSecurityEnforce: podSecurityLevel,
+					podSecurityWarn:    podSecurityLevel,
+				},
+			},
+		})
+		if images == nil {
+			continue
 		}
-		if images != nil && images.PushUsername != "" {
-			if err := e.rt.Kube.ApplyPullSecret(ctx, env, images.PullSecretName, images.Host, images.PushUsername, images.PushPassword); err != nil {
-				return err
-			}
-			e.defaultServiceAccountPulls(ctx, env, images.PullSecretName)
-		}
-		e.rt.Logf("Environment %s ready", env)
+		objects = append(objects,
+			stack.SecretObject(env, registryCredentials, "kubernetes.io/dockerconfigjson", map[string]string{".dockerconfigjson": config}, nil),
+			map[string]any{
+				"apiVersion":       "v1",
+				"kind":             "ServiceAccount",
+				"metadata":         map[string]any{"name": "default", "namespace": env},
+				"imagePullSecrets": []map[string]string{{"name": registryCredentials}},
+			})
 	}
-	return nil
+	return objects, nil
 }
 
-// The default service account appears shortly after its namespace.
-var (
-	serviceAccountAttempts = 10
-	serviceAccountDelay    = 2 * time.Second
-)
-
-// defaultServiceAccountPulls adds the pull secret to the namespace's default
-// service account, so pods that name no imagePullSecrets (hooks, CronJobs,
-// third-party charts) pull from the registry too. Pods that name one, as
-// public-url-application does, are unaffected, so a failure is a warning.
-func (e environments) defaultServiceAccountPulls(ctx context.Context, env, secret string) {
-	var failed error
-	err := stack.Retry(ctx, e.rt.Console, "default service account in "+env, serviceAccountAttempts, serviceAccountDelay, func() error {
-		_, err := e.rt.Kube.AddImagePullSecret(ctx, env, "default", secret)
-		if err != nil && !strings.Contains(err.Error(), "(NotFound)") && !strings.Contains(err.Error(), "(Conflict)") {
-			failed = err
-			return nil
-		}
-		return err
-	})
-	if err == nil {
-		err = failed
-	}
+// apply applies every environment's objects in one call.
+func (e environments) apply(ctx context.Context) error {
+	objects, err := e.objects()
 	if err != nil {
-		e.rt.Logf("warning: the default service account in %s does not pull with %s: %v", env, secret, err)
+		return err
 	}
+	if err := e.rt.Kube.Apply(ctx, objects...); err != nil {
+		return err
+	}
+	var names []string
+	for _, environment := range e.rt.Environments() {
+		names = append(names, environment.Name)
+	}
+	e.rt.Logf("Environments ready: %s", strings.Join(names, ", "))
+	return nil
 }
 
 func (e environments) status(ctx context.Context) []stack.Check {
@@ -103,7 +102,7 @@ func (e environments) status(ctx context.Context) []stack.Check {
 			continue
 		}
 		if images != nil {
-			raw, ok := e.rt.Kube.SecretValue(ctx, env, images.PullSecretName, ".dockerconfigjson")
+			raw, ok := e.rt.Kube.SecretValue(ctx, env, registryCredentials, ".dockerconfigjson")
 			if !ok {
 				checks = append(checks, stack.Check{Name: env, State: stack.Fail, Detail: "pull secret missing"})
 				continue

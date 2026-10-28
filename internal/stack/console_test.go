@@ -2,6 +2,7 @@ package stack
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func TestConsoleRedactsAndForwards(t *testing.T) {
 	if !strings.Contains(got, "token=[redacted] other=[redacted] abc") {
 		t.Errorf("output = %q", got)
 	}
-	if !strings.Contains(got, `ownstack.event=stage_started id="images" title="Image registry · Harbor"`) {
+	if !strings.Contains(got, `ownstack.event {"event":"stage_started","id":"images","title":"Image registry · Harbor"}`+"\n") {
 		t.Errorf("event = %q", got)
 	}
 	if len(forwarded) != 2 || strings.Contains(forwarded[0], "supersecret") {
@@ -44,20 +45,25 @@ func TestLineWriterSplitsCarriageReturns(t *testing.T) {
 	}
 }
 
-// Event fields are %q-quoted; a secret with a quote or backslash must be
-// redacted before quoting, or its escaped form slips through.
-func TestEventRedactsBeforeQuoting(t *testing.T) {
+// Event fields are JSON strings; a secret with a quote or backslash must be
+// redacted before marshalling, or its escaped form slips through.
+func TestEventRedactsBeforeMarshalling(t *testing.T) {
 	var out bytes.Buffer
 	c := NewConsole(&out)
 	secret := `pa"ss\word99`
 	c.Redact(secret)
-	c.Event("stage_failed", map[string]string{"id": "images", "error": "login failed for " + secret})
+	c.Event("stage_failed", map[string]string{"id": "images", "error": "login failed for " + secret + "\nnext \"line\""})
 	got := out.String()
 	if strings.Contains(got, "word99") {
 		t.Fatalf("secret leaked: %s", got)
 	}
-	if !strings.Contains(got, `error="login failed for [redacted]"`) {
-		t.Errorf("event = %q", got)
+	line, ok := strings.CutPrefix(strings.TrimSuffix(got, "\n"), EventPrefix)
+	var fields map[string]string
+	if !ok || strings.Contains(line, "\n") || json.Unmarshal([]byte(line), &fields) != nil {
+		t.Fatalf("not one JSON event line: %q", got)
+	}
+	if fields["event"] != "stage_failed" || fields["error"] != "login failed for [redacted]\nnext \"line\"" {
+		t.Errorf("fields = %q", fields)
 	}
 }
 

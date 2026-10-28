@@ -164,21 +164,13 @@ func mismatches(ctx context.Context, domain, ip string) []string {
 // WaitForRecords polls public DNS until both names resolve to ip.
 func WaitForRecords(ctx context.Context, rt *stack.Runtime, timeout time.Duration) error {
 	domain, ip := rt.Domain(), rt.Out.Compute.PublicIP
-	deadline := time.Now().Add(timeout)
-	for {
+	what := fmt.Sprintf("%s and *.%s to resolve to %s", domain, domain, ip)
+	if err := stack.WaitFor(ctx, rt, what, timeout, func(ctx context.Context) (bool, string) {
 		missing := mismatches(ctx, domain, ip)
-		if len(missing) == 0 {
-			rt.Logf("DNS: %s and *.%s resolve to %s", domain, domain, ip)
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s and *.%s do not resolve to %s after %s (%s)", domain, domain, ip, timeout, strings.Join(missing, "; "))
-		}
-		rt.Logf("  waiting: %s and *.%s to resolve to %s", domain, domain, ip)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(15 * time.Second):
-		}
+		return len(missing) == 0, strings.Join(missing, "; ")
+	}); err != nil {
+		return err
 	}
+	rt.Logf("DNS: %s and *.%s resolve to %s", domain, domain, ip)
+	return nil
 }

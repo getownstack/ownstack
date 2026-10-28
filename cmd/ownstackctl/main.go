@@ -10,9 +10,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
+	"github.com/getownstack/ownstack/internal/catalog"
 	"github.com/getownstack/ownstack/internal/engine"
 	"github.com/getownstack/ownstack/internal/health"
 	"github.com/getownstack/ownstack/internal/manifest"
@@ -25,8 +25,6 @@ import (
 
 // version is set at release build time with -ldflags "-X main.version=...".
 var version = "dev"
-
-const defaultRepoDir = "/root/ownstack-cluster"
 
 // activeConsole knows the secrets resolved in this run, so the final error
 // message can be redacted too.
@@ -43,21 +41,19 @@ func main() {
 	stack.EngineVersion = version
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Args[1:]); err != nil {
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", redactError(err))
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, args []string) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		usage(os.Stdout)
+		usage(stdout)
 		return nil
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
-	case "up":
-		return cmdUp(ctx, rest)
 	case "apply":
 		return cmdApply(ctx, rest)
 	case "plan":
@@ -65,14 +61,14 @@ func run(ctx context.Context, args []string) error {
 	case "status":
 		return cmdStatus(ctx, rest)
 	case "validate":
-		return cmdValidate(rest)
+		return cmdValidate(rest, stdin, stdout)
 	case "catalog":
-		return printJSON(providers.Catalog())
+		return printJSON(stdout, providers.Catalog())
 	case "workflow":
-		fmt.Print(ghactions.Workflow)
+		fmt.Fprint(stdout, ghactions.Workflow)
 		return nil
 	case "version":
-		fmt.Println("ownstackctl", version)
+		fmt.Fprintln(stdout, "ownstackctl", version)
 		return nil
 	}
 	usage(os.Stderr)
@@ -83,66 +79,50 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `ownstackctl reconciles this server towards ownstack.yaml.
 
 Usage:
-  ownstackctl up       [-f ownstack.yaml] [--dir /root/ownstack-cluster]
-                       Create or update your cluster repo with the manifest, then apply it.
-                       Use this for the first run on a fresh server.
-  ownstackctl apply    [-f ownstack.yaml]
+  ownstackctl apply    [-f FILE] [--report URL] [--allow-low-memory]
                        Converge this server to the manifest, then check it is healthy.
-                       Safe to rerun.
-  ownstackctl plan     [-f ownstack.yaml] [--json]    Check before apply: the manifest, this server,
-                                                      its memory, the secrets, and the stages.
-  ownstackctl status   [-f ownstack.yaml] [--json]    Check every part of the running stack.
-  ownstackctl validate [-f ownstack.yaml] [--json]    Check the manifest against the catalog.
-  ownstackctl catalog                                 Print aspects, providers, and presets as JSON.
-  ownstackctl workflow                                Print the GitHub Actions workflow for app repos
-                                                      (.github/workflows/ownstack.yml).
+                       Safe to rerun. Keeps the applied manifest in $OWNSTACK_DIR.
+  ownstackctl plan     [-f FILE] [--json]    Check before apply: the manifest, this server,
+                                             its memory, the secrets, and the stages.
+  ownstackctl status   [-f FILE] [--json] [--health-url URL]
+                                             Check every part of the running stack.
+  ownstackctl validate [-f FILE|-] [--json]  Check a manifest against the catalog
+                                             (- reads stdin; YAML or JSON).
+  ownstackctl catalog                        Print aspects, providers, and presets as JSON.
+  ownstackctl workflow                       Print the GitHub Actions workflow for app repos
+                                             (.github/workflows/ownstack.yml).
   ownstackctl version
 
+-f defaults to $OWNSTACK_DIR/ownstack.yaml, the manifest the last apply used.
+$OWNSTACK_DIR (default /etc/ownstack) also holds secrets.env and apply.lock.
+
 Secrets are never stored in ownstack.yaml. They are read from environment
-variables (GITHUB_TOKEN, CLOUDFLARE_API_TOKEN, ...), from the secrets file
-(/etc/ownstack/secrets.env), generated where possible, or prompted for.
+variables (GITHUB_TOKEN, CLOUDFLARE_API_TOKEN, ...), then from
+$OWNSTACK_DIR/secrets.env, generated where possible, or prompted for on a
+terminal.
 
-Flags shared by commands that read the manifest:
-  -f PATH              manifest path (default ownstack.yaml)
-  --secrets-file PATH  secrets file (default /etc/ownstack/secrets.env)
-  --no-prompt          never prompt for secrets
-  --report URL         also send progress to an Ownstack run (token in OWNSTACK_REPORT_TOKEN)
-
-Flags for apply and up:
-  --allow-low-memory   skip the check that the stack fits this server's memory
-  --no-verify          skip the final health check
+--report URL sends progress to an Ownstack run (token in
+OWNSTACK_REPORT_TOKEN) and then keeps reporting health every 5 minutes.
 `)
 }
 
-// ── Shared flags ─────────────────────────────────────────────────────────────
+// manifestPath is -f's default: the manifest apply saved on this server.
+func manifestPath() string { return stack.StateFile(manifest.FileName) }
 
-type common struct {
-	file        string
-	secretsFile string
-	noPrompt    bool
-	jsonOut     bool
-	reportURL   string
-}
-
-func newFlags(name string, c *common) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.StringVar(&c.file, "f", manifest.FileName, "manifest path")
-	fs.StringVar(&c.secretsFile, "secrets-file", envOr("OWNSTACK_SECRETS_FILE", secrets.DefaultFile), "secrets file")
-	fs.BoolVar(&c.noPrompt, "no-prompt", false, "never prompt for secrets")
-	fs.StringVar(&c.reportURL, "report", "", "Ownstack run URL to report progress to")
-	return fs
-}
-
-type loaded struct {
-	manifest *manifest.Manifest
-	raw      []byte
-}
-
-// load reads and parses the manifest.
-func load(path string) (*loaded, error) {
-	data, err := os.ReadFile(path)
+// load reads and parses the manifest; "-" reads stdin.
+func load(path string, stdin io.Reader) (*manifest.Manifest, error) {
+	var data []byte
+	var err error
+	if path == "-" {
+		data, err = io.ReadAll(stdin)
+	} else {
+		data, err = os.ReadFile(path)
+	}
 	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("%s not found; create one in the Ownstack designer or pass -f", path)
+		if path == manifestPath() {
+			return nil, fmt.Errorf("%s not found: no stack was applied on this server yet; pass -f ownstack.yaml (from the Ownstack designer)", path)
+		}
+		return nil, fmt.Errorf("%s not found", path)
 	}
 	if err != nil {
 		return nil, err
@@ -151,7 +131,7 @@ func load(path string) (*loaded, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &loaded{manifest: m, raw: data}, nil
+	return m, nil
 }
 
 type session struct {
@@ -159,25 +139,26 @@ type session struct {
 	console  *stack.Console
 	store    *secrets.Store
 	reporter *report.Reporter
-	loaded   *loaded
 }
 
-func open(ctx context.Context, c common, out io.Writer) (*session, error) {
-	l, err := load(c.file)
+// open loads the manifest for apply, plan, and status. readOnly stores
+// never generate, prompt for, or save secrets.
+func open(ctx context.Context, file string, readOnly bool, reportURL string, out io.Writer) (*session, error) {
+	m, err := load(file, os.Stdin)
 	if err != nil {
 		return nil, err
 	}
 	console := stack.NewConsole(out)
 	activeConsole = console
-	store := secrets.NewStore(c.secretsFile)
-	store.Prompt = !c.noPrompt
-	s := &session{engine: engine.New(l.manifest, store, console), console: console, store: store, loaded: l}
-	if c.reportURL != "" {
+	store := secrets.NewStore(stack.StateFile("secrets.env"))
+	store.ReadOnly = readOnly
+	s := &session{engine: engine.New(m, store, console), console: console, store: store}
+	if reportURL != "" {
 		token := os.Getenv("OWNSTACK_REPORT_TOKEN")
 		if token == "" {
 			return nil, fmt.Errorf("--report needs OWNSTACK_REPORT_TOKEN")
 		}
-		s.reporter = report.New(c.reportURL, token)
+		s.reporter = report.New(reportURL, token)
 		console.Redact(token)
 		console.AddSink(s.reporter.Line)
 		s.reporter.Start(ctx)
@@ -201,20 +182,19 @@ func (s *session) finish(err error) error {
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 func cmdApply(ctx context.Context, args []string) error {
-	var c common
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	file := fs.String("f", manifestPath(), "manifest path")
+	reportURL := fs.String("report", "", "Ownstack run URL to report progress to (token in OWNSTACK_REPORT_TOKEN)")
 	var opts engine.ApplyOptions
-	var hf healthFlags
-	fs := newFlags("apply", &c)
-	applyFlags(fs, &opts)
-	hf.register(fs)
-	if err := fs.Parse(args); err != nil {
+	fs.BoolVar(&opts.AllowLowMemory, "allow-low-memory", false, "skip the memory preflight")
+	if err := parse(fs, args); err != nil {
 		return err
 	}
-	s, err := open(ctx, c, os.Stdout)
+	s, err := open(ctx, *file, false, *reportURL, os.Stdout)
 	if err != nil {
 		return err
 	}
-	unlock, err := lockNode(c.secretsFile)
+	unlock, err := lockNode(stack.StateDir())
 	if err != nil {
 		return s.finish(err)
 	}
@@ -222,73 +202,31 @@ func cmdApply(ctx context.Context, args []string) error {
 	err = s.engine.Apply(ctx, opts)
 	if err == nil {
 		printSummary(s)
-		setupHealth(ctx, s, hf, c.reportURL, c.file)
-	}
-	return s.finish(err)
-}
-
-func cmdUp(ctx context.Context, args []string) error {
-	var c common
-	var dir string
-	var opts engine.ApplyOptions
-	var hf healthFlags
-	fs := newFlags("up", &c)
-	applyFlags(fs, &opts)
-	hf.register(fs)
-	fs.StringVar(&dir, "dir", defaultRepoDir, "where to check out the cluster repo")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	s, err := open(ctx, c, os.Stdout)
-	if err != nil {
-		return err
-	}
-	unlock, err := lockNode(c.secretsFile)
-	if err != nil {
-		return s.finish(err)
-	}
-	defer unlock()
-	err = func() error {
-		if err := s.engine.Bootstrap(ctx, s.loaded.raw, dir, opts); err != nil {
-			return err
+		if *reportURL != "" {
+			setupHealth(ctx, s, *reportURL)
 		}
-		checkout := filepath.Join(dir, manifest.FileName)
-		m, err := manifest.Load(checkout)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", checkout, err)
-		}
-		s.engine = engine.New(m, s.store, s.console)
-		if err := s.engine.Apply(ctx, opts); err != nil {
-			return err
-		}
-		printSummary(s)
-		setupHealth(ctx, s, hf, c.reportURL, checkout)
-		s.console.Printf("The stack definition lives in %s (and your cluster repo). Rerun `ownstackctl apply` there after changing it.", checkout)
-		return nil
-	}()
+	}
 	return s.finish(err)
 }
 
 func cmdPlan(ctx context.Context, args []string) error {
-	var c common
-	fs := newFlags("plan", &c)
-	fs.BoolVar(&c.jsonOut, "json", false, "print JSON")
-	if err := fs.Parse(args); err != nil {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	file := fs.String("f", manifestPath(), "manifest path")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	if err := parse(fs, args); err != nil {
 		return err
 	}
-	c.noPrompt = true
-	s, err := open(ctx, c, os.Stderr)
+	s, err := open(ctx, *file, true, "", os.Stderr)
 	if err != nil {
 		return err
 	}
-	s.store.Generate, s.store.Save = false, false
 	plan := s.engine.Plan(ctx)
 	s.console.RedactAll(&plan)
-	if c.jsonOut {
-		return printJSON(plan)
+	if *jsonOut {
+		return printJSON(os.Stdout, plan)
 	}
 	marks := map[string]string{stack.OK: "✓", stack.Fail: "✗"}
-	fmt.Printf("Plan for stack %q\n", plan.Stack)
+	fmt.Printf("Plan for %s\n", plan.Domain)
 	for _, issue := range plan.Issues {
 		fmt.Printf("  ✗ %s\n", issue)
 	}
@@ -322,42 +260,42 @@ func cmdPlan(ctx context.Context, args []string) error {
 }
 
 func cmdStatus(ctx context.Context, args []string) error {
-	var c common
-	var healthURL string
-	fs := newFlags("status", &c)
-	fs.BoolVar(&c.jsonOut, "json", false, "print JSON")
-	fs.StringVar(&healthURL, "health-url", "", "also send the status to Ownstack (token in OWNSTACK_REPORT_TOKEN)")
-	if err := fs.Parse(args); err != nil {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	file := fs.String("f", manifestPath(), "manifest path")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	healthURL := fs.String("health-url", "", "also send the status to Ownstack (token in OWNSTACK_REPORT_TOKEN)")
+	if err := parse(fs, args); err != nil {
 		return err
 	}
-	c.noPrompt = true
-	s, err := open(ctx, c, os.Stderr)
+	s, err := open(ctx, *file, true, "", os.Stderr)
 	if err != nil {
 		return err
 	}
-	// Parse accepts any YAML, so a file that is not a valid manifest would
-	// otherwise report a stack with no stages as healthy.
+	// A file that is not a valid manifest would otherwise report a stack
+	// with no stages as healthy.
 	if err := s.engine.Validate(); err != nil {
 		return err
 	}
-	s.store.Generate, s.store.Save = false, false
 	st := s.engine.Status(ctx)
 	// Check details are free-form provider and API errors.
 	s.console.RedactAll(&st)
-	if healthURL != "" {
-		if err := health.Send(ctx, healthURL, os.Getenv("OWNSTACK_REPORT_TOKEN"), st); err != nil {
+	if *healthURL != "" {
+		if err := health.Send(ctx, *healthURL, os.Getenv("OWNSTACK_REPORT_TOKEN"), st); err != nil {
 			fmt.Fprintf(os.Stderr, "note: could not send health to Ownstack: %v\n", err)
 		}
 	}
-	if c.jsonOut {
-		return printJSON(st)
-	}
-	marks := map[string]string{stack.OK: "✓", stack.Warn: "!", stack.Fail: "✗", stack.Unknown: "?"}
-	fmt.Printf("Stack %q: %s\n", st.Stack, st.State)
-	for _, stage := range st.Stages {
-		fmt.Printf("\n%s %s\n", marks[stage.State], stage.Title)
-		for _, check := range stage.Checks {
-			fmt.Printf("  %s %-24s %s\n", marks[check.State], check.Name, check.Detail)
+	if *jsonOut {
+		if err := printJSON(os.Stdout, st); err != nil {
+			return err
+		}
+	} else {
+		marks := map[string]string{stack.OK: "✓", stack.Warn: "!", stack.Fail: "✗", stack.Unknown: "?"}
+		fmt.Printf("Stack %s: %s\n", st.Domain, st.State)
+		for _, stage := range st.Stages {
+			fmt.Printf("\n%s %s\n", marks[stage.State], stage.Title)
+			for _, check := range stage.Checks {
+				fmt.Printf("  %s %-24s %s\n", marks[check.State], check.Name, check.Detail)
+			}
 		}
 	}
 	if st.State == stack.Fail {
@@ -366,29 +304,76 @@ func cmdStatus(ctx context.Context, args []string) error {
 	return nil
 }
 
-func cmdValidate(args []string) error {
-	var c common
-	fs := newFlags("validate", &c)
-	fs.BoolVar(&c.jsonOut, "json", false, "print JSON")
+// Validation is validate --json's answer. The Ownstack designer reads it.
+type Validation struct {
+	Valid    bool             `json:"valid"`
+	Issues   []manifest.Issue `json:"issues"`
+	Manifest string           `json:"manifest"`
+	// Resources are the providers' estimates, and the least memory a server
+	// needs for them (apply's memory preflight).
+	Resources struct {
+		MemoryMiB    int `json:"memoryMiB"`
+		DiskGiB      int `json:"diskGiB"`
+		MinServerMiB int `json:"minServerMiB"`
+	} `json:"resources"`
+	Secrets []engine.Secret `json:"secrets"`
+}
+
+// validate checks a manifest without the network or secrets.
+func validate(file string, stdin io.Reader) Validation {
+	v := Validation{Issues: []manifest.Issue{}, Secrets: []engine.Secret{}}
+	m, err := load(file, stdin)
+	if err != nil {
+		v.Issues = append(v.Issues, manifest.Issue{Path: "", Message: err.Error()})
+		return v
+	}
+	cat := providers.Catalog()
+	v.Issues = append(v.Issues, m.Validate(cat)...)
+	v.Valid = len(v.Issues) == 0
+	if out, err := m.Marshal(cat); err == nil {
+		v.Manifest = string(out)
+	}
+	e := engine.New(m, secrets.NewStore(""), stack.NewConsole(io.Discard))
+	r := e.Resources()
+	v.Resources.MemoryMiB, v.Resources.DiskGiB, v.Resources.MinServerMiB = r.MemoryMiB, r.DiskGiB, catalog.MinServerMiB(r.MemoryMiB)
+	v.Secrets = e.Secrets()
+	return v
+}
+
+func cmdValidate(args []string, stdin io.Reader, stdout io.Writer) error {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	file := fs.String("f", manifestPath(), "manifest path, or - for stdin")
+	jsonOut := fs.Bool("json", false, "print JSON and always exit 0")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	v := validate(*file, stdin)
+	if *jsonOut {
+		return printJSON(stdout, v)
+	}
+	if v.Valid {
+		fmt.Fprintf(stdout, "%s is valid\n", *file)
+		return nil
+	}
+	for _, issue := range v.Issues {
+		if issue.Path == "" {
+			return errors.New(issue.Message)
+		}
+		fmt.Fprintf(stdout, "  ✗ %s\n", issue)
+	}
+	return fmt.Errorf("%d problem(s) in %s", len(v.Issues), *file)
+}
+
+// parse parses flags and refuses positional arguments, which would
+// otherwise be ignored silently.
+func parse(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	l, err := load(c.file)
-	if err != nil {
-		return err
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%s: unexpected argument %q", fs.Name(), fs.Arg(0))
 	}
-	issues := l.manifest.Validate(providers.Catalog())
-	if c.jsonOut {
-		return printJSON(map[string]any{"valid": len(issues) == 0, "issues": issues})
-	}
-	if len(issues) == 0 {
-		fmt.Println("ownstack.yaml is valid")
-		return nil
-	}
-	for _, issue := range issues {
-		fmt.Printf("  ✗ %s\n", issue)
-	}
-	return fmt.Errorf("%d problem(s) in %s", len(issues), c.file)
+	return nil
 }
 
 // printSummary tells the user where their stack is and how to sign in.
@@ -396,10 +381,8 @@ func printSummary(s *session) {
 	out := s.engine.RT.Out
 	m, cat := s.engine.Manifest, s.engine.Catalog
 	name := func(aspect string) string {
-		if c, ok := m.Component(aspect); ok {
-			if p, ok := cat.Provider(aspect, c.Provider); ok {
-				return p.Name
-			}
+		if p, ok := cat.Provider(aspect, m.Provider(cat, aspect)); ok {
+			return p.Name
 		}
 		return aspect
 	}
@@ -423,67 +406,32 @@ func printSummary(s *session) {
 		}
 		c.Printf("%s", line)
 	}
-	c.Printf("  %-18s https://<app>.%s (each infrastructure/<app>/ in your repos)", "Apps", m.Spec.Domain)
-	c.Printf("  %-18s %s on this server", "Secrets", s.store.Path)
+	c.Printf("  %-18s https://<app>.%s (each infrastructure/<app>/ in your repos)", "Apps", m.Domain)
+	if out.VCS != nil && out.VCS.ClusterRepoURL != "" {
+		c.Printf("  %-18s %s (mirrors the applied manifest)", "Cluster repo", out.VCS.ClusterRepoURL)
+	}
+	c.Printf("  %-18s %s and %s on this server", "Manifest, secrets", manifestPath(), s.store.Path)
 	c.Printf("  %-18s ownstackctl status", "Health")
 }
 
-// healthFlags configure the health timer installed after a successful run.
-type healthFlags struct {
-	url      string
-	disabled bool
-}
-
-func (h *healthFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&h.url, "health-url", "", "Ownstack health endpoint (default: derived from --report)")
-	fs.BoolVar(&h.disabled, "no-health-reports", false, "do not install the health report timer")
-}
-
-// setupHealth installs the health timer and sends a first report. Failures
-// are reported but never fail the run.
-func setupHealth(ctx context.Context, s *session, h healthFlags, reportURL, manifestPath string) {
-	url := h.url
-	if url == "" {
-		url = health.URLFromReport(reportURL)
-	}
-	token := os.Getenv("OWNSTACK_REPORT_TOKEN")
-	if h.disabled || url == "" || token == "" || os.Geteuid() != 0 {
+// setupHealth installs the timer that reports health to the run's Ownstack
+// stack, and starts the first report. Failures are reported but never fail
+// the run.
+func setupHealth(ctx context.Context, s *session, reportURL string) {
+	url, token := health.URLFromReport(reportURL), os.Getenv("OWNSTACK_REPORT_TOKEN")
+	if url == "" || os.Geteuid() != 0 {
 		return
 	}
-	abs, err := filepath.Abs(manifestPath)
-	var secretsFile string
-	if err == nil {
-		secretsFile, err = filepath.Abs(s.store.Path)
-	}
-	if err == nil {
-		err = health.Install(ctx, s.engine.RT.Exec, url, token, abs, secretsFile)
-	}
-	if err == nil {
-		st := s.engine.Status(ctx)
-		s.console.RedactAll(&st)
-		err = health.Send(ctx, url, token, st)
-	}
-	if err != nil {
+	if err := health.Install(ctx, s.engine.RT.Exec, url, token); err != nil {
 		s.console.Printf("note: health reports to Ownstack are not set up: %v", err)
 		return
 	}
 	s.console.Printf("Health is reported to Ownstack every %s (stop: systemctl disable --now ownstack-health.timer)", health.Interval)
 }
 
-func applyFlags(fs *flag.FlagSet, opts *engine.ApplyOptions) {
-	fs.BoolVar(&opts.AllowLowMemory, "allow-low-memory", false, "skip the memory preflight")
-	fs.BoolVar(&opts.SkipVerify, "no-verify", false, "skip the final health check")
-}
-
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func printJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }

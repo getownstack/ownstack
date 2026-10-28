@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,25 +21,27 @@ type Kube struct {
 
 type object = map[string]any
 
-func (k *Kube) Apply(ctx context.Context, obj object) error {
-	data, err := json.Marshal(obj)
+// Apply server-side applies objects in one kubectl call, as a v1 List in
+// order (a namespace before the objects in it). ownstackctl owns the fields
+// it sets, and --force-conflicts takes them back from anyone who changed
+// them. Server-side apply keeps no last-applied annotation, so secret values
+// are stored only in the secrets themselves.
+func (k *Kube) Apply(ctx context.Context, objects ...map[string]any) error {
+	data, err := json.Marshal(object{"apiVersion": "v1", "kind": "List", "items": objects})
 	if err != nil {
 		return err
 	}
-	_, err = k.outputInput(ctx, string(data), "kubectl", "apply", "-f", "-")
+	_, err = k.outputInput(ctx, string(data), "kubectl", "apply", "--server-side", "--force-conflicts", "--field-manager=ownstack", "-f", "-")
 	return err
-}
-
-func (k *Kube) EnsureNamespace(ctx context.Context, name string) error {
-	return k.Apply(ctx, object{
-		"apiVersion": "v1",
-		"kind":       "Namespace",
-		"metadata":   object{"name": name},
-	})
 }
 
 // ApplySecret creates or updates an Opaque (or typed) secret.
 func (k *Kube) ApplySecret(ctx context.Context, namespace, name, secretType string, data map[string]string, labels map[string]string) error {
+	return k.Apply(ctx, SecretObject(namespace, name, secretType, data, labels))
+}
+
+// SecretObject is an Opaque (or typed) secret holding data.
+func SecretObject(namespace, name, secretType string, data map[string]string, labels map[string]string) map[string]any {
 	if secretType == "" {
 		secretType = "Opaque"
 	}
@@ -46,23 +49,17 @@ func (k *Kube) ApplySecret(ctx context.Context, namespace, name, secretType stri
 	if len(labels) > 0 {
 		meta["labels"] = labels
 	}
-	return k.Apply(ctx, object{
+	encoded := map[string]string{}
+	for key, value := range data {
+		encoded[key] = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	return object{
 		"apiVersion": "v1",
 		"kind":       "Secret",
 		"type":       secretType,
 		"metadata":   meta,
-		"stringData": data,
-	})
-}
-
-// ApplyPullSecret creates or updates a kubernetes.io/dockerconfigjson secret.
-func (k *Kube) ApplyPullSecret(ctx context.Context, namespace, name, server, username, password string) error {
-	config, err := DockerConfigJSON(server, username, password)
-	if err != nil {
-		return err
+		"data":       encoded,
 	}
-	return k.ApplySecret(ctx, namespace, name, "kubernetes.io/dockerconfigjson",
-		map[string]string{".dockerconfigjson": config}, nil)
 }
 
 // DockerConfigJSON is the .dockerconfigjson of a pull secret for one registry.
@@ -109,49 +106,6 @@ func PullSecretMismatch(raw, server, username, password string) string {
 		return "different password"
 	}
 	return ""
-}
-
-// AddImagePullSecret makes a service account pull images with the named
-// secret: Kubernetes adds a service account's pull secrets to pods that name
-// none. Pull secrets it already lists are kept. Only names are written,
-// never credentials. changed is false when the secret was already listed.
-func (k *Kube) AddImagePullSecret(ctx context.Context, namespace, serviceAccount, secret string) (bool, error) {
-	out, err := k.Exec.Output(ctx, "kubectl", "get", "serviceaccount", serviceAccount, "-n", namespace, "-o", "json")
-	if err != nil {
-		return false, err
-	}
-	patch, changed, err := imagePullSecretsPatch(out, secret)
-	if err != nil || !changed {
-		return false, err
-	}
-	_, err = k.Exec.Output(ctx, "kubectl", "patch", "serviceaccount", serviceAccount, "-n", namespace, "--type=merge", "-p", patch)
-	return err == nil, err
-}
-
-// imagePullSecretsPatch returns a merge patch that appends secret to a
-// service account's imagePullSecrets. A merge patch replaces the whole list,
-// so it carries the existing entries, and the resourceVersion makes the API
-// server refuse it (Conflict) if the account changed since it was read.
-func imagePullSecretsPatch(serviceAccountJSON, secret string) (patch string, changed bool, err error) {
-	var sa struct {
-		Metadata struct {
-			ResourceVersion string `json:"resourceVersion"`
-		} `json:"metadata"`
-		ImagePullSecrets []map[string]any `json:"imagePullSecrets"`
-	}
-	if err := json.Unmarshal([]byte(serviceAccountJSON), &sa); err != nil {
-		return "", false, fmt.Errorf("read service account: %w", err)
-	}
-	for _, ref := range sa.ImagePullSecrets {
-		if ref["name"] == secret {
-			return "", false, nil
-		}
-	}
-	data, err := json.Marshal(object{
-		"metadata":         object{"resourceVersion": sa.Metadata.ResourceVersion},
-		"imagePullSecrets": append(sa.ImagePullSecrets, map[string]any{"name": secret}),
-	})
-	return string(data), true, err
 }
 
 // SecretValue reads one key of a secret; ok is false when it does not exist.
@@ -258,12 +212,18 @@ type Chart struct {
 	Version   string
 	Values    string         // rendered provider values (YAML)
 	Overrides map[string]any // manifest `values:` merged on top
-	Timeout   time.Duration
+	Timeout   time.Duration  // for the release to become ready; 10 minutes when zero
 }
 
 // HelmUpgrade installs or upgrades a release and waits for it to be ready.
-// Values files contain secrets, so they are written 0600 and removed after.
+// The chart is downloaded once into StateDir()/charts, so a rerun does not
+// depend on the chart repository. Values files contain secrets, so they are
+// written 0600 and removed after.
 func (k *Kube) HelmUpgrade(ctx context.Context, c Chart) error {
+	chart, err := k.pullChart(ctx, c)
+	if err != nil {
+		return err
+	}
 	if err := k.recoverRelease(ctx, c.Release, c.Namespace); err != nil {
 		return err
 	}
@@ -273,12 +233,14 @@ func (k *Kube) HelmUpgrade(ctx context.Context, c Chart) error {
 	}
 	defer os.RemoveAll(dir)
 
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
 	args := []string{
-		"upgrade", "--install", c.Release, c.Name,
-		"--repo", c.Repo,
-		"--version", c.Version,
+		"upgrade", "--install", c.Release, chart,
 		"--namespace", c.Namespace, "--create-namespace",
-		"--wait", "--timeout", fmt.Sprintf("%ds", int(timeoutOr(c.Timeout, 15*time.Minute).Seconds())),
+		"--wait", "--timeout", fmt.Sprintf("%ds", int(timeout.Seconds())),
 	}
 	for i, values := range []any{c.Values, c.Overrides} {
 		var data []byte
@@ -303,6 +265,38 @@ func (k *Kube) HelmUpgrade(ctx context.Context, c Chart) error {
 		args = append(args, "-f", path)
 	}
 	return k.Exec.Run(ctx, "helm", args...)
+}
+
+// pullChart returns the path of c's chart archive,
+// StateDir()/charts/<name>-<version>.tgz, downloading it first when it is
+// not there. The download lands in a temporary directory and is renamed
+// into place, so an interrupted one leaves nothing behind.
+func (k *Kube) pullChart(ctx context.Context, c Chart) (string, error) {
+	dir := StateFile("charts")
+	path := filepath.Join(dir, c.Name+"-"+c.Version+".tgz")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.MkdirTemp(dir, ".pull-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	what := "download chart " + c.Name + " " + c.Version
+	if err := Retry(ctx, k.Exec.Console, what, 3, 10*time.Second, func() error {
+		_, err := k.Exec.Output(ctx, "helm", "pull", c.Name, "--repo", c.Repo, "--version", c.Version, "--destination", tmp)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	archives, _ := filepath.Glob(filepath.Join(tmp, "*.tgz"))
+	if len(archives) != 1 {
+		return "", fmt.Errorf("%s: helm pull wrote %d chart archives, want 1", what, len(archives))
+	}
+	return path, os.Rename(archives[0], path)
 }
 
 type Release struct {
@@ -389,11 +383,4 @@ func recoveryAction(history []helmRevision) (string, int) {
 
 func (k *Kube) outputInput(ctx context.Context, stdin, name string, args ...string) (string, error) {
 	return k.Exec.outputInput(ctx, stdin, name, args...)
-}
-
-func timeoutOr(d, fallback time.Duration) time.Duration {
-	if d == 0 {
-		return fallback
-	}
-	return d
 }

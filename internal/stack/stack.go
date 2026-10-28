@@ -5,8 +5,10 @@ package stack
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -76,13 +78,17 @@ func NewRuntime(m *manifest.Manifest, cat *catalog.Catalog, store *secrets.Store
 const Kubeconfig = "/etc/rancher/k3s/k3s.yaml"
 
 // StateDir is where ownstackctl keeps a node's state: $OWNSTACK_DIR, by
-// default /etc/ownstack.
+// default /etc/ownstack. It holds ownstack.yaml (the last applied manifest),
+// secrets.env, apply.lock, health.env, and charts/.
 func StateDir() string {
 	if dir := os.Getenv("OWNSTACK_DIR"); dir != "" {
 		return dir
 	}
 	return "/etc/ownstack"
 }
+
+// StateFile is a file in StateDir.
+func StateFile(name string) string { return filepath.Join(StateDir(), name) }
 
 // For scopes the runtime to one aspect so Setting and Secret read that
 // aspect's component.
@@ -91,8 +97,6 @@ func (rt *Runtime) For(aspect string) *Runtime {
 	scoped.aspect = aspect
 	return &scoped
 }
-
-func (rt *Runtime) Aspect() string { return rt.aspect }
 
 func (rt *Runtime) Setting(key string) string {
 	return rt.Manifest.Settings(rt.Catalog, rt.aspect)[key]
@@ -109,27 +113,18 @@ func (rt *Runtime) SettingInt(key string) int {
 }
 
 // Values returns the manifest's Helm value overrides for this aspect.
-func (rt *Runtime) Values() map[string]any {
-	if c, ok := rt.Manifest.Component(rt.aspect); ok {
-		return c.Values
-	}
-	return nil
-}
+func (rt *Runtime) Values() map[string]any { return rt.Manifest.Values(rt.aspect) }
 
-// Secret resolves one of this aspect's secrets.
+// Secret resolves one of this aspect's secrets from its environment
+// variable, the node's secrets file, generation, or a prompt (package
+// secrets).
 func (rt *Runtime) Secret(key string) (string, error) {
-	c, _ := rt.Manifest.Component(rt.aspect)
-	req := secrets.Request{Ref: rt.Manifest.SecretRef(rt.Catalog, rt.aspect, key), Label: key}
-	if c != nil {
-		if p, ok := rt.Catalog.Provider(rt.aspect, c.Provider); ok {
-			if param, ok := p.Param(key); ok {
-				req.Label = p.Name + " " + lowerFirst(param.Label)
-				req.Help = param.Help
-				req.Generate = param.Generate
-			}
-		}
+	p, _ := rt.Catalog.Provider(rt.aspect, rt.Manifest.Provider(rt.Catalog, rt.aspect))
+	param, ok := p.Param(key)
+	if !ok || !param.IsSecret() {
+		return "", fmt.Errorf("%s has no secret %q", rt.aspect, key)
 	}
-	return rt.Secrets.Get(req)
+	return rt.Secrets.Get(secrets.Request{Env: param.Env, Label: p.Label(param), Help: param.Help, Generate: param.Generate})
 }
 
 func (rt *Runtime) Logf(format string, args ...any) { rt.Console.Printf(format, args...) }
@@ -180,11 +175,11 @@ type IngressOutput struct {
 }
 
 type VCSOutput struct {
-	Kind           string // github
-	Owner          string
-	APIURL         string
-	ClusterRepo    string // cluster repo name under Owner
-	ClusterRepoURL string // https clone URL
+	Kind   string // github
+	Owner  string
+	APIURL string
+	// ClusterRepoURL is the web URL of the repo that mirrors ownstack.yaml.
+	ClusterRepoURL string
 	// DemoRepo is the demo application repo under Owner; empty when the
 	// stack has no demo app.
 	DemoRepo string
@@ -193,11 +188,10 @@ type VCSOutput struct {
 }
 
 type ImagesOutput struct {
-	Host           string
-	Project        string
-	PushUsername   string
-	PushPassword   string
-	PullSecretName string
+	Host         string
+	Project      string
+	PushUsername string
+	PushPassword string
 	// Login tells a person how to sign in to the registry's web UI at
 	// https://<Host>, for the run summary; empty when it has none. It names
 	// where the password is kept, never the value.
@@ -216,7 +210,7 @@ type CICDOutput struct {
 // rt.Manifest (internal/providers/contract_test.go enforces it).
 
 // Domain is where applications are published: <app>.<domain>.
-func (rt *Runtime) Domain() string { return rt.Manifest.Spec.Domain }
+func (rt *Runtime) Domain() string { return rt.Manifest.Domain }
 
 // AdminDomain is the parent domain of platform service hosts.
 func (rt *Runtime) AdminDomain() string { return rt.Manifest.AdminDomain() }
@@ -231,15 +225,11 @@ type Environment = manifest.Environment
 
 // Environments are the stack's environments in manifest order. The first is
 // production, and a branch deploys into the first one whose glob matches it.
-func (rt *Runtime) Environments() []Environment { return rt.Manifest.Environments() }
+func (rt *Runtime) Environments() []Environment { return rt.Manifest.EnvironmentList() }
 
 // Production is the production environment, the first one.
 func (rt *Runtime) Production() Environment { return rt.Environments()[0] }
 
-// lowerFirst lowercases a leading capital unless it starts an acronym.
-func lowerFirst(s string) string {
-	if len(s) > 1 && s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'a' && s[1] <= 'z' {
-		return string(s[0]+('a'-'A')) + s[1:]
-	}
-	return s
-}
+// ManifestFile is ownstack.yaml as it was applied, for the cluster repo that
+// mirrors it.
+func (rt *Runtime) ManifestFile() []byte { return rt.Manifest.Source }

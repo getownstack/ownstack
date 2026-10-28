@@ -141,13 +141,13 @@ func TestUpsertRefusesRecordsItDidNotCreate(t *testing.T) {
 	fake, p, rt := newFake(t, foreignRecords...)
 	api := p.client(rt)
 	ctx := context.Background()
-	zone, err := api.findZone(ctx, "", "sub.example.com")
+	zone, err := api.findZone(ctx, "sub.example.com")
 	if err != nil || zone != "zone1" {
 		t.Fatalf("zone = %q, %v", zone, err)
 	}
 	for _, name := range []string{"example.com", "*.example.com"} {
 		_, err := api.upsertA(ctx, zone, name, "203.0.113.10", false)
-		if err == nil || !strings.Contains(err.Error(), "spec.dns.settings.replaceRecords") {
+		if err == nil || !strings.Contains(err.Error(), "dns.replaceRecords") {
 			t.Errorf("%s: err = %v, want a refusal naming the setting", name, err)
 		}
 	}
@@ -232,7 +232,7 @@ func TestApplyRefusesBeforeChangingAnything(t *testing.T) {
 		record{ID: "cname", Type: "CNAME", Name: "*.example.com", Content: "elsewhere.net"},
 	)
 	err := p.Apply(context.Background(), rt)
-	if err == nil || !strings.Contains(err.Error(), "*.example.com: CNAME elsewhere.net") || !strings.Contains(err.Error(), "spec.dns.settings.replaceRecords: true") {
+	if err == nil || !strings.Contains(err.Error(), "*.example.com: CNAME elsewhere.net") || !strings.Contains(err.Error(), "set dns.replaceRecords: true") {
 		t.Fatalf("err = %v", err)
 	}
 	if w := fake.writes(); len(w) != 0 {
