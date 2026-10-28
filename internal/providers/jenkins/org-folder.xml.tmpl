@@ -42,10 +42,13 @@
     <numToKeep>-1</numToKeep>
     <abortBuilds>false</abortBuilds>
   </orphanedItemStrategy>
+  <!-- Scanning the organization every 2 minutes re-examines each listed repo,
+       so pushes build without webhooks. (Jenkins gives new child projects the
+       folder's own trigger, not the child template above.) -->
   <triggers>
     <com.cloudbees.hudson.plugins.folder.computed.PeriodicFolderTrigger plugin="cloudbees-folder">
-      <spec>H H/4 * * *</spec>
-      <interval>86400000</interval>
+      <spec>* * * * *</spec>
+      <interval>120000</interval>
     </com.cloudbees.hudson.plugins.folder.computed.PeriodicFolderTrigger>
   </triggers>
   <disabled>false</disabled>
